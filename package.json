@@ -1,0 +1,20 @@
+{
+  "name": "chatgpt2api-cf",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --minify",
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "eventsource-parser": "^4.1.0",
+    "hono": "^4.13.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260902.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.110.0"
+  }
+}

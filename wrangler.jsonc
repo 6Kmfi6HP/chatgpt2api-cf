@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "chatgpt2api-cf",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-03",
+  "vars": {
+    "API_KEYS": "",
+    "MODELS": "auto,gpt-4o,gpt-4o-mini",
+    "DEVICE_POOL_SIZE": "3"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "CHATGPT_KV",
+      "id": "467d17c6dc4c47fab6499c1c99db7dfb"
+    }
+  ]
+}
