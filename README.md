@@ -6,6 +6,10 @@
 </p>
 
 <p align="center">
+  <a href="./README.md">English</a> | <a href="./README_zh.md">简体中文</a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Runtime-Cloudflare%20Workers-orange?logo=cloudflare" alt="Cloudflare Workers" />
   <img src="https://img.shields.io/badge/Framework-Hono-E36002?logo=hono" alt="Hono" />
   <img src="https://img.shields.io/badge/TypeScript-Strict-blue?logo=typescript" alt="TypeScript" />
