@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Runtime-Cloudflare%20Workers-orange?logo=cloudflare" alt="Cloudflare Workers" />
   <img src="https://img.shields.io/badge/Framework-Hono-E36002?logo=hono" alt="Hono" />
   <img src="https://img.shields.io/badge/TypeScript-Strict-blue?logo=typescript" alt="TypeScript" />
-  <img src="https://img.shields.io/badge/Tests-105%20Passing-brightgreen" alt="Tests" />
+  <img src="https://img.shields.io/badge/Tests-112%20Passing-brightgreen" alt="Tests" />
   <img src="https://img.shields.io/badge/Bundle%20Size-~44%20KiB-success" alt="Bundle Size" />
   <img src="https://img.shields.io/badge/License-MIT-lightgrey" alt="License" />
 </p>
@@ -39,6 +39,9 @@
 - **🛑 Client Abort & Stream Cancellation**: Full `AbortSignal` propagation. If a client disconnects or clicks "Stop Generating", upstream fetching and reading are canceled immediately, saving CPU and quota.
 - **🌏 Accurate Token Estimation**: CJK-aware token estimator (~1.5 tokens/char for Chinese/Japanese/Korean) and chars/4 for ASCII.
 - **🔑 Dual Authentication Support**: Compatible with standard `Authorization: Bearer <key>` and `x-api-key: <key>`.
+- **📋 Live Model Catalog**: `GET /v1/models` proxies the real anonymous catalog from upstream (`GET backend-anon/models`): `gpt-5-5`, `gpt-5-6`, `gpt-5-3-mini`, `gpt-5-5-mini`, `gpt-5-6-mini`, `auto`. Cached 1h in KV; falls back to `["auto"]` if upstream is unreachable. **No name mapping** — the slug you request is passed through verbatim, so you can select `gpt-5-6` or a cheaper mini yourself.
+- **🔎 Web Search ON by Default**: Requests are sent with `forceUseSearch: true`; citations auto-format as Markdown links. Per-request opt-out: `"search": false`.
+- **📍 Configurable Placement / Egress Region**: `wrangler.jsonc` ships with `"placement": { "region": "aws:us-west-2" }` so the Worker executes in the US regardless of where the client connects from (fixes regional 403 blocks, e.g. requests received at HK edge).
 
 ---
 
@@ -127,6 +130,24 @@ Deploy globally with one command:
 pnpm run deploy
 ```
 
+#### Configuring Placement (outbound region)
+
+The worker's *egress* location (the IP region OpenAI sees) is controlled by the
+[`placement` block](https://developers.cloudflare.com/workers/configuration/smart-placement/) in `wrangler.jsonc`:
+
+```jsonc
+"placement": {
+  // "mode": "smart"                    // Cloudflare auto-learns (needs multi-region traffic)
+  "region": "aws:us-west-2"             // run in/near a US region (aws:/gcp:/azure: regions)
+  // "host": "db.example.com:5432"      // TCP probe hint
+  // "hostname": "api.example.com"      // HTTP HEAD probe hint (ineffective for anycast hosts)
+}
+```
+
+`android.chat.openai.com` is Cloudflare-anycast, so `hostname` hints do NOT work (documented upstream). Use a fixed `region` to pin egress (e.g. `aws:us-west-2` → Seattle). Verify with the `cf-placement` response header (`remote-SEA` = executed in Seattle).
+
+After changing it: `pnpm run deploy`. Effect is immediate; `cf-placement` tells you per-request where the Worker actually ran.
+
 ---
 
 ## ⚙️ Configuration
@@ -136,7 +157,7 @@ Environment variables can be set in `wrangler.jsonc` or as Cloudflare Worker Sec
 | Variable | Default | Description |
 |---|---|---|
 | `API_KEYS` | `""` | Comma-separated list of allowed API keys. If empty, the proxy is public. |
-| `MODELS` | `"auto,gpt-4o,gpt-4o-mini"` | Comma-separated list of model IDs to publish on `GET /v1/models`. |
+| ~~`MODELS`~~ | — | **Removed.** Models are no longer configurable or mappable: `GET /v1/models` fetches the live anonymous catalog (KV-cached 1h, fallback `auto`) and every requested slug is passed through verbatim. |
 | `DEVICE_POOL_SIZE` | `"3"` | Bounded pool capacity of device identities maintained in KV. |
 
 ---
@@ -158,7 +179,7 @@ The gateway exposes standard OpenAI endpoints:
 curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o",
+    "model": "gpt-5-6",
     "messages": [
       {"role": "user", "content": "Explain quantum computing in 3 sentences."}
     ],
@@ -173,7 +194,7 @@ curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
 curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o",
+    "model": "gpt-5-6",
     "messages": [
       {"role": "system", "content": "You are a concise assistant."},
       {"role": "user", "content": "Hello!"}
@@ -192,7 +213,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gpt-4o",
+    model="gpt-5-6",
     messages=[{"role": "user", "content": "Write a haiku about Cloudflare."}],
     stream=True
 )
@@ -206,13 +227,13 @@ for chunk in response:
 
 - **Base URL / Endpoint**: `https://<your-worker>.workers.dev/v1`
 - **API Key**: Any dummy string (e.g. `sk-test`) if `API_KEYS` is empty, or your secret key.
-- **Model**: `auto`, `gpt-4o`, `gpt-4o-mini`, etc.
+- **Model**: `auto`, `gpt-5-5`, `gpt-5-6`, `gpt-5-3-mini`, `gpt-5-5-mini`, `gpt-5-6-mini` (see `GET /v1/models` for the live catalog).
 
 ---
 
 ## 🧪 Testing
 
-The test suite contains **105 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
+The test suite contains **112 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
 
 ```bash
 # Run Vitest test suite
@@ -226,7 +247,8 @@ pnpm exec tsc --noEmit
 
 ## 📋 Honest Limitations
 
-- **Model Capabilities**: The underlying upstream model is `auto`. All published model IDs (`gpt-4o`, `gpt-4o-mini`, etc.) route to this backend tier.
+- **Model Pass-through**: No name mapping. The slug you send goes upstream verbatim; unknown/empty models resolve to `auto`. See `GET /v1/models` for the real anonymous catalog.
+- **Web Search ON by default**: requests send `forceUseSearch: true`; reply citations are auto-formatted as Markdown links. Per-request opt-out: `"search": false`.
 - **Sampling Knobs**: Knobs like `temperature`, `top_p`, `seed`, and function calling/tools are accepted for client compatibility, but ignored by upstream.
 - **Multimodal**: Only `text` parts are forwarded; images/audio parts are stripped.
 - **Regional Restrictions**: Requests originating from Cloudflare edge locations in unsupported countries (e.g. Hong Kong, China) may trigger OpenAI's regional 403 blocks. Deploying with location hints or Smart Placement resolves this.

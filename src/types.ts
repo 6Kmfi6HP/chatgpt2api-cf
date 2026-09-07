@@ -12,6 +12,11 @@ export interface ChatCompletionRequest {
   };
   temperature?: number;
   max_tokens?: number;
+  /**
+   * Web-search toggle. Default true (search ON). Set to false to disable
+   * upstream web search for this request (forceUseSearch=false).
+   */
+  search?: boolean;
 }
 
 export interface ChatCompletionChoice {
@@ -81,6 +86,5 @@ export interface DevicePoolState {
 export interface Env {
   CHATGPT_KV: KVNamespace;
   API_KEYS?: string; // Comma separated allowed api keys (empty = public)
-  MODELS?: string; // Comma separated models to expose, default "auto,gpt-4o,gpt-4o-mini"
   DEVICE_POOL_SIZE?: string; // Default "3"
 }

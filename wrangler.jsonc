@@ -3,9 +3,19 @@
   "name": "chatgpt2api-cf",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-03",
+  // Force Worker execution in the US so egress IP to android.chat.openai.com is US-based.
+  // NOTE: android.chat.openai.com is Cloudflare-anycast (104.18.x.x), so "hostname" hints
+  // do NOT work (docs: hints don't work for anycast/replicated hosts). Use "region" instead.
+  // All placement options (mutually exclusive):
+  //   "mode": "smart"           - auto-learn placement (needs multi-site traffic, ~15 min)
+  //   "region": "aws:us-east-1" - run near a cloud region (aws:/gcp:/azure:) <- chosen: US West
+  //   "hostname": "<upstream>"  - HTTP HEAD probe hint (INEFFECTIVE for anycast hosts)
+  //   "host": "<host>:<port>"   - TCP probe hint
+  "placement": {
+    "region": "aws:us-west-2"
+  },
   "vars": {
     "API_KEYS": "",
-    "MODELS": "auto,gpt-4o,gpt-4o-mini",
     "DEVICE_POOL_SIZE": "3"
   },
   "kv_namespaces": [

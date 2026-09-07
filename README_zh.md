@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Runtime-Cloudflare%20Workers-orange?logo=cloudflare" alt="Cloudflare Workers" />
   <img src="https://img.shields.io/badge/Framework-Hono-E36002?logo=hono" alt="Hono" />
   <img src="https://img.shields.io/badge/TypeScript-Strict-blue?logo=typescript" alt="TypeScript" />
-  <img src="https://img.shields.io/badge/Tests-105%20Passing-brightgreen" alt="Tests" />
+  <img src="https://img.shields.io/badge/Tests-112%20Passing-brightgreen" alt="Tests" />
   <img src="https://img.shields.io/badge/Bundle%20Size-~44%20KiB-success" alt="Bundle Size" />
   <img src="https://img.shields.io/badge/License-MIT-lightgrey" alt="License" />
 </p>
@@ -39,6 +39,9 @@
 - **🛑 客户端流式中断响应（AbortSignal）**：全链路监听客户端断开连接。当用户在前端点击“停止生成”或关闭网页时，立即中止与 OpenAI 的上游请求，彻底杜绝 Worker CPU 与上游额度浪费。
 - **🌏 精确的中日韩（CJK）Token 统计**：针对汉字/假名/谚文字符进行加权统计（中文约 1.5 token/字），与官方 `tiktoken` 表现高度贴近。
 - **🔑 双鉴权请求头支持**：同时支持标准的 `Authorization: Bearer <key>` 与 `x-api-key: <key>`，方便与各类客户端集成。
+- **📋 动态真实模型目录**：`GET /v1/models` 不再读静态配置，改为实时代理上游匿名目录（`GET backend-anon/models`）：`gpt-5-5`、`gpt-5-6`、`gpt-5-3-mini`、`gpt-5-5-mini`、`gpt-5-6-mini`、`auto`。KV 缓存 1 小时，上游不可达时回退 `["auto"]`。**无名称映射**：客户端传入的 slug 原样透传，可自选 gpt-5-6 或更省配额的 mini。
+- **🔎 联网搜索默认开启**：所有请求自动携带 `forceUseSearch: true`，引用自动渲染为 Markdown 链接。单次关闭：`"search": false`。
+- **📍 可配置 Placement / 出站区域**：`wrangler.jsonc` 内置 `"placement": { "region": "aws:us-west-2" }`，使 Worker 无论客户端从哪里接入均在美国机房执行（修复香港等地边缘出站被区域封锁的问题）。
 
 ---
 
@@ -127,6 +130,24 @@ pnpm dev
 pnpm run deploy
 ```
 
+#### 配置 Placement（出站区域）
+
+Worker 的**出口位置**（OpenAI 看到的 IP 地区）由 `wrangler.jsonc` 中的
+[`placement`](https://developers.cloudflare.com/workers/configuration/smart-placement/) 段控制：
+
+```jsonc
+"placement": {
+  // "mode": "smart"                    // Cloudflare 自动学习（需要多地流量，约 15 分钟）
+  "region": "aws:us-west-2"             // 固定到某个云区域（aws:/gcp:/azure: 前缀）← 本项目默认
+  // "host": "db.example.com:5432"      // TCP 探测提示
+  // "hostname": "api.example.com"      // HTTP HEAD 探测（对 anycast 域名无效）
+}
+```
+
+上游 `android.chat.openai.com` 是 Cloudflare anycast 域名，因此 `hostname` 提示**无效**（官方文档明示 anycast/多播资源不适用）。固定美国出口请使用 `region`（如 `aws:us-west-2` → 西雅图）。验证：查看响应头 `cf-placement`（`remote-SEA` 即已在西雅图执行）。
+
+**改动后重新 deploy 即生效**；复查 `cf-placement` 头即可确认路由结果。
+
 部署完成后会输出你的公网 Worker 访问地址（例如 `https://chatgpt2api-cf.<your-subdomain>.workers.dev`）。
 
 ---
@@ -138,7 +159,7 @@ pnpm run deploy
 | 变量名 | 默认值 | 作用说明 |
 |---|---|---|
 | `API_KEYS` | `""` | 允许访问的 API Key 列表（逗号分隔）。留空则为**公开模式**，无需鉴权。 |
-| `MODELS` | `"auto,gpt-4o,gpt-4o-mini"` | 在 `GET /v1/models` 接口中对外发布并展示的模型 ID 列表。 |
+| ~~`MODELS`~~ | — | **已移除。** 模型列表不再可手工配置，也无映射逻辑：`GET /v1/models` 实时拉取匿名上游目录（KV 缓存 1 小时，失败回退 `auto`），请求模型 slug 原样透传。 |
 | `DEVICE_POOL_SIZE` | `"3"` | 维护在 Cloudflare KV 内部的设备身份池严格容量上限。 |
 
 ---
@@ -160,7 +181,7 @@ pnpm run deploy
 curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o",
+    "model": "gpt-5-6",
     "messages": [
       {"role": "user", "content": "请用简练的三句话解释量子计算。"}
     ],
@@ -175,7 +196,7 @@ curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
 curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o",
+    "model": "gpt-5-6",
     "messages": [
       {"role": "system", "content": "你是一个严谨的助手。"},
       {"role": "user", "content": "你好！"}
@@ -194,7 +215,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gpt-4o",
+    model="gpt-5-6",
     messages=[{"role": "user", "content": "写一首关于边缘计算的五言绝句。"}],
     stream=True
 )
@@ -209,7 +230,7 @@ print()
 
 - **接口地址 (Base URL / API Host)**: `https://<your-worker>.workers.dev/v1`
 - **API Key**: 若环境变量 `API_KEYS` 留空，可填任意占位符（如 `sk-test`）；若设置了密钥则填入对应值。
-- **模型名称 (Model)**: `auto`、`gpt-4o`、`gpt-4o-mini` 或任何你在客户端设定的模型名。
+- **模型名称 (Model)**: `auto`、`gpt-5-5`、`gpt-5-6`、`gpt-5-3-mini`、`gpt-5-5-mini`、`gpt-5-6-mini`（实时目录见 `GET /v1/models`）。
 
 ---
 
@@ -218,7 +239,7 @@ print()
 本项目包含完整的单元测试与端到端测试套件，涵盖协议转换、引用清洗、三阶段状态机、KV 轮换淘汰与流式差分：
 
 ```bash
-# 运行全部 105 项测试用例 (基于 Vitest)
+# 运行全部 112 项测试用例 (基于 Vitest)
 pnpm test
 
 # 严格 TypeScript 类型检查
@@ -229,7 +250,8 @@ pnpm exec tsc --noEmit
 
 ## 📋 客观局限性说明
 
-- **底层模型特性**：上游匿名后端目前仅支持 `auto` 统一模型；所有对外发布的模型 ID（如 `gpt-4o` 等）均映射至该匿名通道。
+- **模型透传**：不做名称映射，客户端传入的模型 slug 原样发往上层；空/无效回退为 `auto`。
+- **联网搜索默认开启**：请求携带 `forceUseSearch: true`，引用自动整理为 Markdown 链接。单次请求关闭：`"search": false`。
 - **采样参数**：上游匿名层不支持 `temperature`、`top_p`、`seed` 以及函数调用（Function Calling / Tools）；网关会正常吸收这些参数以兼容客户端，但不会影响上游输出。
 - **仅转发纯文本**：输入消息中的非文本部分（图片、音频、附件等）会被自动剔除，仅转发文本内容。
 - **边缘地区限制**：OpenAI 对部分国家/地区（如中国香港节点）有 IP 封锁。若你的 Worker 请求正好经由受限地区节点出站，可能会遇到 OpenAI 的地区性 403。可配置 Cloudflare Smart Placement 或 Location Hint 优化出站。

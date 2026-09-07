@@ -5,6 +5,7 @@ import type { Env, ChatCompletionRequest } from './types';
 import { UpstreamClient, StatusError } from './client';
 import { deviceManager as defaultDeviceManager, DeviceManager } from './device';
 import { buildAnonRequest, flattenMessages } from './translate';
+import { getModelCatalog } from './catalog';
 import { pipeOpenAIStream, aggregateNonStream } from './stream';
 
 export interface AppOptions {
@@ -118,12 +119,9 @@ export function createApp(options?: AppOptions) {
   });
 
   // Root / Status endpoint
-  app.get('/', (c) => {
-    const rawModels = c.env?.MODELS || 'auto,gpt-4o,gpt-4o-mini';
-    const models = rawModels
-      .split(',')
-      .map((m) => m.trim())
-      .filter(Boolean);
+  app.get('/', async (c) => {
+    const client = options?.client || new UpstreamClient();
+    const models = await getModelCatalog(c.env, client);
 
     return c.json({
       status: 'ok',
@@ -153,13 +151,10 @@ export function createApp(options?: AppOptions) {
   });
   app.get('/healthz', (c) => c.json({ status: 'ok' }));
 
-  // Model list endpoint
-  app.get('/v1/models', (c) => {
-    const rawModels = c.env?.MODELS || 'auto,gpt-4o,gpt-4o-mini';
-    const models = rawModels
-      .split(',')
-      .map((m) => m.trim())
-      .filter(Boolean);
+  // Model list endpoint: live anonymous catalog, fallback ["auto"]
+  app.get('/v1/models', async (c) => {
+    const client = options?.client || new UpstreamClient();
+    const models = await getModelCatalog(c.env, client);
 
     return c.json({
       object: 'list',
@@ -201,9 +196,10 @@ export function createApp(options?: AppOptions) {
       );
     }
 
-    const model = req.model || 'auto';
+    // No name mapping: the requested model slug is passed through verbatim.
+    const model = (typeof req.model === 'string' && req.model.trim()) || 'auto';
     const prompt = flattenMessages(req.messages);
-    const anonBody = buildAnonRequest(model, prompt);
+    const anonBody = buildAnonRequest(model, prompt, { search: req.search });
 
     const client = options?.client || new UpstreamClient();
     const dm = options?.deviceManager || defaultDeviceManager;

@@ -111,6 +111,45 @@ export class UpstreamClient {
     return resp;
   }
 
+  async models(deviceId: string, signal?: AbortSignal): Promise<string[]> {
+    const url = this.buildUrl('models');
+    const headers: Record<string, string> = {
+      'User-Agent': USER_AGENT,
+      'Accept': 'application/json',
+      'OAI-Client-Type': CLIENT_TYPE,
+      'OAI-Device-Id': deviceId,
+      'OAI-Package-Name': APP_PACKAGE,
+      'X-OpenAI-No-Http-Logging': '1',
+    };
+
+    let resp: Response;
+    try {
+      resp = await this.fetchFn.call(globalThis, url, { method: 'GET', headers, signal });
+    } catch (err: any) {
+      throw new Error(`chatgpt-anon models: ${err.message}`);
+    }
+
+    if (!resp.ok) {
+      const bodySniff = await extractBodySniff(resp);
+      throw new Error(`chatgpt-anon models: HTTP ${resp.status}: ${bodySniff}`);
+    }
+
+    let data: any;
+    try {
+      data = await resp.json();
+    } catch (err: any) {
+      throw new Error(`chatgpt-anon models: decode: ${err.message}`);
+    }
+
+    const slugs: string[] = [];
+    if (data && Array.isArray(data.models)) {
+      for (const m of data.models) {
+        if (m && typeof m.slug === 'string' && m.slug) slugs.push(m.slug);
+      }
+    }
+    return slugs;
+  }
+
   async sentinel(deviceId: string, signal?: AbortSignal): Promise<{ token: string; expiry: number }> {
     const resp = await this.post('sentinel', 'sentinel/chat-requirements', deviceId, {}, '{}', signal);
 

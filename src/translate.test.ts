@@ -10,7 +10,6 @@ import {
   genID,
   wantsStreamUsage,
   extractMessageText,
-  UPSTREAM_MODEL,
 } from './translate';
 import type { OpenAIMessage } from './types';
 
@@ -90,8 +89,8 @@ describe('buildAnonRequest', () => {
     expect(req.action).toBe('next');
     expect(req.parentMessageId).toBeNull();
     expect(req.conversationId).toBeNull();
-    expect(req.model).toBe(UPSTREAM_MODEL);
-    expect(req.model).toBe('auto');
+    expect(req.model).toBe('gpt-4o');
+    expect(req.forceUseSearch).toBe(true);
     expect(req.historyAndTrainingDisabled).toBe(false);
     expect(req.conversationMode).toEqual({ kind: 'primary_assistant' });
     expect(req.forceUseSse).toBe(true);
@@ -108,6 +107,16 @@ describe('buildAnonRequest', () => {
         parts: [prompt],
       },
     });
+  });
+
+  it('falls back to auto for empty model', () => {
+    expect(buildAnonRequest('', 'hi').model).toBe('auto');
+  });
+
+  it('defaults forceUseSearch to true and honors search=false', () => {
+    expect(buildAnonRequest('auto', 'hi').forceUseSearch).toBe(true);
+    expect(buildAnonRequest('auto', 'hi', { search: true }).forceUseSearch).toBe(true);
+    expect(buildAnonRequest('auto', 'hi', { search: false }).forceUseSearch).toBe(false);
   });
 });
 

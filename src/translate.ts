@@ -5,8 +5,6 @@ import type {
   ChatCompletionChunk,
 } from './types';
 
-export const UPSTREAM_MODEL = 'auto';
-
 /**
  * Extracts plain text from an OpenAI content field, whether it is a string
  * or an array of content parts. Non-text parts are ignored.
@@ -57,7 +55,20 @@ export function flattenMessages(messages: OpenAIMessage[]): string {
 /**
  * buildAnonRequest constructs the upstream conversation DTO payload.
  */
-export function buildAnonRequest(model: string, prompt: string): Record<string, any> {
+export interface AnonRequestOptions {
+  /**
+   * Web-search toggle. Anonymous upstream accepts a 3-state forceUseSearch
+   * (Auto/ForceSearch/ForceNoSearch -> null/true/false). Per project policy
+   * search is ON by default; set search=false to disable.
+   */
+  search?: boolean;
+}
+
+export function buildAnonRequest(
+  model: string,
+  prompt: string,
+  options?: AnonRequestOptions
+): Record<string, any> {
   return {
     action: 'next',
     messages: [
@@ -71,9 +82,10 @@ export function buildAnonRequest(model: string, prompt: string): Record<string, 
     ],
     parentMessageId: null,
     conversationId: null,
-    model: UPSTREAM_MODEL,
+    model: model || 'auto',
     historyAndTrainingDisabled: false,
     conversationMode: { kind: 'primary_assistant' },
+    forceUseSearch: options?.search !== false,
     forceUseSse: true,
     supportedEncodings: ['text/plain'],
     timezone: 'UTC',

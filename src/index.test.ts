@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createApp } from './index';
+import { clearCatalogCache } from './catalog';
 import { UpstreamClient, StatusError } from './client';
 import { DeviceManager } from './device';
 import type { Env, ChatCompletionRequest } from './types';
@@ -61,9 +62,19 @@ class MockUpstreamClient extends UpstreamClient {
   public prepareCalls: any[] = [];
   public conversationCalls: any[] = [];
   public conversationHandler?: () => Promise<Response>;
+  public modelsCalls: number = 0;
+  public modelsHandler?: () => Promise<string[]>;
 
   constructor() {
     super('https://mock.chatgpt.local');
+  }
+
+  async models(deviceId: string): Promise<string[]> {
+    this.modelsCalls++;
+    if (this.modelsHandler) {
+      return this.modelsHandler();
+    }
+    return ['gpt-5-5', 'gpt-5-6', 'auto'];
   }
 
   async sentinel(deviceId: string): Promise<{ token: string; expiry: number }> {
@@ -102,13 +113,13 @@ describe('Hono Application (src/index.ts)', () => {
   let app: ReturnType<typeof createApp>;
 
   beforeEach(() => {
+    clearCatalogCache();
     mockClient = new MockUpstreamClient();
     mockDeviceManager = new DeviceManager(100);
     app = createApp({ client: mockClient, deviceManager: mockDeviceManager });
     mockEnv = {
       CHATGPT_KV: new MockKVNamespace() as any,
       API_KEYS: '',
-      MODELS: 'auto,gpt-4o,gpt-4o-mini',
       DEVICE_POOL_SIZE: '3',
     };
   });
@@ -120,7 +131,7 @@ describe('Hono Application (src/index.ts)', () => {
       const data: any = await res.json();
       expect(data.status).toBe('ok');
       expect(data.service).toBe('chatgpt2api-cf');
-      expect(data.models).toEqual(['auto', 'gpt-4o', 'gpt-4o-mini']);
+      expect(data.models).toEqual(['gpt-5-5', 'gpt-5-6', 'auto']);
       expect(data.docs).toBeDefined();
     });
 
@@ -140,28 +151,81 @@ describe('Hono Application (src/index.ts)', () => {
   });
 
   describe('GET /v1/models', () => {
-    it('returns default model list in OpenAI format', async () => {
+    it('returns the live upstream catalog in OpenAI format', async () => {
       const res = await app.request('/v1/models', { method: 'GET' }, mockEnv);
       expect(res.status).toBe(200);
       const data: any = await res.json();
       expect(data.object).toBe('list');
       expect(data.data.length).toBe(3);
       expect(data.data[0]).toEqual({
-        id: 'auto',
+        id: 'gpt-5-5',
         object: 'model',
         created: 1700000000,
         owned_by: 'openai',
       });
-      expect(data.data[1].id).toBe('gpt-4o');
-      expect(data.data[2].id).toBe('gpt-4o-mini');
+      expect(data.data[1].id).toBe('gpt-5-6');
+      expect(data.data[2].id).toBe('auto');
     });
 
-    it('splits custom MODELS environment variable', async () => {
-      const customEnv = { ...mockEnv, MODELS: 'gpt-4.1, gpt-4o-custom ' };
-      const res = await app.request('/v1/models', { method: 'GET' }, customEnv);
+    it('falls back to ["auto"] when upstream catalog fetch fails', async () => {
+      mockClient.modelsHandler = async () => {
+        throw new Error('upstream down');
+      };
+      const res = await app.request('/v1/models', { method: 'GET' }, mockEnv);
       expect(res.status).toBe(200);
       const data: any = await res.json();
-      expect(data.data.map((m: any) => m.id)).toEqual(['gpt-4.1', 'gpt-4o-custom']);
+      expect(data.data.map((m: any) => m.id)).toEqual(['auto']);
+    });
+
+    it('serves the catalog from KV cache without hitting upstream twice', async () => {
+      mockClient.modelsHandler = async () => ['gpt-5-6', 'auto'];
+      await app.request('/v1/models', { method: 'GET' }, mockEnv);
+      mockClient.modelsHandler = async () => {
+        throw new Error('should not be called');
+      };
+      const res = await app.request('/v1/models', { method: 'GET' }, mockEnv);
+      expect(res.status).toBe(200);
+      const data: any = await res.json();
+      expect(data.data.map((m: any) => m.id)).toEqual(['gpt-5-6', 'auto']);
+      expect(mockClient.modelsCalls).toBe(1);
+    });
+  });
+
+  describe('POST /v1/chat/completions - upstream DTO options', () => {
+    const chatBody = (extra: any = {}) =>
+      JSON.stringify({ model: 'gpt-5-6', messages: [{ role: 'user', content: 'hi' }], ...extra });
+
+    const postChat = async (body: string) =>
+      app.request(
+        '/v1/chat/completions',
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body },
+        mockEnv
+      );
+
+    it('passes the requested model through with no mapping', async () => {
+      const res = await postChat(chatBody());
+      expect(res.status).toBe(200);
+      expect(mockClient.prepareCalls[0].anonBody.model).toBe('gpt-5-6');
+    });
+
+    it('defaults model to auto when absent', async () => {
+      const res = await postChat(
+        JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+      );
+      expect(res.status).toBe(200);
+      expect(mockClient.prepareCalls[0].anonBody.model).toBe('auto');
+    });
+
+    it('enables forceUseSearch by default', async () => {
+      const res = await postChat(chatBody());
+      expect(res.status).toBe(200);
+      expect(mockClient.prepareCalls[0].anonBody.forceUseSearch).toBe(true);
+    });
+
+    it('disables upstream search when search=false', async () => {
+      const res = await postChat(chatBody({ search: false }));
+      expect(res.status).toBe(200);
+      expect(mockClient.prepareCalls[0].anonBody.forceUseSearch).toBe(false);
     });
   });
 
