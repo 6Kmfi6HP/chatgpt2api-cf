@@ -199,7 +199,15 @@ export function createApp(options?: AppOptions) {
     // No name mapping: the requested model slug is passed through verbatim.
     const model = (typeof req.model === 'string' && req.model.trim()) || 'auto';
     const prompt = flattenMessages(req.messages);
-    const anonBody = buildAnonRequest(model, prompt, { search: req.search });
+    const anonBody = buildAnonRequest(model, prompt, {
+      search: req.search,
+      thinkingEffort: req.reasoning_effort,
+      serviceTier: req.service_tier,
+      oneOffModelOverride: req.one_off_model_override,
+      systemHints: req.system_hints,
+      localFunctionNames: req.local_function_names,
+      mapSearchParams: req.map_search_params,
+    });
 
     const client = options?.client || new UpstreamClient();
     const dm = options?.deviceManager || defaultDeviceManager;

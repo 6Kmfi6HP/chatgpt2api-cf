@@ -17,6 +17,47 @@ export interface ChatCompletionRequest {
    * upstream web search for this request (forceUseSearch=false).
    */
   search?: boolean;
+  /**
+   * Thinking/reasoning effort (GPT-5.x). Passed through verbatim to the
+   * upstream `thinkingEffort` field. Values follow the upstream model
+   * (e.g. "low" | "medium" | "high"); omit to leave the upstream default.
+   */
+  reasoning_effort?: string;
+  /**
+   * Upstream service tier / priority. Passed through verbatim to
+   * `serviceTier`. Omit to use the upstream default tier.
+   */
+  service_tier?: string;
+  /**
+   * One-off model override for a single request. Passed through verbatim
+   * to `oneOffModelOverride` (takes precedence over `model` upstream when
+   * the server honours it). Omit to use `model`.
+   */
+  one_off_model_override?: string;
+  /**
+   * System-hint ids applied to this conversation. Passed through verbatim
+   * to `systemHints`. Ids come from the upstream `prompt_library/system_hints`
+   * catalog. Omit to leave the default.
+   */
+  system_hints?: string[];
+  /**
+   * Client-side tool/function names. Passed through verbatim to
+   * `localFunctionNames`. The Android app sends `["search"]` alongside
+   * force search; set to `["search"]` to mirror that, or omit.
+   */
+  local_function_names?: string[];
+  /**
+   * Map area-search parameters. Passed through verbatim to `mapSearchParams`
+   * (`{latitude, longitude, latitudeSpan, longitudeSpan, mapMessageId}`).
+   * Omit unless doing a map "search this area" request.
+   */
+  map_search_params?: {
+    latitude?: number;
+    longitude?: number;
+    latitudeSpan?: number;
+    longitudeSpan?: number;
+    mapMessageId?: string;
+  };
 }
 
 export interface ChatCompletionChoice {

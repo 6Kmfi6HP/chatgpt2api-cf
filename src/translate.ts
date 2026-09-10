@@ -62,6 +62,24 @@ export interface AnonRequestOptions {
    * search is ON by default; set search=false to disable.
    */
   search?: boolean;
+  /** Thinking/reasoning effort, verbatim upstream `thinkingEffort`. */
+  thinkingEffort?: string;
+  /** Upstream `serviceTier` (priority tier). */
+  serviceTier?: string;
+  /** Upstream `oneOffModelOverride` (single-request model override). */
+  oneOffModelOverride?: string;
+  /** Upstream `systemHints` (system-prompt id list). */
+  systemHints?: string[];
+  /** Upstream `localFunctionNames` (client tool names, e.g. ["search"]). */
+  localFunctionNames?: string[];
+  /** Upstream `mapSearchParams` (map area-search params). */
+  mapSearchParams?: {
+    latitude?: number;
+    longitude?: number;
+    latitudeSpan?: number;
+    longitudeSpan?: number;
+    mapMessageId?: string;
+  };
 }
 
 export function buildAnonRequest(
@@ -69,7 +87,7 @@ export function buildAnonRequest(
   prompt: string,
   options?: AnonRequestOptions
 ): Record<string, any> {
-  return {
+  const body: Record<string, any> = {
     action: 'next',
     messages: [
       {
@@ -92,6 +110,29 @@ export function buildAnonRequest(
     timezoneOffsetMin: 0,
     noAuthAdPreferences: true,
   };
+
+  // Optional upstream passthroughs: only included when provided, so the
+  // default wire shape stays identical to the pre-existing minimal body.
+  if (typeof options?.thinkingEffort === 'string' && options.thinkingEffort.trim() !== '') {
+    body.thinkingEffort = options.thinkingEffort;
+  }
+  if (typeof options?.serviceTier === 'string' && options.serviceTier.trim() !== '') {
+    body.serviceTier = options.serviceTier;
+  }
+  if (typeof options?.oneOffModelOverride === 'string' && options.oneOffModelOverride.trim() !== '') {
+    body.oneOffModelOverride = options.oneOffModelOverride;
+  }
+  if (Array.isArray(options?.systemHints) && options.systemHints.length > 0) {
+    body.systemHints = options.systemHints;
+  }
+  if (Array.isArray(options?.localFunctionNames) && options.localFunctionNames.length > 0) {
+    body.localFunctionNames = options.localFunctionNames;
+  }
+  if (options?.mapSearchParams && typeof options.mapSearchParams === 'object') {
+    body.mapSearchParams = options.mapSearchParams;
+  }
+
+  return body;
 }
 
 /**

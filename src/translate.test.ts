@@ -118,6 +118,57 @@ describe('buildAnonRequest', () => {
     expect(buildAnonRequest('auto', 'hi', { search: true }).forceUseSearch).toBe(true);
     expect(buildAnonRequest('auto', 'hi', { search: false }).forceUseSearch).toBe(false);
   });
+
+  it('omits optional upstream passthrough fields when not provided', () => {
+    const req = buildAnonRequest('auto', 'hi');
+    for (const key of [
+      'thinkingEffort',
+      'serviceTier',
+      'oneOffModelOverride',
+      'systemHints',
+      'localFunctionNames',
+      'mapSearchParams',
+    ]) {
+      expect(req).not.toHaveProperty(key);
+    }
+  });
+
+  it('includes provided optional upstream passthrough fields verbatim', () => {
+    const req = buildAnonRequest('auto', 'hi', {
+      thinkingEffort: 'high',
+      serviceTier: 'priority',
+      oneOffModelOverride: 'gpt-5-6',
+      systemHints: ['cfg-tool-1'],
+      localFunctionNames: ['search'],
+      mapSearchParams: { latitude: 13.75, longitude: 100.5, latitudeSpan: 0.01, longitudeSpan: 0.01 },
+    });
+    expect(req.thinkingEffort).toBe('high');
+    expect(req.serviceTier).toBe('priority');
+    expect(req.oneOffModelOverride).toBe('gpt-5-6');
+    expect(req.systemHints).toEqual(['cfg-tool-1']);
+    expect(req.localFunctionNames).toEqual(['search']);
+    expect(req.mapSearchParams).toEqual({
+      latitude: 13.75,
+      longitude: 100.5,
+      latitudeSpan: 0.01,
+      longitudeSpan: 0.01,
+    });
+  });
+
+  it('ignores blank scalars and empty arrays for passthrough fields', () => {
+    const req = buildAnonRequest('auto', 'hi', {
+      thinkingEffort: '   ',
+      serviceTier: '',
+      oneOffModelOverride: '',
+      systemHints: [],
+      localFunctionNames: [],
+    });
+    expect(req).not.toHaveProperty('thinkingEffort');
+    expect(req).not.toHaveProperty('serviceTier');
+    expect(req).not.toHaveProperty('oneOffModelOverride');
+    expect(req).not.toHaveProperty('systemHints');
+    expect(req).not.toHaveProperty('localFunctionNames');
+  });
 });
 
 describe('buildOpenAIChunk', () => {
