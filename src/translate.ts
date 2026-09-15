@@ -17,7 +17,12 @@ export function extractMessageText(
   }
   if (Array.isArray(content)) {
     return content
-      .filter((part) => part && part.type === 'text' && typeof part.text === 'string')
+      .filter(
+        (part) =>
+          part &&
+          (part.type === 'text' || part.type === 'input_text') &&
+          typeof part.text === 'string'
+      )
       .map((part) => part.text)
       .join('');
   }
@@ -80,6 +85,17 @@ export interface AnonRequestOptions {
     longitudeSpan?: number;
     mapMessageId?: string;
   };
+  /**
+   * Prebuilt upstream content for the single user message (e.g. multimodal
+   * text with image asset pointers from src/image_parts). When omitted the
+   * default text content `{ content_type: 'text', parts: [prompt] }` is used.
+   */
+  messageContent?: Record<string, any>;
+  /**
+   * Upstream `attachmentMimeTypes` (MIME types of the attached files).
+   * Only included when provided and non-empty.
+   */
+  attachmentMimeTypes?: string[];
 }
 
 export function buildAnonRequest(
@@ -87,15 +103,18 @@ export function buildAnonRequest(
   prompt: string,
   options?: AnonRequestOptions
 ): Record<string, any> {
+  // Optional multimodal content: when provided it replaces the default text
+  // content of the single upstream user message.
+  const userContent = options?.messageContent ?? {
+    content_type: 'text',
+    parts: [prompt],
+  };
   const body: Record<string, any> = {
     action: 'next',
     messages: [
       {
         author: { role: 'user' },
-        content: {
-          content_type: 'text',
-          parts: [prompt],
-        },
+        content: userContent,
       },
     ],
     parentMessageId: null,
@@ -130,6 +149,9 @@ export function buildAnonRequest(
   }
   if (options?.mapSearchParams && typeof options.mapSearchParams === 'object') {
     body.mapSearchParams = options.mapSearchParams;
+  }
+  if (Array.isArray(options?.attachmentMimeTypes) && options.attachmentMimeTypes.length > 0) {
+    body.attachmentMimeTypes = options.attachmentMimeTypes;
   }
 
   return body;

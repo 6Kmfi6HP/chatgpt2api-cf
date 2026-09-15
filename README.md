@@ -41,6 +41,7 @@
 - **🔑 Dual Authentication Support**: Compatible with standard `Authorization: Bearer <key>` and `x-api-key: <key>`.
 - **📋 Live Model Catalog**: `GET /v1/models` proxies the real anonymous catalog from upstream (`GET backend-anon/models`): `gpt-5-5`, `gpt-5-6`, `gpt-5-3-mini`, `gpt-5-5-mini`, `gpt-5-6-mini`, `auto`. Cached 1h in KV; falls back to `["auto"]` if upstream is unreachable. **No name mapping** — the slug you request is passed through verbatim, so you can select `gpt-5-6` or a cheaper mini yourself.
 - **🔎 Web Search ON by Default**: Requests are sent with `forceUseSearch: true`; citations auto-format as Markdown links. Per-request opt-out: `"search": false`.
+- **🖼 Anonymous Image Understanding**: OpenAI `image_url` / `input_image` parts (data URLs or http(s) URLs) are transparently re-uploaded to the upstream anonymous file pipeline and attached as `image_asset_pointer` parts — no login required. Multi-image and streaming supported.
 - **📍 Configurable Placement / Egress Region**: `wrangler.jsonc` ships with `"placement": { "region": "aws:us-west-2" }` so the Worker executes in the US regardless of where the client connects from (fixes regional 403 blocks, e.g. requests received at HK edge).
 
 ---
@@ -223,7 +224,47 @@ for chunk in response:
         print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 
-### 3. Third-Party Clients (NextChat, Chatbox, Cursor, etc.)
+### 3. Image Understanding (Vision)
+
+Send standard OpenAI `image_url` content parts (data URL or public http(s) URL). The gateway
+re-uploads the image to the upstream anonymous file pipeline and attaches it to the message —
+no login, no API key on the upstream side:
+
+```bash
+curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "How many white squares are in the image?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+      ]
+    }]
+  }'
+```
+
+```python
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe this image."},
+            {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}},
+        ],
+    }],
+)
+```
+
+Notes:
+- `input_image` (Responses-style string field) parts are also recognized; `input_text` counts as text.
+- Multiple images per request are supported (attached in order).
+- Uploads use the per-device anonymous quota (~10/day per pooled device); the device pool rotates automatically on 429.
+- Image URLs are fetched by the Worker — private/intranet URLs are not reachable.
+
+### 4. Third-Party Clients (NextChat, Chatbox, Cursor, etc.)
 
 - **Base URL / Endpoint**: `https://<your-worker>.workers.dev/v1`
 - **API Key**: Any dummy string (e.g. `sk-test`) if `API_KEYS` is empty, or your secret key.
@@ -250,7 +291,7 @@ pnpm exec tsc --noEmit
 - **Model Pass-through**: No name mapping. The slug you send goes upstream verbatim; unknown/empty models resolve to `auto`. See `GET /v1/models` for the real anonymous catalog.
 - **Web Search ON by default**: requests send `forceUseSearch: true`; reply citations are auto-formatted as Markdown links. Per-request opt-out: `"search": false`.
 - **Sampling Knobs**: Knobs like `temperature`, `top_p`, `seed`, and function calling/tools are accepted for client compatibility, but ignored by upstream.
-- **Multimodal**: Only `text` parts are forwarded; images/audio parts are stripped.
+- **Multimodal**: Image parts are supported (re-uploaded to the anonymous file pipeline, ~10 uploads/day per pooled device, pooled automatically). Audio and other attachment types are stripped. Image upload throttling upstream is per-device; the device pool rotates on 429 automatically.
 - **Regional Restrictions**: Requests originating from Cloudflare edge locations in unsupported countries (e.g. Hong Kong, China) may trigger OpenAI's regional 403 blocks. Deploying with location hints or Smart Placement resolves this.
 
 ---

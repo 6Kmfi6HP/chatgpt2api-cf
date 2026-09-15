@@ -41,6 +41,7 @@
 - **🔑 双鉴权请求头支持**：同时支持标准的 `Authorization: Bearer <key>` 与 `x-api-key: <key>`，方便与各类客户端集成。
 - **📋 动态真实模型目录**：`GET /v1/models` 不再读静态配置，改为实时代理上游匿名目录（`GET backend-anon/models`）：`gpt-5-5`、`gpt-5-6`、`gpt-5-3-mini`、`gpt-5-5-mini`、`gpt-5-6-mini`、`auto`。KV 缓存 1 小时，上游不可达时回退 `["auto"]`。**无名称映射**：客户端传入的 slug 原样透传，可自选 gpt-5-6 或更省配额的 mini。
 - **🔎 联网搜索默认开启**：所有请求自动携带 `forceUseSearch: true`，引用自动渲染为 Markdown 链接。单次关闭：`"search": false`。
+- **🖼 匿名图片理解（看图）**：OpenAI `image_url` / `input_image` 内容部分（data URL 或 http(s) URL）会被透明地重新上传到上游匿名文件管线，并以 `image_asset_pointer` 形式随消息发送 —— 无需登录。支持单条消息多图与流式输出。
 - **📍 可配置 Placement / 出站区域**：`wrangler.jsonc` 内置 `"placement": { "region": "aws:us-west-2" }`，使 Worker 无论客户端从哪里接入均在美国机房执行（修复香港等地边缘出站被区域封锁的问题）。
 
 ---
@@ -226,7 +227,46 @@ for chunk in response:
 print()
 ```
 
-### 3. 常见客户端配置（NextChat、Chatbox、Cursor、Cline 等）
+### 3. 图片理解（看图）
+
+使用标准 OpenAI `image_url` 内容部分（data URL 或公网 http(s) URL）即可。网关会把图片
+重新上传到上游匿名文件管线并随消息附带 —— 上游侧无需登录、无需 API Key：
+
+```bash
+curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "图里有几个白色方块？"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+      ]
+    }]
+  }'
+```
+
+```python
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "描述这张图片。"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}},
+        ],
+    }],
+)
+```
+
+说明：
+- 同时识别 `input_image`（Responses 风格字符串字段）；`input_text` 按文本处理。
+- 支持单条消息多图（按顺序附带）。
+- 上传使用每设备匿名配额（每池化设备每日约 10 次）；触发 429 时设备池自动轮换。
+- 图片 URL 由 Worker 抓取 —— 内网/私有地址不可达。
+
+### 4. 常见客户端配置（NextChat、Chatbox、Cursor、Cline 等）
 
 - **接口地址 (Base URL / API Host)**: `https://<your-worker>.workers.dev/v1`
 - **API Key**: 若环境变量 `API_KEYS` 留空，可填任意占位符（如 `sk-test`）；若设置了密钥则填入对应值。
@@ -253,7 +293,7 @@ pnpm exec tsc --noEmit
 - **模型透传**：不做名称映射，客户端传入的模型 slug 原样发往上层；空/无效回退为 `auto`。
 - **联网搜索默认开启**：请求携带 `forceUseSearch: true`，引用自动整理为 Markdown 链接。单次请求关闭：`"search": false`。
 - **采样参数**：上游匿名层不支持 `temperature`、`top_p`、`seed` 以及函数调用（Function Calling / Tools）；网关会正常吸收这些参数以兼容客户端，但不会影响上游输出。
-- **仅转发纯文本**：输入消息中的非文本部分（图片、音频、附件等）会被自动剔除，仅转发文本内容。
+- **多模态**：支持图片部分（自动重上传至匿名文件管线，每设备每日约 10 次上传配额，由设备池自动轮换）；音频及其他附件类型仍会被剔除。
 - **边缘地区限制**：OpenAI 对部分国家/地区（如中国香港节点）有 IP 封锁。若你的 Worker 请求正好经由受限地区节点出站，可能会遇到 OpenAI 的地区性 403。可配置 Cloudflare Smart Placement 或 Location Hint 优化出站。
 
 ---

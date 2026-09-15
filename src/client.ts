@@ -3,7 +3,7 @@ export const USER_AGENT = 'ChatGPT/1.2026.237 (Android 14; sdk_gphone64_arm64; b
 export const APP_PACKAGE = 'com.openai.chatgpt.internal';
 export const CLIENT_TYPE = 'android';
 
-export type Stage = 'sentinel' | 'prepare' | 'conversation';
+export type Stage = 'sentinel' | 'prepare' | 'conversation' | 'upload' | 'process';
 
 export class StatusError extends Error {
   readonly status: number;

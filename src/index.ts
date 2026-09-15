@@ -7,6 +7,14 @@ import { deviceManager as defaultDeviceManager, DeviceManager } from './device';
 import { buildAnonRequest, flattenMessages } from './translate';
 import { getModelCatalog } from './catalog';
 import { pipeOpenAIStream, aggregateNonStream } from './stream';
+import {
+  collectImageRefs,
+  resolveImage,
+  buildMultimodalContent,
+  hasImageContent,
+  type ResolvedImage,
+} from './image_parts';
+import { uploadImage, sniffImageMime, defaultExtensionForMime } from './upload';
 
 export interface AppOptions {
   client?: UpstreamClient;
@@ -199,15 +207,9 @@ export function createApp(options?: AppOptions) {
     // No name mapping: the requested model slug is passed through verbatim.
     const model = (typeof req.model === 'string' && req.model.trim()) || 'auto';
     const prompt = flattenMessages(req.messages);
-    const anonBody = buildAnonRequest(model, prompt, {
-      search: req.search,
-      thinkingEffort: req.reasoning_effort,
-      serviceTier: req.service_tier,
-      oneOffModelOverride: req.one_off_model_override,
-      systemHints: req.system_hints,
-      localFunctionNames: req.local_function_names,
-      mapSearchParams: req.map_search_params,
-    });
+
+    // Collect image references across all messages (order preserved).
+    const imageRefs = req.messages.flatMap((m) => collectImageRefs(m.content as any));
 
     const client = options?.client || new UpstreamClient();
     const dm = options?.deviceManager || defaultDeviceManager;
@@ -226,6 +228,56 @@ export function createApp(options?: AppOptions) {
       try {
         const device = await dm.getHealthyDevice(c.env, client);
         selectedDeviceId = device.id;
+
+        // Image uploads are per-device quota'd upstream, so they happen inside
+        // the retry loop with the same device that runs the conversation. A
+        // 429/403 from the upload path cools this device down and the loop
+        // retries with a fresh one.
+        let anonBody: Record<string, any>;
+        if (imageRefs.length > 0) {
+          const resolved: ResolvedImage[] = [];
+          const mimeTypes = new Set<string>();
+          for (const ref of imageRefs) {
+            const img = await resolveImage(ref, (u, init) =>
+              fetch(u, { ...init, signal })
+            );
+            const sniffed = sniffImageMime(img.bytes);
+            const mimeType =
+              sniffed !== 'application/octet-stream' ? sniffed : img.mimeType;
+            const { fileId } = await uploadImage({
+              client,
+              deviceId: device.id,
+              imageBytes: img.bytes,
+              mimeType,
+              fileName: `image.${defaultExtensionForMime(mimeType)}`,
+              signal,
+            });
+            mimeTypes.add(mimeType);
+            resolved.push({ fileId, sizeBytes: img.bytes.byteLength, width: img.width, height: img.height, mimeType });
+          }
+          const content = buildMultimodalContent(prompt, resolved);
+          anonBody = buildAnonRequest(model, prompt, {
+            search: req.search,
+            thinkingEffort: req.reasoning_effort,
+            serviceTier: req.service_tier,
+            oneOffModelOverride: req.one_off_model_override,
+            systemHints: req.system_hints,
+            localFunctionNames: req.local_function_names,
+            mapSearchParams: req.map_search_params,
+            messageContent: content,
+            attachmentMimeTypes: [...mimeTypes],
+          });
+        } else {
+          anonBody = buildAnonRequest(model, prompt, {
+            search: req.search,
+            thinkingEffort: req.reasoning_effort,
+            serviceTier: req.service_tier,
+            oneOffModelOverride: req.one_off_model_override,
+            systemHints: req.system_hints,
+            localFunctionNames: req.local_function_names,
+            mapSearchParams: req.map_search_params,
+          });
+        }
 
         const conduitToken = await client.prepare(
           device.id,
@@ -248,6 +300,22 @@ export function createApp(options?: AppOptions) {
             await dm.reportCooldown(c.env, selectedDeviceId, err);
           }
           continue;
+        }
+        // Client-side image validation failures (undecodable data URLs,
+        // unsupported formats, non-image responses) are the caller's fault:
+        // surface them as 400 instead of 500.
+        const msg: string = err?.message ?? '';
+        if (
+          msg.includes('Unsupported image format') ||
+          msg.includes('Invalid data URL') ||
+          msg.includes('did not return an image') ||
+          msg.includes('Failed to fetch image') ||
+          msg.includes('Cannot parse') ||
+          msg.includes('Empty image payload')
+        ) {
+          err = new StatusError('upload', 400, msg);
+          lastError = err;
+          throw err;
         }
         throw err;
       }
