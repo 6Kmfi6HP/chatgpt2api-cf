@@ -10,8 +10,42 @@ import {
   genID,
   wantsStreamUsage,
   extractMessageText,
+  lastUserMessageText,
 } from './translate';
 import type { OpenAIMessage } from './types';
+
+describe('lastUserMessageText', () => {
+  it('extracts the text of the final user message', () => {
+    const messages: OpenAIMessage[] = [
+      { role: 'user', content: 'first question' },
+      { role: 'assistant', content: 'an answer' },
+      { role: 'user', content: 'second question' },
+      { role: 'assistant', content: 'another answer' },
+    ];
+    expect(lastUserMessageText(messages)).toBe('second question');
+  });
+
+  it('joins multimodal text parts of the final user message', () => {
+    const messages: OpenAIMessage[] = [
+      { role: 'user', content: 'older' },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'describe ' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,xx' } },
+          { type: 'text', text: 'this image' },
+        ] as any,
+      },
+    ];
+    expect(lastUserMessageText(messages)).toBe('describe this image');
+  });
+
+  it('returns empty string when there is no user message', () => {
+    expect(lastUserMessageText([{ role: 'system', content: 'sys' }])).toBe('');
+    expect(lastUserMessageText([{ role: 'assistant', content: 'hi' }])).toBe('');
+    expect(lastUserMessageText([])).toBe('');
+  });
+});
 
 describe('extractMessageText', () => {
   it('extracts text from string content', () => {

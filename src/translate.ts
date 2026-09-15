@@ -30,6 +30,23 @@ export function extractMessageText(
 }
 
 /**
+ * lastUserMessageText extracts the text of the final user message — the
+ * frame image attachments ride on when history is replayed as native
+ * upstream frames. Returns '' when the history contains no user message.
+ */
+export function lastUserMessageText(messages: OpenAIMessage[]): string {
+  if (!messages || messages.length === 0) {
+    return '';
+  }
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') {
+      return extractMessageText(messages[i].content);
+    }
+  }
+  return '';
+}
+
+/**
  * flattenMessages concatenates the message history into one prompt text.
  * - If single user message, return verbatim
  * - If multi-turn, format System:\n..., User:\n..., Assistant:\n... joined by \n\n

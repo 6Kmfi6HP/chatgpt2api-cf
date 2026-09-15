@@ -178,7 +178,10 @@ export function buildAnonRequestBodyWithTools(
     // No caller messages: keep buildAnonRequest's prompt-placeholder user message.
     messages = dto.messages as UpstreamMessage[];
   }
-  if (tools.length > 0) {
+  // tool_choice:"none" opts out of tool-calling entirely: no protocol frame
+  // is prepended (mirrors the handler's hasTools gate and StreamProcessor's
+  // toolCallState gate).
+  if (tools.length > 0 && req?.tool_choice !== 'none') {
     messages = [toolProtocolFrame(tools), ...messages];
   }
 

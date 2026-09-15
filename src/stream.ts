@@ -39,6 +39,14 @@ export class StreamProcessor {
   public prevText = '';
   public withheld = '';
   public toolCallState?: ToolCallStreamState;
+  /**
+   * Message id of the live assistant reply being streamed. Upstream
+   * conversation streams re-emit replayed history frames (multi-frame
+   * history) as already-complete messages before the fresh reply; only the
+   * live message may be streamed back to the client. Empty until the first
+   * live snapshot designates it.
+   */
+  public liveMessageId = '';
 
   constructor(
     model: string,
@@ -70,6 +78,28 @@ export class StreamProcessor {
     const ev = rawJSON;
     if (!ev.message || ev.message.author?.role !== 'assistant') {
       return [];
+    }
+
+    // Multi-frame history replay: the upstream stream re-emits each replayed
+    // assistant frame as an already-complete message before the fresh reply.
+    // Echo frames arrive "finished_successfully" with no live markers, while
+    // every snapshot of the live reply carries "in_progress" status or the
+    // "next"/"final" turn markers. History echoes must not be streamed back —
+    // only the live reply is new content.
+    const msgId = typeof ev.message.id === 'string' ? ev.message.id : '';
+    if (msgId !== this.liveMessageId) {
+      const status = ev.message.status;
+      const isHistoryEcho =
+        (status === 'finished_successfully' || status === 'finished') &&
+        ev.message?.metadata?.message_type !== 'next' &&
+        ev.message.channel !== 'final';
+      if (isHistoryEcho) {
+        return [];
+      }
+      // The live reply (re)starts: reset the cumulative snapshot-diff state.
+      this.liveMessageId = msgId;
+      this.prevText = '';
+      this.withheld = '';
     }
 
     const parts: string[] = [];
@@ -357,6 +387,17 @@ export async function aggregateNonStream(
           ingestMetadata(sources, parsed);
           if (!parsed.message || parsed.message.author?.role !== 'assistant') {
             return;
+          }
+          // Multi-frame history replay: skip re-emitted assistant frames —
+          // they are conversation history, not this turn's reply (mirrors the
+          // StreamProcessor gate).
+          if (parsed.message.status === 'finished_successfully') {
+            const isHistoryEcho =
+              parsed.message?.metadata?.message_type !== 'next' &&
+              parsed.message.channel !== 'final';
+            if (isHistoryEcho) {
+              return;
+            }
           }
           const parts: string[] = [];
           if (Array.isArray(parsed.message.content?.parts)) {

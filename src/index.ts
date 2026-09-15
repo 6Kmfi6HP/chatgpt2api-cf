@@ -4,7 +4,7 @@ import { streamSSE } from 'hono/streaming';
 import type { Env, ChatCompletionRequest, ChatCompletionResponse } from './types';
 import { UpstreamClient, StatusError } from './client';
 import { deviceManager as defaultDeviceManager, DeviceManager } from './device';
-import { buildAnonRequest, flattenMessages } from './translate';
+import { flattenMessages, lastUserMessageText } from './translate';
 import { buildAnonRequestBodyWithTools } from './toolcall_wire';
 import { getModelCatalog } from './catalog';
 import { pipeOpenAIStream, aggregateNonStream } from './stream';
@@ -12,7 +12,6 @@ import {
   collectImageRefs,
   resolveImage,
   buildMultimodalContent,
-  hasImageContent,
   type ResolvedImage,
 } from './image_parts';
 import { uploadImage, sniffImageMime, defaultExtensionForMime } from './upload';
@@ -85,7 +84,10 @@ async function retryToolTurn(
           mimeSet.add(mimeType);
           resolved.push({ fileId, sizeBytes: img.bytes.byteLength, width: img.width, height: img.height, mimeType });
         }
-        messageContent = buildMultimodalContent(prompt, resolved);
+        messageContent = buildMultimodalContent(
+          lastUserMessageText(req.messages),
+          resolved
+        );
         mimeTypes = [...mimeSet];
       }
       const anonBody = buildAnonRequestBodyWithTools(req as any, {
@@ -330,46 +332,12 @@ export function createApp(options?: AppOptions) {
           Array.isArray(req.tools) &&
           req.tools.length > 0 &&
           req.tool_choice !== 'none';
-        let anonBody: Record<string, any>;
-        if (hasTools) {
-          // Tool protocol compiled into a system message; the whole OpenAI
-          // messages[] (incl. role:"tool" results) maps to upstream frames.
-          let toolMessageContent: Record<string, any> | undefined;
-          let toolMimeTypes: string[] | undefined;
-          if (imageRefs.length > 0) {
-            const resolved: ResolvedImage[] = [];
-            const mimeTypes = new Set<string>();
-            for (const ref of imageRefs) {
-              const img = await resolveImage(ref, (u, init) =>
-                fetch(u, { ...init, signal })
-              );
-              const sniffed = sniffImageMime(img.bytes);
-              const mimeType =
-                sniffed !== 'application/octet-stream' ? sniffed : img.mimeType;
-              const { fileId } = await uploadImage({
-                client,
-                deviceId: device.id,
-                imageBytes: img.bytes,
-                mimeType,
-                fileName: `image.${defaultExtensionForMime(mimeType)}`,
-                signal,
-              });
-              mimeTypes.add(mimeType);
-              resolved.push({ fileId, sizeBytes: img.bytes.byteLength, width: img.width, height: img.height, mimeType });
-            }
-            toolMessageContent = buildMultimodalContent(prompt, resolved);
-            toolMimeTypes = [...mimeTypes];
-          }
-          // When tools are active the upstream web tool can hijack the turn
-          // and break the reply convention. Default search OFF for tool
-          // requests unless the caller explicitly opts in.
-          const toolReq = { ...req, search: req.search ?? false } as any;
-          anonBody = buildAnonRequestBodyWithTools(toolReq, {
-            prompt,
-            messageContent: toolMessageContent,
-            attachmentMimeTypes: toolMimeTypes,
-          });
-        } else if (imageRefs.length > 0) {
+
+        // Resolve and upload image attachments (order preserved). All images
+        // ride the last user frame, exactly like the pre-existing behavior.
+        let messageContent: Record<string, any> | undefined;
+        let attachmentMimeTypes: string[] | undefined;
+        if (imageRefs.length > 0) {
           const resolved: ResolvedImage[] = [];
           const mimeTypes = new Set<string>();
           for (const ref of imageRefs) {
@@ -390,28 +358,51 @@ export function createApp(options?: AppOptions) {
             mimeTypes.add(mimeType);
             resolved.push({ fileId, sizeBytes: img.bytes.byteLength, width: img.width, height: img.height, mimeType });
           }
-          const content = buildMultimodalContent(prompt, resolved);
-          anonBody = buildAnonRequest(model, prompt, {
-            search: req.search,
-            thinkingEffort: req.reasoning_effort,
-            serviceTier: req.service_tier,
-            oneOffModelOverride: req.one_off_model_override,
-            systemHints: req.system_hints,
-            localFunctionNames: req.local_function_names,
-            mapSearchParams: req.map_search_params,
-            messageContent: content,
-            attachmentMimeTypes: [...mimeTypes],
-          });
-        } else {
-          anonBody = buildAnonRequest(model, prompt, {
-            search: req.search,
-            thinkingEffort: req.reasoning_effort,
-            serviceTier: req.service_tier,
-            oneOffModelOverride: req.one_off_model_override,
-            systemHints: req.system_hints,
-            localFunctionNames: req.local_function_names,
-            mapSearchParams: req.map_search_params,
-          });
+          // The multimodal frame carries only the final user message's text:
+          // the rest of the history is replayed as its own native frames.
+          messageContent = buildMultimodalContent(
+            lastUserMessageText(req.messages),
+            resolved
+          );
+          attachmentMimeTypes = [...mimeTypes];
+        }
+
+        // Multi-turn continuity: every OpenAI message (system/user/assistant/
+        // tool) maps to one native upstream frame in a fresh conversation.
+        // The anonymous upstream model treats a pasted transcript prompt as
+        // untrusted external content and disowns it ("I don't have access to
+        // that memory"), but native frames are honored as its own history, so
+        // follow-up turns keep recalling prior context. Tool requests
+        // additionally get the compiled tool-protocol system frame prepended.
+        //
+        // Search defaults are unchanged: ON for plain chat unless
+        // "search": false; OFF for tool requests unless "search": true (the
+        // upstream web tool competes with tool-calling).
+        const wireReq = {
+          ...req,
+          model,
+          search: hasTools ? req.search ?? false : req.search !== false,
+        } as any;
+        const anonBody = buildAnonRequestBodyWithTools(wireReq, {
+          prompt,
+          messageContent,
+          attachmentMimeTypes,
+        });
+
+        // Degenerate history without a single user message (e.g. system-only):
+        // replay it as the pre-existing single user frame so the upstream
+        // conversation still opens on a user turn.
+        if (
+          !hasTools &&
+          !(anonBody.messages as any[]).some((m) => m?.author?.role === 'user')
+        ) {
+          anonBody.messages = [
+            {
+              author: { role: 'user' },
+              content:
+                messageContent ?? { content_type: 'text', parts: [prompt] },
+            },
+          ];
         }
 
         const conduitToken = await client.prepare(

@@ -39,6 +39,7 @@
 - **🛑 Client Abort & Stream Cancellation**: Full `AbortSignal` propagation. If a client disconnects or clicks "Stop Generating", upstream fetching and reading are canceled immediately, saving CPU and quota.
 - **🌏 Accurate Token Estimation**: CJK-aware token estimator (~1.5 tokens/char for Chinese/Japanese/Korean) and chars/4 for ASCII.
 - **🔑 Dual Authentication Support**: Compatible with standard `Authorization: Bearer <key>` and `x-api-key: <key>`.
+- **💬 True Multi-Turn Continuity**: every OpenAI message maps to a native upstream frame. Follow-up turns replay the full history as real conversation turns, so the anonymous model treats prior context as its own memory (labeled-transcript prompts get disowned as untrusted content on longer histories).
 - **📋 Live Model Catalog**: `GET /v1/models` proxies the real anonymous catalog from upstream (`GET backend-anon/models`): `gpt-5-5`, `gpt-5-6`, `gpt-5-3-mini`, `gpt-5-5-mini`, `gpt-5-6-mini`, `auto`. Cached 1h in KV; falls back to `["auto"]` if upstream is unreachable. **No name mapping** — the slug you request is passed through verbatim, so you can select `gpt-5-6` or a cheaper mini yourself.
 - **🔎 Web Search ON by Default**: Requests are sent with `forceUseSearch: true`; citations auto-format as Markdown links. Per-request opt-out: `"search": false`.
 - **🖼 Anonymous Image Understanding**: OpenAI `image_url` / `input_image` parts (data URLs or http(s) URLs) are transparently re-uploaded to the upstream anonymous file pipeline and attached as `image_asset_pointer` parts — no login required. Multi-image and streaming supported.
@@ -60,7 +61,9 @@ Hono Router (src/index.ts)
         │     • Verifies sentinel token (~9 min TTL) & auto-refreshes before expiry
         │
         ├─ 2. Request Translation (src/translate.ts)
-        │     • Flattens multi-turn OpenAI messages → labeled transcript
+        │     • Maps each OpenAI message to a native upstream frame (multi-turn
+        │       history is replayed as real conversation turns the model treats
+        │       as its own memory; labeled-transcript prompts get disowned)
         │     • Builds anonymous conversation DTO (model: "auto")
         │
         ├─ 3. Upstream 3-Stage Client (src/client.ts)

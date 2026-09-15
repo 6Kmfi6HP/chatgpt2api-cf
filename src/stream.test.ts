@@ -64,6 +64,98 @@ describe('StreamProcessor', () => {
     expect(finalChunks[0].choices[0].finish_reason).toBe('stop');
   });
 
+  it('skips re-emitted history frames (multi-frame replay) and streams only the live reply', () => {
+    const sp = new StreamProcessor('gpt-4o');
+
+    // History echo #1: replayed assistant frame arrives already finished,
+    // without live markers.
+    const echo1 = {
+      type: 'message_stream',
+      conversation_id: 'conv-123',
+      message: {
+        id: 'hist-1',
+        author: { role: 'assistant' },
+        content: { content_type: 'text', parts: ['Three apple trees — nice! What variety?'] },
+        status: 'finished_successfully',
+        end_turn: null,
+        metadata: { request_id: 'req-1' },
+        channel: null,
+      },
+    };
+    expect(sp.processEvent(echo1)).toEqual([]);
+
+    // History echo #2 (second replayed assistant frame, also finished).
+    const echo2 = {
+      type: 'message_stream',
+      conversation_id: 'conv-123',
+      message: {
+        id: 'hist-2',
+        author: { role: 'assistant' },
+        content: { content_type: 'text', parts: ['Earlier answer.'] },
+        status: 'finished_successfully',
+        channel: null,
+      },
+    };
+    expect(sp.processEvent(echo2)).toEqual([]);
+
+    // Live reply: starts in_progress with empty text, then grows.
+    const liveStart = {
+      type: 'message_stream',
+      conversation_id: 'conv-123',
+      message: {
+        id: 'live-1',
+        author: { role: 'assistant' },
+        content: { content_type: 'text', parts: [''] },
+        status: 'in_progress',
+        metadata: { message_type: 'next' },
+        channel: 'final',
+      },
+    };
+    // The first live snapshot carries the OpenAI role delta (text is empty).
+    const startChunks = sp.processEvent(liveStart);
+    expect(startChunks.length).toBe(1);
+    expect(startChunks[0].choices[0].delta).toEqual({ role: 'assistant' });
+
+    const liveGrow = {
+      type: 'message_stream',
+      conversation_id: 'conv-123',
+      message: {
+        id: 'live-1',
+        author: { role: 'assistant' },
+        content: { content_type: 'text', parts: ['3'] },
+        status: 'finished_successfully',
+        end_turn: true,
+        metadata: { message_type: 'next', finish_details: { type: 'stop' } },
+        channel: 'final',
+      },
+    };
+    const chunks = sp.processEvent(liveGrow);
+    expect(chunks.length).toBe(1);
+    expect(chunks[0].choices[0].delta).toEqual({ content: '3' });
+
+    const finalChunks = sp.flush();
+    expect(finalChunks[0].choices[0].finish_reason).toBe('stop');
+  });
+
+  it('streams a reply that arrives only as a finished snapshot with live markers', () => {
+    const sp = new StreamProcessor('gpt-4o');
+    const fastReply = {
+      type: 'message_stream',
+      message: {
+        id: 'fast-1',
+        author: { role: 'assistant' },
+        content: { content_type: 'text', parts: ['Instant answer.'] },
+        status: 'finished_successfully',
+        end_turn: true,
+        metadata: { message_type: 'next', finish_details: { type: 'stop' } },
+        channel: 'final',
+      },
+    };
+    const chunks = sp.processEvent(fastReply);
+    expect(chunks.length).toBe(2);
+    expect(chunks[1].choices[0].delta).toEqual({ content: 'Instant answer.' });
+  });
+
   it('handles multi-part assistant content', () => {
     const sp = new StreamProcessor('auto');
     const ev = {

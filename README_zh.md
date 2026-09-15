@@ -39,6 +39,7 @@
 - **🛑 客户端流式中断响应（AbortSignal）**：全链路监听客户端断开连接。当用户在前端点击“停止生成”或关闭网页时，立即中止与 OpenAI 的上游请求，彻底杜绝 Worker CPU 与上游额度浪费。
 - **🌏 精确的中日韩（CJK）Token 统计**：针对汉字/假名/谚文字符进行加权统计（中文约 1.5 token/字），与官方 `tiktoken` 表现高度贴近。
 - **🔑 双鉴权请求头支持**：同时支持标准的 `Authorization: Bearer <key>` 与 `x-api-key: <key>`，方便与各类客户端集成。
+- **💬 真实的多轮连续对话**：每条 OpenAI 消息映射为一个上游原生消息帧。后续轮次将完整历史作为真实对话轮次重放，匿名模型会把先前上下文视作自身记忆（带角色标记的拼接文本在历史变长后会被模型当作不可信内容而"失忆"）。
 - **📋 动态真实模型目录**：`GET /v1/models` 不再读静态配置，改为实时代理上游匿名目录（`GET backend-anon/models`）：`gpt-5-5`、`gpt-5-6`、`gpt-5-3-mini`、`gpt-5-5-mini`、`gpt-5-6-mini`、`auto`。KV 缓存 1 小时，上游不可达时回退 `["auto"]`。**无名称映射**：客户端传入的 slug 原样透传，可自选 gpt-5-6 或更省配额的 mini。
 - **🔎 联网搜索默认开启**：所有请求自动携带 `forceUseSearch: true`，引用自动渲染为 Markdown 链接。单次关闭：`"search": false`。
 - **🖼 匿名图片理解（看图）**：OpenAI `image_url` / `input_image` 内容部分（data URL 或 http(s) URL）会被透明地重新上传到上游匿名文件管线，并以 `image_asset_pointer` 形式随消息发送 —— 无需登录。支持单条消息多图与流式输出。
@@ -60,7 +61,7 @@ Hono 路由中心 (src/index.ts)
         │     • 检查 Sentinel Token (~9分钟有效)，临期自动刷新
         │
         ├─ 2. 请求消息扁平化转换 (src/translate.ts)
-        │     • 将 OpenAI 多轮会话展平为带角色标记的单段文本 (System/User/Assistant)
+        │     • 将 OpenAI 多轮会话逐条映射为上游原生消息帧 (多轮历史作为真实对话轮次重放, 模型视其为自身记忆)
         │     • 构造上游 Android 匿名协议 DTO (model: "auto")
         │
         ├─ 3. 上游三阶段认证客户端 (src/client.ts)

@@ -229,6 +229,124 @@ describe('Hono Application (src/index.ts)', () => {
     });
   });
 
+  describe('POST /v1/chat/completions - multi-turn history replay', () => {
+    const postChat = async (body: any) =>
+      app.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+        mockEnv
+      );
+
+    it('maps each message of a multi-turn conversation to a native upstream frame', async () => {
+      const res = await postChat({
+        model: 'auto',
+        messages: [
+          { role: 'system', content: 'You are concise.' },
+          { role: 'user', content: 'remember the codeword alpha1' },
+          { role: 'assistant', content: 'ok1' },
+          { role: 'user', content: 'What was the codeword?' },
+        ],
+      });
+      expect(res.status).toBe(200);
+      const dto = mockClient.prepareCalls[0].anonBody;
+      expect(dto.messages).toEqual([
+        {
+          author: { role: 'system' },
+          content: { content_type: 'text', parts: ['You are concise.'] },
+        },
+        {
+          author: { role: 'user' },
+          content: { content_type: 'text', parts: ['remember the codeword alpha1'] },
+        },
+        {
+          author: { role: 'assistant' },
+          content: { content_type: 'text', parts: ['ok1'] },
+        },
+        {
+          author: { role: 'user' },
+          content: { content_type: 'text', parts: ['What was the codeword?'] },
+        },
+      ]);
+      // Stateless OpenAI semantics stay: a fresh upstream conversation per
+      // request, with the whole history replayed as native frames.
+      expect(dto.conversationId).toBeNull();
+      expect(dto.parentMessageId).toBeNull();
+      // No labeled-transcript blob pasted into a single frame anymore.
+      expect(JSON.stringify(dto.messages)).not.toContain('Assistant:');
+    });
+
+    it('keeps the single-message wire shape: one verbatim user frame', async () => {
+      const res = await postChat({
+        model: 'auto',
+        messages: [{ role: 'user', content: 'Say hello' }],
+      });
+      expect(res.status).toBe(200);
+      const dto = mockClient.prepareCalls[0].anonBody;
+      expect(dto.messages).toEqual([
+        {
+          author: { role: 'user' },
+          content: { content_type: 'text', parts: ['Say hello'] },
+        },
+      ]);
+    });
+
+    it('falls back to a single user frame when history has no user message', async () => {
+      const res = await postChat({
+        model: 'auto',
+        messages: [{ role: 'system', content: 'You are terse.' }],
+      });
+      expect(res.status).toBe(200);
+      const dto = mockClient.prepareCalls[0].anonBody;
+      expect(dto.messages).toEqual([
+        {
+          author: { role: 'user' },
+          content: { content_type: 'text', parts: ['System:\nYou are terse.'] },
+        },
+      ]);
+    });
+
+    it('tool history without tools enabled maps role:"tool" results to tool frames', async () => {
+      const res = await postChat({
+        model: 'auto',
+        messages: [
+          { role: 'user', content: 'weather in Tokyo?' },
+          {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              {
+                id: 'call_abc123',
+                type: 'function',
+                function: { name: 'get_weather', arguments: '{"city":"Tokyo"}' },
+              },
+            ],
+          },
+          {
+            role: 'tool',
+            tool_call_id: 'call_abc123',
+            name: 'get_weather',
+            content: '{"temp_c":26}',
+          },
+        ],
+      });
+      expect(res.status).toBe(200);
+      const msgs = mockClient.prepareCalls[0].anonBody.messages;
+      expect(msgs.length).toBe(3);
+      expect(msgs[0].author.role).toBe('user');
+      expect(msgs[1].author.role).toBe('assistant');
+      expect(msgs[1].content.parts[0]).toContain('tool_calls');
+      expect(msgs[2].author.role).toBe('tool');
+      expect(msgs[2].author.name).toBe('get_weather');
+      expect(msgs[2].content.parts[0]).toBe('{"temp_c":26}');
+      // No tool protocol frame: tools were not part of the request.
+      expect(msgs[0].author.role).not.toBe('system');
+    });
+  });
+
   describe('Bearer Token Authentication', () => {
     it('allows requests when API_KEYS is empty (public mode)', async () => {
       const res = await app.request('/v1/models', { method: 'GET' }, mockEnv);
