@@ -42,6 +42,7 @@
 - **📋 动态真实模型目录**：`GET /v1/models` 不再读静态配置，改为实时代理上游匿名目录（`GET backend-anon/models`）：`gpt-5-5`、`gpt-5-6`、`gpt-5-3-mini`、`gpt-5-5-mini`、`gpt-5-6-mini`、`auto`。KV 缓存 1 小时，上游不可达时回退 `["auto"]`。**无名称映射**：客户端传入的 slug 原样透传，可自选 gpt-5-6 或更省配额的 mini。
 - **🔎 联网搜索默认开启**：所有请求自动携带 `forceUseSearch: true`，引用自动渲染为 Markdown 链接。单次关闭：`"search": false`。
 - **🖼 匿名图片理解（看图）**：OpenAI `image_url` / `input_image` 内容部分（data URL 或 http(s) URL）会被透明地重新上传到上游匿名文件管线，并以 `image_asset_pointer` 形式随消息发送 —— 无需登录。支持单条消息多图与流式输出。
+- **🛠 OpenAI 工具调用（Function Calling）**：传入标准 `tools` 定义即可；网关把工具协议编译进上游 system 消息，解析模型工具调用回复，返回 assistant `tool_calls` 与 `finish_reason: "tool_calls"`（含流式 delta）。执行后以 `role: "tool"` 消息回灌即可进入下一轮。
 - **📍 可配置 Placement / 出站区域**：`wrangler.jsonc` 内置 `"placement": { "region": "aws:us-west-2" }`，使 Worker 无论客户端从哪里接入均在美国机房执行（修复香港等地边缘出站被区域封锁的问题）。
 
 ---
@@ -266,7 +267,53 @@ response = client.chat.completions.create(
 - 上传使用每设备匿名配额（每池化设备每日约 10 次）；触发 429 时设备池自动轮换。
 - 图片 URL 由 Worker 抓取 —— 内网/私有地址不可达。
 
-### 4. 常见客户端配置（NextChat、Chatbox、Cursor、Cline 等）
+### 4. 工具调用（Function Calling）
+
+标准 OpenAI `tools` + `tool_calls` 流程即可使用：
+
+```python
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "lookup_employee_floor",
+        "description": "按全名查询员工所在楼层",
+        "parameters": {
+            "type": "object",
+            "properties": {"employee_name": {"type": "string"}},
+            "required": ["employee_name"],
+        },
+    },
+}]
+
+# 第一轮: 模型发起工具调用
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "John Hartman 在几楼办公？"}],
+    tools=tools,
+)
+tc = response.choices[0].message.tool_calls[0]
+# response.choices[0].finish_reason == "tool_calls"
+
+# 第二轮: 执行工具后回灌结果（一次请求完成）
+response = client.chat.completions.create(
+    model="auto",
+    messages=[
+        {"role": "user", "content": "John Hartman 在几楼办公？"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": tc.id, "type": "function",
+             "function": {"name": "lookup_employee_floor", "arguments": tc.function.arguments}},
+        ]},
+        {"role": "tool", "tool_call_id": tc.id, "name": "lookup_employee_floor",
+         "content": '{"floor": 7, "building": "HQ-North"}'},
+    ],
+    tools=tools,
+)
+print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 楼办公。"
+```
+
+流式模式会输出 `delta.tool_calls` 帧与 `finish_reason: "tool_calls"`。
+
+### 5. 常见客户端配置（NextChat、Chatbox、Cursor、Cline 等）
 
 - **接口地址 (Base URL / API Host)**: `https://<your-worker>.workers.dev/v1`
 - **API Key**: 若环境变量 `API_KEYS` 留空，可填任意占位符（如 `sk-test`）；若设置了密钥则填入对应值。
@@ -294,6 +341,7 @@ pnpm exec tsc --noEmit
 - **联网搜索默认开启**：请求携带 `forceUseSearch: true`，引用自动整理为 Markdown 链接。单次请求关闭：`"search": false`。
 - **采样参数**：上游匿名层不支持 `temperature`、`top_p`、`seed` 以及函数调用（Function Calling / Tools）；网关会正常吸收这些参数以兼容客户端，但不会影响上游输出。
 - **多模态**：支持图片部分（自动重上传至匿名文件管线，每设备每日约 10 次上传配额，由设备池自动轮换）；音频及其他附件类型仍会被剔除。
+- **工具调用**：通过编译的 system 协议实现（匿名上游无原生 tools API）。模型服从度因匿名副本而异，必要时重试。带 tools 的请求默认关闭联网搜索（上游 web 工具可能劫持工具调用轮次）；用 `"search": true` 可显式开启。`tool_choice: "none"` 完全禁用工具调用。
 - **边缘地区限制**：OpenAI 对部分国家/地区（如中国香港节点）有 IP 封锁。若你的 Worker 请求正好经由受限地区节点出站，可能会遇到 OpenAI 的地区性 403。可配置 Cloudflare Smart Placement 或 Location Hint 优化出站。
 
 ---

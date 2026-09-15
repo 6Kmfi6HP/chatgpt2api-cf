@@ -466,3 +466,218 @@ describe('Hono Application (src/index.ts)', () => {
     });
   });
 });
+
+describe('Tool calling (OpenAI tools API)', () => {
+  it('compiles tools into a system protocol message and maps role:"tool" results upstream', async () => {
+    const { app } = await import('./index');
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({ client, deviceManager: dm });
+
+    const payload = {
+      model: 'auto',
+      stream: false,
+      messages: [
+        { role: 'user', content: 'What is the weather in Tokyo? Use the tool.' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            {
+              id: 'call_abc123',
+              type: 'function',
+              function: { name: 'get_weather', arguments: '{"city":"Tokyo"}' },
+            },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'call_abc123', name: 'get_weather', content: '{"temp_c":26}' },
+      ],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            description: 'Get current weather for a city',
+            parameters: {
+              type: 'object',
+              properties: { city: { type: 'string' } },
+              required: ['city'],
+            },
+          },
+        },
+      ],
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, mockEnv);
+
+    expect(res.status).toBe(200);
+    // Inspect what was sent upstream
+    const convCall = client.conversationCalls[0];
+    expect(convCall).toBeDefined();
+    const dto = convCall.anonBody;
+    const msgs = dto.messages;
+    // First message = tool protocol system
+    expect(msgs[0].author.role).toBe('system');
+    expect(msgs[0].content.parts[0]).toContain('get_weather');
+    // User message preserved
+    expect(msgs.some((m: any) => m.author.role === 'user')).toBe(true);
+    // Tool result frame with author.name
+    const toolFrame = msgs.find((m: any) => m.author.role === 'tool');
+    expect(toolFrame).toBeDefined();
+    expect(toolFrame.author.name).toBe('get_weather');
+    expect(toolFrame.content.parts[0]).toContain('26');
+    // Assistant tool_calls trajectory frame contains the JSON convention
+    const asstFrame = msgs.find((m: any) => m.author.role === 'assistant');
+    expect(asstFrame).toBeDefined();
+    expect(asstFrame.content.parts[0]).toContain('tool_calls');
+  });
+
+  it('returns finish_reason "tool_calls" with assistant tool_calls when the model emits the JSON convention', async () => {
+    const { app } = await import('./index');
+    const client = new MockUpstreamClient();
+    const toolReply = '{"tool_calls":[{"name":"get_weather","arguments":{"city":"Tokyo"}}]}';
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent(toolReply))}\n\n`]);
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({ client, deviceManager: dm });
+
+    const payload = {
+      model: 'auto',
+      stream: false,
+      messages: [{ role: 'user', content: 'weather in Tokyo?' }],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            description: 'Get weather',
+            parameters: { type: 'object', properties: { city: { type: 'string' } } },
+          },
+        },
+      ],
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, mockEnv);
+
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.choices[0].finish_reason).toBe('tool_calls');
+    expect(data.choices[0].message.content).toBeNull();
+    expect(data.choices[0].message.tool_calls).toHaveLength(1);
+    const tc = data.choices[0].message.tool_calls[0];
+    expect(tc.id).toMatch(/^call_[A-Za-z0-9]{22}$/);
+    expect(tc.type).toBe('function');
+    expect(tc.function.name).toBe('get_weather');
+    expect(tc.function.arguments).toBe('{"city":"Tokyo"}');
+  });
+
+  it('streams tool_calls delta frames without leaking the JSON', async () => {
+    const { app } = await import('./index');
+    const client = new MockUpstreamClient();
+    const toolReply = '{"tool_calls":[{"name":"get_weather","arguments":{"city":"Tokyo"}}]}';
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent(toolReply))}\n\n`]);
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({ client, deviceManager: dm });
+
+    const payload = {
+      model: 'auto',
+      stream: true,
+      messages: [{ role: 'user', content: 'weather in Tokyo?' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'get_weather', description: 'Get weather', parameters: { type: 'object', properties: {} } },
+        },
+      ],
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, mockEnv);
+
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+    // The raw JSON convention must NOT appear as streamed content
+    expect(raw).not.toContain('"tool_calls":[{"name"');
+    // A tool_calls delta frame must appear
+    expect(raw).toContain('tool_calls');
+    expect(raw).toContain('get_weather');
+    // finish_reason tool_calls in the final chunk
+    expect(raw).toContain('finish_reason":"tool_calls"');
+  });
+
+  it('plain text replies keep finish_reason "stop" and content even with tools present', async () => {
+    const { app } = await import('./index');
+    const client = new MockUpstreamClient();
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('The weather is sunny.'))}\n\n`]);
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({ client, deviceManager: dm });
+
+    const payload = {
+      model: 'auto',
+      stream: false,
+      messages: [{ role: 'user', content: 'hello' }],
+      tools: [
+        { type: 'function', function: { name: 'get_weather', description: 'x', parameters: { type: 'object', properties: {} } } },
+      ],
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, mockEnv);
+
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.choices[0].finish_reason).toBe('stop');
+    expect(data.choices[0].message.content).toBe('The weather is sunny.');
+    expect(data.choices[0].message.tool_calls).toBeUndefined();
+  });
+
+  it('tool_choice "none" disables the tool protocol entirely', async () => {
+    const { app } = await import('./index');
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({ client, deviceManager: dm });
+
+    const payload = {
+      model: 'auto',
+      stream: false,
+      messages: [{ role: 'user', content: 'hello' }],
+      tool_choice: 'none',
+      tools: [
+        { type: 'function', function: { name: 'get_weather', description: 'x', parameters: { type: 'object', properties: {} } } },
+      ],
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, mockEnv);
+
+    expect(res.status).toBe(200);
+    const convCall = client.conversationCalls[0];
+    const msgs = convCall.anonBody.messages;
+    // No tool protocol system message inserted
+    expect(msgs[0].author.role).not.toBe('system');
+  });
+});

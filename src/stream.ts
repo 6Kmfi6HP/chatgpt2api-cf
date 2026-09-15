@@ -11,6 +11,8 @@ import {
   splitCitationTail,
   resolveWithheld,
 } from './citations';
+import { ToolCallStreamState } from './toolcall_stream';
+import { buildToolCallsChatMessage } from './toolcall_wire';
 import {
   buildOpenAIChunk,
   buildFinalChunk,
@@ -36,6 +38,7 @@ export class StreamProcessor {
   public emittedRole = false;
   public prevText = '';
   public withheld = '';
+  public toolCallState?: ToolCallStreamState;
 
   constructor(
     model: string,
@@ -47,6 +50,10 @@ export class StreamProcessor {
     this.originalReq = originalReq;
     this.messageId = messageId || genID('chatcmpl-');
     this.created = created || Math.floor(Date.now() / 1000);
+    const anyReq = originalReq as any;
+    if (anyReq && Array.isArray(anyReq.tools) && anyReq.tools.length > 0 && anyReq.tool_choice !== 'none') {
+      this.toolCallState = new ToolCallStreamState();
+    }
   }
 
   /**
@@ -78,6 +85,45 @@ export class StreamProcessor {
     const full = parts.join('');
     const formatted = formatCitations(full, this.sources);
     const { keep: fullClean, tail } = splitCitationTail(formatted);
+
+    // Tool-call stream detection: when enabled, the detector may decide to
+    // buffer (JSON could still be a tool call), flush (plain text — emit the
+    // pending delta), or emit tool_calls deltas instead of content.
+    if (this.toolCallState) {
+      const emits = this.toolCallState.feed(fullClean);
+      const out: ChatCompletionChunk[] = [];
+      for (const e of emits) {
+        if (e.delta?.tool_calls) {
+          if (!this.emittedRole) {
+            this.emittedRole = true;
+            out.push(
+              buildOpenAIChunk(this.messageId, this.created, this.model, {
+                role: 'assistant',
+              })
+            );
+          }
+          out.push(
+            buildOpenAIChunk(this.messageId, this.created, this.model, e.delta as any)
+          );
+        } else if (e.delta?.content) {
+          if (!this.emittedRole) {
+            this.emittedRole = true;
+            out.push(
+              buildOpenAIChunk(this.messageId, this.created, this.model, {
+                role: 'assistant',
+              })
+            );
+          }
+          out.push(
+            buildOpenAIChunk(this.messageId, this.created, this.model, {
+              content: e.delta.content,
+            })
+          );
+        }
+      }
+      this.prevText = fullClean;
+      return out;
+    }
 
     let delta = '';
     if (fullClean.startsWith(this.prevText)) {
@@ -146,7 +192,8 @@ export class StreamProcessor {
         this.created,
         this.model,
         promptTokens,
-        completionTokens
+        completionTokens,
+        this.toolCallState ? this.toolCallState.finishReason() : 'stop'
       )
     );
 
@@ -358,6 +405,31 @@ export async function aggregateNonStream(
     : '';
   const promptTokens = countRoughTokens(promptText);
   const completionTokens = countRoughTokens(finalText);
+
+  // Tool-call conversion: when the reply matches the tool-call convention,
+  // return an assistant message carrying tool_calls (content=null) and
+  // finish_reason "tool_calls".
+  const toolMsg = buildToolCallsChatMessage(finalText);
+  if (toolMsg) {
+    return {
+      id: genID('chatcmpl-'),
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [
+        {
+          index: 0,
+          message: toolMsg,
+          finish_reason: 'tool_calls',
+        },
+      ],
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+      },
+    } as any;
+  }
 
   return buildOpenAICompletion(
     genID('chatcmpl-'),

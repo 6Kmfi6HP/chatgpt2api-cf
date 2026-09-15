@@ -5,6 +5,7 @@ import type { Env, ChatCompletionRequest } from './types';
 import { UpstreamClient, StatusError } from './client';
 import { deviceManager as defaultDeviceManager, DeviceManager } from './device';
 import { buildAnonRequest, flattenMessages } from './translate';
+import { buildAnonRequestBodyWithTools } from './toolcall_wire';
 import { getModelCatalog } from './catalog';
 import { pipeOpenAIStream, aggregateNonStream } from './stream';
 import {
@@ -208,8 +209,14 @@ export function createApp(options?: AppOptions) {
     const model = (typeof req.model === 'string' && req.model.trim()) || 'auto';
     const prompt = flattenMessages(req.messages);
 
-    // Collect image references across all messages (order preserved).
-    const imageRefs = req.messages.flatMap((m) => collectImageRefs(m.content as any));
+    // Collect image references (order preserved). With tools enabled only
+    // user messages carry images (tool/assistant frames never do).
+    const hasToolsForRefs =
+      Array.isArray(req.tools) && req.tools.length > 0 && req.tool_choice !== 'none';
+    const refSource = hasToolsForRefs
+      ? req.messages.filter((m) => m.role === 'user')
+      : req.messages;
+    const imageRefs = refSource.flatMap((m) => collectImageRefs(m.content as any));
 
     const client = options?.client || new UpstreamClient();
     const dm = options?.deviceManager || defaultDeviceManager;
@@ -233,8 +240,50 @@ export function createApp(options?: AppOptions) {
         // the retry loop with the same device that runs the conversation. A
         // 429/403 from the upload path cools this device down and the loop
         // retries with a fresh one.
+        const hasTools =
+          Array.isArray(req.tools) &&
+          req.tools.length > 0 &&
+          req.tool_choice !== 'none';
         let anonBody: Record<string, any>;
-        if (imageRefs.length > 0) {
+        if (hasTools) {
+          // Tool protocol compiled into a system message; the whole OpenAI
+          // messages[] (incl. role:"tool" results) maps to upstream frames.
+          let toolMessageContent: Record<string, any> | undefined;
+          let toolMimeTypes: string[] | undefined;
+          if (imageRefs.length > 0) {
+            const resolved: ResolvedImage[] = [];
+            const mimeTypes = new Set<string>();
+            for (const ref of imageRefs) {
+              const img = await resolveImage(ref, (u, init) =>
+                fetch(u, { ...init, signal })
+              );
+              const sniffed = sniffImageMime(img.bytes);
+              const mimeType =
+                sniffed !== 'application/octet-stream' ? sniffed : img.mimeType;
+              const { fileId } = await uploadImage({
+                client,
+                deviceId: device.id,
+                imageBytes: img.bytes,
+                mimeType,
+                fileName: `image.${defaultExtensionForMime(mimeType)}`,
+                signal,
+              });
+              mimeTypes.add(mimeType);
+              resolved.push({ fileId, sizeBytes: img.bytes.byteLength, width: img.width, height: img.height, mimeType });
+            }
+            toolMessageContent = buildMultimodalContent(prompt, resolved);
+            toolMimeTypes = [...mimeTypes];
+          }
+          // When tools are active the upstream web tool can hijack the turn
+          // and break the reply convention. Default search OFF for tool
+          // requests unless the caller explicitly opts in.
+          const toolReq = { ...req, search: req.search ?? false } as any;
+          anonBody = buildAnonRequestBodyWithTools(toolReq, {
+            prompt,
+            messageContent: toolMessageContent,
+            attachmentMimeTypes: toolMimeTypes,
+          });
+        } else if (imageRefs.length > 0) {
           const resolved: ResolvedImage[] = [];
           const mimeTypes = new Set<string>();
           for (const ref of imageRefs) {

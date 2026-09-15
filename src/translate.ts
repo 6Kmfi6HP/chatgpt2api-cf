@@ -10,7 +10,7 @@ import type {
  * or an array of content parts. Non-text parts are ignored.
  */
 export function extractMessageText(
-  content: string | Array<{ type: string; text?: string }>
+  content: string | Array<{ type: string; text?: string }> | null
 ): string {
   if (typeof content === 'string') {
     return content;
@@ -191,7 +191,8 @@ export function buildFinalChunk(
   created: number,
   model: string,
   promptTokens?: number,
-  completionTokens?: number
+  completionTokens?: number,
+  finishReason?: 'stop' | 'tool_calls'
 ): ChatCompletionChunk {
   const pTokens = promptTokens ?? 0;
   const cTokens = completionTokens ?? 0;
@@ -204,7 +205,7 @@ export function buildFinalChunk(
       {
         index: 0,
         delta: {},
-        finish_reason: 'stop',
+        finish_reason: finishReason ?? 'stop',
       },
     ],
   };

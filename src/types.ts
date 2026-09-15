@@ -1,6 +1,30 @@
+export interface OpenAIToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description?: string;
+    parameters?: Record<string, any>;
+  };
+}
+
+export interface OpenAIToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
 export interface OpenAIMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string | Array<{ type: string; text?: string }>;
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | Array<{ type: string; text?: string }> | null;
+  /** Tool executor name for role="tool" messages. */
+  name?: string;
+  /** Assistant tool-call requests (mirrors OpenAI wire format). */
+  tool_calls?: OpenAIToolCall[];
+  /** Matches the assistant tool_calls[].id this message answers. */
+  tool_call_id?: string;
 }
 
 export interface ChatCompletionRequest {
@@ -58,15 +82,28 @@ export interface ChatCompletionRequest {
     longitudeSpan?: number;
     mapMessageId?: string;
   };
+  /**
+   * OpenAI function tool definitions. The gateway compiles them into the
+   * upstream system protocol; when the model emits a tool call the response
+   * carries assistant `tool_calls` with `finish_reason: "tool_calls"`.
+   */
+  tools?: OpenAIToolDefinition[];
+  /**
+   * Accepted for OpenAI compatibility: "auto" | "none" | named function.
+   * "none" disables tool-calling for the request; other values behave as
+   * "auto" (upstream has no native tool-choice knob).
+   */
+  tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
 }
 
 export interface ChatCompletionChoice {
   index: number;
   message: {
     role: 'assistant';
-    content: string;
+    content: string | null;
+    tool_calls?: OpenAIToolCall[];
   };
-  finish_reason: 'stop' | 'length' | null;
+  finish_reason: 'stop' | 'length' | 'tool_calls' | null;
 }
 
 export interface ChatCompletionResponse {
@@ -87,8 +124,9 @@ export interface ChatCompletionChunkChoice {
   delta: {
     role?: 'assistant';
     content?: string;
+    tool_calls?: Array<OpenAIToolCall & { index?: number }>;
   };
-  finish_reason: 'stop' | 'length' | null;
+  finish_reason: 'stop' | 'length' | 'tool_calls' | null;
 }
 
 export interface ChatCompletionChunk {

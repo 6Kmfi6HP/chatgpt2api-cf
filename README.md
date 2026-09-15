@@ -42,6 +42,7 @@
 - **📋 Live Model Catalog**: `GET /v1/models` proxies the real anonymous catalog from upstream (`GET backend-anon/models`): `gpt-5-5`, `gpt-5-6`, `gpt-5-3-mini`, `gpt-5-5-mini`, `gpt-5-6-mini`, `auto`. Cached 1h in KV; falls back to `["auto"]` if upstream is unreachable. **No name mapping** — the slug you request is passed through verbatim, so you can select `gpt-5-6` or a cheaper mini yourself.
 - **🔎 Web Search ON by Default**: Requests are sent with `forceUseSearch: true`; citations auto-format as Markdown links. Per-request opt-out: `"search": false`.
 - **🖼 Anonymous Image Understanding**: OpenAI `image_url` / `input_image` parts (data URLs or http(s) URLs) are transparently re-uploaded to the upstream anonymous file pipeline and attached as `image_asset_pointer` parts — no login required. Multi-image and streaming supported.
+- **🛠 OpenAI Tool Calling (function calling)**: pass standard `tools` definitions; the gateway compiles them into the upstream protocol, parses model tool-call replies, and returns assistant `tool_calls` with `finish_reason: "tool_calls"` (streaming deltas included). Feed results back as `role: "tool"` messages for the next turn.
 - **📍 Configurable Placement / Egress Region**: `wrangler.jsonc` ships with `"placement": { "region": "aws:us-west-2" }` so the Worker executes in the US regardless of where the client connects from (fixes regional 403 blocks, e.g. requests received at HK edge).
 
 ---
@@ -264,7 +265,53 @@ Notes:
 - Uploads use the per-device anonymous quota (~10/day per pooled device); the device pool rotates automatically on 429.
 - Image URLs are fetched by the Worker — private/intranet URLs are not reachable.
 
-### 4. Third-Party Clients (NextChat, Chatbox, Cursor, etc.)
+### 4. Tool Calling (Function Calling)
+
+Standard OpenAI `tools` + `tool_calls` flow works through the gateway:
+
+```python
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "lookup_employee_floor",
+        "description": "Look up which floor an employee works on, by full name",
+        "parameters": {
+            "type": "object",
+            "properties": {"employee_name": {"type": "string"}},
+            "required": ["employee_name"],
+        },
+    },
+}]
+
+# Turn 1: model requests a tool call
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "Which floor does John Hartman work on?"}],
+    tools=tools,
+)
+tc = response.choices[0].message.tool_calls[0]
+# response.choices[0].finish_reason == "tool_calls"
+
+# Turn 2: execute the tool, feed the result back (one request)
+response = client.chat.completions.create(
+    model="auto",
+    messages=[
+        {"role": "user", "content": "Which floor does John Hartman work on?"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": tc.id, "type": "function",
+             "function": {"name": "lookup_employee_floor", "arguments": tc.function.arguments}},
+        ]},
+        {"role": "tool", "tool_call_id": tc.id, "name": "lookup_employee_floor",
+         "content": '{"floor": 7, "building": "HQ-North"}'},
+    ],
+    tools=tools,
+)
+print(response.choices[0].message.content)  # "John Hartman works on the 7th floor of HQ-North."
+```
+
+Streaming emits `delta.tool_calls` frames and `finish_reason: "tool_calls"`.
+
+### 5. Third-Party Clients (NextChat, Chatbox, Cursor, etc.)
 
 - **Base URL / Endpoint**: `https://<your-worker>.workers.dev/v1`
 - **API Key**: Any dummy string (e.g. `sk-test`) if `API_KEYS` is empty, or your secret key.
@@ -292,6 +339,7 @@ pnpm exec tsc --noEmit
 - **Web Search ON by default**: requests send `forceUseSearch: true`; reply citations are auto-formatted as Markdown links. Per-request opt-out: `"search": false`.
 - **Sampling Knobs**: Knobs like `temperature`, `top_p`, `seed`, and function calling/tools are accepted for client compatibility, but ignored by upstream.
 - **Multimodal**: Image parts are supported (re-uploaded to the anonymous file pipeline, ~10 uploads/day per pooled device, pooled automatically). Audio and other attachment types are stripped. Image upload throttling upstream is per-device; the device pool rotates on 429 automatically.
+- **Tool calling**: implemented via a compiled system protocol (the anonymous upstream has no native tools API). Model adherence varies across anonymous replicas; retries may be needed. Requests with tools default `search` off (the upstream web tool can hijack tool-call turns); set `"search": true` to override. `tool_choice: "none"` disables tool-calling.
 - **Regional Restrictions**: Requests originating from Cloudflare edge locations in unsupported countries (e.g. Hong Kong, China) may trigger OpenAI's regional 403 blocks. Deploying with location hints or Smart Placement resolves this.
 
 ---
