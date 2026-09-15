@@ -32,26 +32,32 @@ const searchTool: ToolDefinition = {
 };
 
 describe('buildToolProtocolSystemMessage', () => {
-  it('lists tool names, descriptions and compact parameter schemas', () => {
+  it('lists tool names, descriptions and parameter schemas', () => {
     const msg = buildToolProtocolSystemMessage([weatherTool, searchTool]);
     expect(msg).toContain('get_weather');
     expect(msg).toContain('Get current weather for a city');
     expect(msg).toContain('web_search');
-    expect(msg).toContain('"properties":{"city":{"type":"string"}');
-    expect(msg).not.toContain('\n  '); // compact serialization, no pretty-print
+    expect(msg).toContain('"unit":{"type":"string"');
   });
 
   it('states the single-line JSON reply convention', () => {
     const msg = buildToolProtocolSystemMessage([weatherTool]);
     expect(msg).toContain('"tool_calls"');
     expect(msg).toContain('{"tool_calls":[{"name":"<tool>","arguments":{}}]}');
-    expect(msg).toContain('one line');
-    expect(msg).toContain('no markdown code fences');
+    expect(msg).toContain('one line of raw JSON');
+    expect(msg).toContain('No markdown code fences');
+  });
+
+  it('frames tools as real and mandates calling over guessing', () => {
+    const msg = buildToolProtocolSystemMessage([weatherTool]);
+    expect(msg).toContain('REAL, CALLABLE');
+    expect(msg).toContain('MUST call the tools');
+    expect(msg).toContain('Never guess');
   });
 
   it('says multiple calls are allowed and prose is preferred when possible', () => {
     const msg = buildToolProtocolSystemMessage([weatherTool]);
-    expect(msg).toContain('multiple');
+    expect(msg).toContain('Multiple entries');
     expect(msg).toContain('plain text');
   });
 
@@ -60,7 +66,7 @@ describe('buildToolProtocolSystemMessage', () => {
       { type: 'function', function: { name: 'ping' } },
     ]);
     expect(msg).toContain('ping');
-    expect(msg).toContain('parameters: {}');
+    expect(msg).toContain('no arguments');
   });
 });
 

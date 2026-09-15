@@ -118,7 +118,7 @@ describe('buildAnonRequestBodyWithTools', () => {
     const dto = buildAnonRequestBodyWithTools(req, { prompt: 'p' });
 
     expect(dto.messages.map((m: any) => m.author.role)).toEqual(['system', 'system', 'user']);
-    expect(dto.messages[0].content.parts.join('')).toContain('Tool call rules');
+    expect(dto.messages[0].content.parts.join('')).toContain('Tool call protocol');
     expect(dto.messages[1].content.parts).toEqual(['You are terse.']);
   });
 

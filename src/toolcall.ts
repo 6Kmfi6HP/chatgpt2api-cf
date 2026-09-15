@@ -47,32 +47,41 @@ export const TOOL_CALL_REPLY_FORMAT = '{"tool_calls":[{"name":"<tool>","argument
 
 /**
  * Build the system message that teaches the model the tool protocol.
- * Kept terse and imperative; tools are serialized compactly (no whitespace).
+ *
+ * Empirically (2026-09-15, anonymous backend replicas), adherence depends on
+ * three factors baked into the wording:
+ *  1. tools are framed as REAL, CALLABLE system-provided tools (otherwise the
+ *     model answers "unable to access the tool");
+ *  2. an explicit "you do not know this from training - MUST call, never
+ *     guess" clause (otherwise the model hallucinates plausible answers);
+ *  3. a concrete single-line JSON template shown once per request.
  */
 export function buildToolProtocolSystemMessage(tools: ToolDefinition[]): string {
-  const lines: string[] = [
-    '# Tools',
-    '',
-    'You can invoke tools to help answer. Available tools:',
-    '',
-  ];
+  const toolLines: string[] = [];
   for (const t of tools) {
     const f = t.function;
     const schema = f.parameters ? JSON.stringify(f.parameters) : '{}';
-    lines.push(`## ${f.name}`);
-    if (f.description) lines.push(f.description);
-    lines.push(`parameters: ${schema}`);
-    lines.push('');
+    const params = schema === '{}' ? 'no arguments' : schema;
+    toolLines.push(`- ${f.name}(${params})${f.description ? ` -> ${f.description}` : ''}`);
   }
-  lines.push(
-    '# Tool call rules',
+
+  const lines: string[] = [
+    'You have access to REAL, CALLABLE tools provided by the system (not hypothetical).',
     '',
-    `- To call tool(s), your entire reply must be exactly one line of raw JSON, no markdown code fences, no explanation, no text before or after: ${TOOL_CALL_REPLY_FORMAT}`,
-    '- "arguments" must be a valid JSON object matching the tool\'s parameter schema.',
-    '- You may include multiple entries in "tool_calls" to call several tools at once.',
-    '- If the information you have is already enough to answer, reply in plain text and do not output "tool_calls".',
-    '- Never mix tool calls with prose in the same reply.',
-  );
+    'Available tools:',
+    ...toolLines,
+    '',
+    'Tool call protocol (STRICT):',
+    'When a tool call is needed, your ENTIRE reply must be exactly one line of raw JSON and nothing else:',
+    TOOL_CALL_REPLY_FORMAT,
+    '',
+    'Rules:',
+    '- No markdown code fences, no explanation, no text before or after. The reply is parsed by a machine.',
+    '- "arguments" must be a valid JSON object matching the tool parameter schema.',
+    '- Multiple entries in "tool_calls" are allowed to call several tools at once.',
+    '- ONLY when you already have all the information needed to fully answer, reply in plain text instead.',
+    '- You do NOT have this data from training - you MUST call the tools to get it. Never guess or invent results.',
+  ];
   return lines.join('\n');
 }
 
