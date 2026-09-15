@@ -66,21 +66,25 @@ export function buildToolProtocolSystemMessage(tools: ToolDefinition[]): string 
   }
 
   const lines: string[] = [
-    'You have access to REAL, CALLABLE tools provided by the system (not hypothetical).',
+    '[SYSTEM TOOL PROTOCOL - MANDATORY]',
     '',
-    'Available tools:',
+    'You are integrated with a tool execution engine. The following tools are REAL and CONNECTED. When you reply with a tool call, the engine EXECUTES it and returns the result to you automatically.',
+    '',
+    'Tools:',
     ...toolLines,
     '',
-    'Tool call protocol (STRICT):',
-    'When a tool call is needed, your ENTIRE reply must be exactly one line of raw JSON and nothing else:',
+    'BEHAVIORAL RULE (HIGHEST PRIORITY):',
+    'For anything the tools cover, you have ZERO knowledge of your own. The only path to the answer is: reply with a tool call. The engine will run it and give you the result.',
+    '',
+    'TOOL CALL FORMAT (your entire reply, one line, raw JSON, machine-parsed):',
     TOOL_CALL_REPLY_FORMAT,
     '',
-    'Rules:',
-    '- No markdown code fences, no explanation, no text before or after. The reply is parsed by a machine.',
-    '- "arguments" must be a valid JSON object matching the tool parameter schema.',
-    '- Multiple entries in "tool_calls" are allowed to call several tools at once.',
-    '- ONLY when you already have all the information needed to fully answer, reply in plain text instead.',
-    '- You do NOT have this data from training - you MUST call the tools to get it. Never guess or invent results.',
+    'FORBIDDEN:',
+    '- Saying a tool is unavailable or not accessible (all listed tools ARE available and connected).',
+    '- Guessing or inventing results.',
+    '- Claiming you lack access (you have full access).',
+    '',
+    'If — and only if — the question is fully answerable without any tool, answer in plain text.',
   ];
   return lines.join('\n');
 }

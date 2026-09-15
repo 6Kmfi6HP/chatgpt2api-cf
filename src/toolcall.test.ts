@@ -44,20 +44,20 @@ describe('buildToolProtocolSystemMessage', () => {
     const msg = buildToolProtocolSystemMessage([weatherTool]);
     expect(msg).toContain('"tool_calls"');
     expect(msg).toContain('{"tool_calls":[{"name":"<tool>","arguments":{}}]}');
-    expect(msg).toContain('one line of raw JSON');
-    expect(msg).toContain('No markdown code fences');
+    expect(msg).toContain('one line, raw JSON, machine-parsed');
+    expect(msg).toContain('FORBIDDEN');
   });
 
   it('frames tools as real and mandates calling over guessing', () => {
     const msg = buildToolProtocolSystemMessage([weatherTool]);
-    expect(msg).toContain('REAL, CALLABLE');
-    expect(msg).toContain('MUST call the tools');
-    expect(msg).toContain('Never guess');
+    expect(msg).toContain('REAL and CONNECTED');
+    expect(msg).toContain('HIGHEST PRIORITY');
+    expect(msg).toContain('Guessing or inventing results');
   });
 
   it('says multiple calls are allowed and prose is preferred when possible', () => {
     const msg = buildToolProtocolSystemMessage([weatherTool]);
-    expect(msg).toContain('Multiple entries');
+    expect(msg).toContain('ZERO knowledge');
     expect(msg).toContain('plain text');
   });
 

@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { streamSSE } from 'hono/streaming';
-import type { Env, ChatCompletionRequest } from './types';
+import type { Env, ChatCompletionRequest, ChatCompletionResponse } from './types';
 import { UpstreamClient, StatusError } from './client';
 import { deviceManager as defaultDeviceManager, DeviceManager } from './device';
 import { buildAnonRequest, flattenMessages } from './translate';
@@ -20,6 +20,92 @@ import { uploadImage, sniffImageMime, defaultExtensionForMime } from './upload';
 export interface AppOptions {
   client?: UpstreamClient;
   deviceManager?: DeviceManager;
+}
+
+
+
+/** Refusal patterns anonymous models emit instead of a tool call. */
+const REFUSAL_PATTERNS = [
+  /unable to (access|use|invoke|retrieve|determine)/i,
+  /can'?t (access|use|invoke|determine|retrieve)/i,
+  /cannot (access|use|invoke|determine|retrieve)/i,
+  /don'?t have (access|the)/i,
+  /tool .{0,24}(available|accessible)/i,
+  /no access to/i,
+  /can'?t determine that from/i,
+  /from (public web|public) results/i,
+];
+
+/** True when a reply looks like a tool refusal rather than a real answer. */
+export function looksLikeRefusal(text: string): boolean {
+  if (!text) return false;
+  return REFUSAL_PATTERNS.some((p) => p.test(text));
+}
+
+interface RetryArgs {
+  model: string;
+  prompt: string;
+  imageRefs: ReturnType<typeof collectImageRefs>;
+  req: ChatCompletionRequest;
+  client: UpstreamClient;
+  dm: DeviceManager;
+  signal?: AbortSignal;
+}
+
+/**
+ * Re-runs a tool turn on fresh devices (up to 3 attempts). Returns the first
+ * non-refusal aggregated completion, or the last one if all refused.
+ */
+async function retryToolTurn(
+  env: Env,
+  args: RetryArgs
+): Promise<ChatCompletionResponse | null> {
+  const { model, prompt, imageRefs, req, client, dm, signal } = args;
+  let lastResult: ChatCompletionResponse | null = null;
+  for (let i = 0; i < 4; i++) {
+    try {
+      const device = await dm.getHealthyDevice(env, client);
+      let messageContent: Record<string, any> | undefined;
+      let mimeTypes: string[] | undefined;
+      if (imageRefs.length > 0) {
+        const resolved: ResolvedImage[] = [];
+        const mimeSet = new Set<string>();
+        for (const ref of imageRefs) {
+          const img = await resolveImage(ref, (u, init) => fetch(u, { ...init, signal }));
+          const sniffed = sniffImageMime(img.bytes);
+          const mimeType = sniffed !== 'application/octet-stream' ? sniffed : img.mimeType;
+          const { fileId } = await uploadImage({
+            client,
+            deviceId: device.id,
+            imageBytes: img.bytes,
+            mimeType,
+            fileName: `image.${defaultExtensionForMime(mimeType)}`,
+            signal,
+          });
+          mimeSet.add(mimeType);
+          resolved.push({ fileId, sizeBytes: img.bytes.byteLength, width: img.width, height: img.height, mimeType });
+        }
+        messageContent = buildMultimodalContent(prompt, resolved);
+        mimeTypes = [...mimeSet];
+      }
+      const anonBody = buildAnonRequestBodyWithTools(req as any, {
+        prompt,
+        messageContent,
+        attachmentMimeTypes: mimeTypes,
+      });
+      const conduitToken = await client.prepare(device.id, device.sentinelToken!, anonBody, signal);
+      const resp = await client.conversation(device.id, device.sentinelToken!, conduitToken, anonBody, signal);
+      const result = await aggregateNonStream(resp, model, req);
+      lastResult = result;
+      const content = result.choices?.[0]?.message?.content ?? '';
+      if (result.choices?.[0]?.finish_reason === 'tool_calls' || !looksLikeRefusal(content)) {
+        return result;
+      }
+    } catch {
+      // keep trying
+    }
+  }
+  return lastResult;
 }
 
 /**
@@ -382,7 +468,26 @@ export function createApp(options?: AppOptions) {
       });
     }
 
-    const result = await aggregateNonStream(upstreamResp, model, req);
+    // Transparent refusal retry for non-stream tool requests: anonymous
+    // models sometimes answer "unable to access the tool" instead of calling
+    // it. Give the request one more round on a fresh device when detected.
+    let result = await aggregateNonStream(upstreamResp, model, req);
+    if (
+      hasToolsForRefs &&
+      result.choices?.[0]?.finish_reason === 'stop' &&
+      looksLikeRefusal(result.choices[0].message?.content ?? '')
+    ) {
+      try {
+        await upstreamResp.body?.cancel();
+      } catch {}
+      const retryResp = await retryToolTurn(c.env, {
+        model, prompt, imageRefs, req, client, dm, signal,
+      });
+      if (retryResp) {
+        result = retryResp;
+        c.header('x-device-id', 'rotated');
+      }
+    }
     return c.json(result);
   });
 

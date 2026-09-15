@@ -160,7 +160,9 @@ export function buildAnonRequestBodyWithTools(
   const tools = normalizeToolDefinitions(req);
 
   const dto = buildAnonRequest(req?.model ?? '', opts.prompt, {
-    search: req?.search,
+    // Tool requests default search OFF: the upstream web tool competes with
+    // tool-calling and breaks the reply convention. Explicit search=true opts in.
+    search: req?.search ?? false,
     thinkingEffort: req?.reasoning_effort,
     serviceTier: req?.service_tier,
     oneOffModelOverride: req?.one_off_model_override,
