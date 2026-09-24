@@ -513,6 +513,154 @@ describe('Hono Application (src/index.ts)', () => {
       expect(bodyText).toContain('"finish_reason":"stop"');
       expect(bodyText).toContain('data: [DONE]');
     });
+
+    it('streaming tool refusal is transparently retried on a fresh device and yields tool_calls', async () => {
+      const tool = {
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          description: 'Get weather',
+          parameters: {
+            type: 'object',
+            properties: { city: { type: 'string' } },
+            required: ['city'],
+          },
+        },
+      };
+      let callCount = 0;
+      mockClient.conversationHandler = async () => {
+        callCount++;
+        if (callCount === 1) {
+          // Attempt 1: refusal prose, no tool_call JSON.
+          return createSseResponse([
+            `data: ${JSON.stringify(
+              mkAssistantEvent("I'm unable to access the weather tool from here.")
+            )}\n\n`,
+          ]);
+        }
+        // Attempt 2: the tool-call convention JSON.
+        return createSseResponse([
+          `data: ${JSON.stringify(
+            mkAssistantEvent('{"tool_calls":[{"name":"get_weather","arguments":{"city":"上海"}}]}')
+          )}\n\n`,
+        ]);
+      };
+
+      const reqPayload = {
+        model: 'auto',
+        stream: true,
+        search: false,
+        tools: [tool],
+        messages: [{ role: 'user', content: '查一下上海今天天气' }],
+      };
+
+      const res = await app.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        },
+        mockEnv
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toContain('text/event-stream');
+      const bodyText = await res.text();
+
+      // Upstream was consulted twice: refusal attempt + successful retry.
+      expect(callCount).toBe(2);
+      // Client received a real tool_call frame. The refusal prose never leaked.
+      expect(bodyText).toContain('"tool_calls"');
+      expect(bodyText).toContain('get_weather');
+      expect(bodyText).not.toContain('unable to access');
+      expect(bodyText).toContain('"finish_reason":"tool_calls"');
+      expect(bodyText).toContain('data: [DONE]');
+    });
+
+    it('streaming refusal retries are exhausted: the last refusal streams as-is', async () => {
+      const tool = {
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          description: 'Get weather',
+          parameters: { type: 'object', properties: { city: { type: 'string' } } },
+        },
+      };
+      let callCount = 0;
+      mockClient.conversationHandler = async () => {
+        callCount++;
+        return createSseResponse([
+          `data: ${JSON.stringify(
+            mkAssistantEvent("I'm unable to access that tool right now.")
+          )}\n\n`,
+        ]);
+      };
+
+      const reqPayload = {
+        model: 'auto',
+        stream: true,
+        search: false,
+        tools: [tool],
+        messages: [{ role: 'user', content: '查一下上海今天天气' }],
+      };
+
+      const res = await app.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        },
+        mockEnv
+      );
+
+      expect(res.status).toBe(200);
+      const bodyText = await res.text();
+      // Refusal text only ever appears ONCE in the client-visible stream, from
+      // the final attempt — previous buffered attempts never leaked.
+      const refusalOccurrences = (bodyText.match(/unable to access/g) || []).length;
+      expect(refusalOccurrences).toBe(1);
+      expect(bodyText).toContain('data: [DONE]');
+      // 1 initial + up to (MAX_STREAM_ATTEMPTS-1) transparent retries + the
+      // final non-stream retry inside the loop that also failed → bounded.
+      expect(callCount).toBeGreaterThanOrEqual(1);
+      expect(callCount).toBeLessThanOrEqual(8);
+    });
+
+    it('streaming non-tool traffic skips refusal retry entirely', async () => {
+      let callCount = 0;
+      mockClient.conversationHandler = async () => {
+        callCount++;
+        return createSseResponse([
+          `data: ${JSON.stringify(
+            mkAssistantEvent("I can't access private systems, but here's public info.")
+          )}\n\n`,
+        ]);
+      };
+
+      const reqPayload = {
+        model: 'auto',
+        stream: true,
+        messages: [{ role: 'user', content: '介绍一下股份有限公司' }],
+      };
+
+      const res = await app.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        },
+        mockEnv
+      );
+
+      expect(res.status).toBe(200);
+      const bodyText = await res.text();
+      expect(callCount).toBe(1);
+      expect(bodyText).toContain("can't access private systems");
+      expect(bodyText).toContain('data: [DONE]');
+    });
   });
 
   describe('429 StatusError Auto-Rotation Retry', () => {

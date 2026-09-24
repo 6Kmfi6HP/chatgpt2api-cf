@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Runtime-Cloudflare%20Workers-orange?logo=cloudflare" alt="Cloudflare Workers" />
   <img src="https://img.shields.io/badge/Framework-Hono-E36002?logo=hono" alt="Hono" />
   <img src="https://img.shields.io/badge/TypeScript-Strict-blue?logo=typescript" alt="TypeScript" />
-  <img src="https://img.shields.io/badge/Tests-112%20Passing-brightgreen" alt="Tests" />
+  <img src="https://img.shields.io/badge/Tests-258%20Passing-brightgreen" alt="Tests" />
   <img src="https://img.shields.io/badge/Bundle%20Size-~44%20KiB-success" alt="Bundle Size" />
   <img src="https://img.shields.io/badge/License-MIT-lightgrey" alt="License" />
 </p>
@@ -340,9 +340,9 @@ pnpm exec tsc --noEmit
 
 - **模型透传**：不做名称映射，客户端传入的模型 slug 原样发往上层；空/无效回退为 `auto`。
 - **联网搜索默认开启**：请求携带 `forceUseSearch: true`，引用自动整理为 Markdown 链接。单次请求关闭：`"search": false`。
-- **采样参数**：上游匿名层不支持 `temperature`、`top_p`、`seed` 以及函数调用（Function Calling / Tools）；网关会正常吸收这些参数以兼容客户端，但不会影响上游输出。
+- **采样参数**：上游匿名层不支持 `temperature`、`top_p`、`seed`；网关会正常吸收这些参数以兼容客户端，但不会影响上游输出。函数调用与工具调用本身不受此限制。
 - **多模态**：支持图片部分（自动重上传至匿名文件管线，每设备每日约 10 次上传配额，由设备池自动轮换）；音频及其他附件类型仍会被剔除。
-- **工具调用**：通过编译的 system 协议实现（匿名上游无原生 tools API）。模型服从度因匿名副本而异，必要时重试。带 tools 的请求默认关闭联网搜索（上游 web 工具可能劫持工具调用轮次）；用 `"search": true` 可显式开启。`tool_choice: "none"` 完全禁用工具调用。
+- **工具调用**：通过编译的 system 协议实现（匿名上游无原生 tools API）。模型服从度因匿名副本而异；网关检测到“拒绝文案”时会自动换新设备重试（最多 3 次），**流式与非流式行为一致** —— 流式客户端不再显著劣于非流式。带 tools 的请求默认关闭联网搜索（上游 web 工具可能劫持工具调用轮次）；用 `"search": true` 可显式开启。`tool_choice: "none"` 完全禁用工具调用。注：`"search": false` 会以 `forceUseSearch: false` 透传上游，但上游模型仍可能自行搜索 —— 该开关仅为建议而非强制。
 - **边缘地区限制**：OpenAI 对部分国家/地区（如中国香港节点）有 IP 封锁。若你的 Worker 请求正好经由受限地区节点出站，可能会遇到 OpenAI 的地区性 403。可配置 Cloudflare Smart Placement 或 Location Hint 优化出站。
 
 ---

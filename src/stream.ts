@@ -9,6 +9,8 @@ import {
   ingestMetadata,
   formatCitations,
   splitCitationTail,
+  splitGenuiContainerTail,
+  stripGenuiContainers,
   resolveWithheld,
 } from './citations';
 import { ToolCallStreamState } from './toolcall_stream';
@@ -37,7 +39,11 @@ export class StreamProcessor {
   public sources = new Map<string, SearchSource>();
   public emittedRole = false;
   public prevText = '';
+  /** Latest live-reply raw text (citations+citations cleaned), pre-flush. */
+  public lastFullText = '';
   public withheld = '';
+  /** Bare genui fence fragment withheld from emission (may still grow). */
+  public withheldGenui = '';
   public toolCallState?: ToolCallStreamState;
   /**
    * Message id of the live assistant reply being streamed. Upstream
@@ -100,6 +106,7 @@ export class StreamProcessor {
       this.liveMessageId = msgId;
       this.prevText = '';
       this.withheld = '';
+      this.withheldGenui = '';
     }
 
     const parts: string[] = [];
@@ -114,7 +121,17 @@ export class StreamProcessor {
     }
     const full = parts.join('');
     const formatted = formatCitations(full, this.sources);
-    const { keep: fullClean, tail } = splitCitationTail(formatted);
+    // Bare genui containers (":::writing{…}" fence lines around the body)
+    // are stripped AFTER citations so a link inside a container survives,
+    // while its fence lines are removed.
+    const stripped = stripGenuiContainers(formatted);
+    const { keep: citationClean, tail } = splitCitationTail(stripped);
+    // A bare ":::" fence fragment at the very end may still grow into a full
+    // opener/closer line on the next snapshot; withhold it like a citation
+    // fragment so partial marker text never reaches the client.
+    const { keep: fullClean, tail: genuiTail } = splitGenuiContainerTail(citationClean);
+    this.withheldGenui = genuiTail;
+    this.lastFullText = fullClean;
 
     // Tool-call stream detection: when enabled, the detector may decide to
     // buffer (JSON could still be a tool call), flush (plain text — emit the
@@ -181,6 +198,11 @@ export class StreamProcessor {
     return out;
   }
 
+  /** Finish reason the current run would end with ("tool_calls" if detected). */
+  toolCallFinishReason(): 'tool_calls' | 'stop' {
+    return this.toolCallState ? this.toolCallState.finishReason() : 'stop';
+  }
+
   /**
    * Flushes stream tail and emits terminal chunks:
    * 1. Any resolved withheld citation fragment (if any)
@@ -189,9 +211,10 @@ export class StreamProcessor {
    */
   flush(): ChatCompletionChunk[] {
     const out: ChatCompletionChunk[] = [];
-    if (this.withheld) {
-      const fragment = resolveWithheld(this.withheld);
+    if (this.withheld || this.withheldGenui) {
+      const fragment = resolveWithheld(this.withheldGenui) + resolveWithheld(this.withheld);
       this.withheld = '';
+      this.withheldGenui = '';
       if (fragment) {
         if (!this.emittedRole) {
           this.emittedRole = true;
@@ -374,6 +397,7 @@ export async function aggregateNonStream(
   const sources = new Map<string, SearchSource>();
   let emitted = '';
   let withheld = '';
+  let withheldGenui = '';
 
   if (resp.body) {
     const reader = resp.body.getReader();
@@ -411,10 +435,14 @@ export async function aggregateNonStream(
           }
           const full = parts.join('');
           const formatted = formatCitations(full, sources);
-          if (!formatted) return;
-          const split = splitCitationTail(formatted);
-          emitted = split.keep;
-          withheld = split.tail;
+          // Bare genui containers: strip fence lines, keep the body.
+          const stripped = stripGenuiContainers(formatted);
+          if (!stripped) return;
+          const citeSplit = splitCitationTail(stripped);
+          const genuiSplit = splitGenuiContainerTail(citeSplit.keep);
+          emitted = genuiSplit.keep;
+          withheld = citeSplit.tail;
+          withheldGenui = genuiSplit.tail;
         } catch {
           // ignore
         }
@@ -440,7 +468,8 @@ export async function aggregateNonStream(
     }
   }
 
-  const finalText = emitted + resolveWithheld(withheld);
+  const finalText =
+    emitted + resolveWithheld(withheldGenui) + resolveWithheld(withheld);
   const promptText = originalReq?.messages
     ? flattenMessages(originalReq.messages)
     : '';

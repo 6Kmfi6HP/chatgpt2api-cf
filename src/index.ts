@@ -7,7 +7,8 @@ import { deviceManager as defaultDeviceManager, DeviceManager } from './device';
 import { flattenMessages, lastUserMessageText } from './translate';
 import { buildAnonRequestBodyWithTools } from './toolcall_wire';
 import { getModelCatalog } from './catalog';
-import { pipeOpenAIStream, aggregateNonStream } from './stream';
+import { pipeOpenAIStream, aggregateNonStream, StreamProcessor } from './stream';
+import { createParser } from 'eventsource-parser';
 import {
   collectImageRefs,
   resolveImage,
@@ -49,6 +50,240 @@ interface RetryArgs {
   client: UpstreamClient;
   dm: DeviceManager;
   signal?: AbortSignal;
+}
+
+interface StreamRetryCtx {
+  env: Env;
+  prompt: string;
+  imageRefs: ReturnType<typeof collectImageRefs>;
+  client: UpstreamClient;
+  dm: DeviceManager;
+  hasTools: boolean;
+}
+
+type SSEWriter = Parameters<typeof pipeOpenAIStream>[1];
+
+/** Emit one OpenAI chunk (or "[DONE]") to an SSE writer. */
+async function emitSSE(
+  writer: SSEWriter,
+  chunk: import('./types').ChatCompletionChunk | string
+): Promise<void> {
+  const data = typeof chunk === 'string' ? chunk : JSON.stringify(chunk);
+  if (typeof writer.writeSSE === 'function') {
+    await writer.writeSSE({ data });
+  } else if (typeof writer.write === 'function') {
+    await writer.write(`data: ${data}\n\n`);
+  }
+}
+
+/**
+ * BufferedAttempt reads one upstream SSE response completely into a
+ * StreamProcessor, WITHOUT emitting anything. Retrying-before-anything-emits
+ * is safe because nothing has left the gateway yet; once a single chunk
+ * goes out we must stay on this attempt.
+ */
+interface BufferedAttempt {
+  chunks: import('./types').ChatCompletionChunk[];
+  sp: StreamProcessor;
+  aborted: boolean;
+}
+
+async function readBufferedAttempt(
+  resp: Response,
+  sp: StreamProcessor,
+  signal?: AbortSignal
+): Promise<BufferedAttempt> {
+  const chunks: import('./types').ChatCompletionChunk[] = [];
+  let aborted = false;
+  const parser = createParser({
+    onEvent: (event) => {
+      if (event.data === '[DONE]') return;
+      try {
+        const parsed = JSON.parse(event.data);
+        for (const c of sp.processEvent(parsed)) {
+          chunks.push(c);
+        }
+      } catch {
+        // Ignore non-JSON frames
+      }
+    },
+  });
+  if (resp.body) {
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    const onAbort = () => {
+      aborted = true;
+      try {
+        reader.cancel();
+      } catch {}
+    };
+    if (signal) {
+      if (signal.aborted) {
+        aborted = true;
+      } else {
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    }
+    try {
+      while (!aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parser.feed(decoder.decode(value, { stream: true }));
+      }
+    } finally {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      reader.releaseLock();
+    }
+  }
+  if (!aborted && typeof (parser as any).reset === 'function') {
+    try {
+      (parser as any).reset({ consume: true });
+    } catch {
+      // ignore
+    }
+  }
+  return { chunks, sp, aborted };
+}
+
+/**
+ * Synthesize a stream from an aggregated completion by feeding its text
+ * through a fresh StreamProcessor once. Used to deliver a retryToolTurn
+ * result (a non-stream completion) through the streaming code path.
+ */
+async function emitAggregatedAsStream(
+  writer: SSEWriter,
+  result: ChatCompletionResponse,
+  model: string,
+  req: ChatCompletionRequest
+): Promise<void> {
+  const sp = new StreamProcessor(model, req);
+  const text = result.choices?.[0]?.message?.content ?? '';
+  if (result.choices?.[0]?.finish_reason === 'tool_calls') {
+    const wire = JSON.stringify({
+      tool_calls: (result.choices?.[0]?.message?.tool_calls ?? []).map((tc: any) => ({
+        name: tc.function?.name,
+        arguments:
+          typeof tc.function?.arguments === 'string'
+            ? JSON.parse(tc.function.arguments || '{}')
+            : (tc.function?.arguments ?? {}),
+      })),
+    });
+    const synth = {
+      type: 'message_stream',
+      message: {
+        id: 'synth-retry',
+        author: { role: 'assistant' },
+        status: 'in_progress',
+        metadata: { message_type: 'next' },
+        content: { content_type: 'text', parts: [wire] },
+      },
+    };
+    for (const chunk of sp.processEvent(synth)) {
+      await emitSSE(writer, chunk);
+    }
+  } else if (text) {
+    const synth = {
+      type: 'message_stream',
+      message: {
+        id: 'synth-retry',
+        author: { role: 'assistant' },
+        status: 'in_progress',
+        metadata: { message_type: 'next' },
+        content: { content_type: 'text', parts: [text] },
+      },
+    };
+    for (const chunk of sp.processEvent(synth)) {
+      await emitSSE(writer, chunk);
+    }
+  }
+  for (const chunk of sp.flush()) {
+    await emitSSE(writer, chunk);
+  }
+  await emitSSE(writer, '[DONE]');
+}
+
+/**
+ * pipeOpenAIStreamRetrying is the streaming counterpart to the non-stream
+ * retryToolTurn path: when tool calling is active and the upstream model
+ * replies with a refusal text instead of a tool call, retry the turn on
+ * fresh devices up to 3 attempts before streaming what remains.
+ *
+ * Streaming-vs-buffering: because the tool-call detector itself buffers
+ * while a reply could still resolve into the tool-call JSON convention,
+ * NOTHING reaches the client in that window. As long as nothing has been
+ * emitted, switching attempts is transparent. Once any content or tool_calls
+ * chunk is emitted we stay on the attempt and stream it to the end.
+ *
+ * hasTools=false: no ambiguity to resolve; falls through to pipeOpenAIStream.
+ */
+async function pipeOpenAIStreamRetrying(
+  resp: Response,
+  writer: SSEWriter,
+  model: string,
+  req: ChatCompletionRequest,
+  signal: AbortSignal | undefined,
+  ctx: StreamRetryCtx
+): Promise<void> {
+  if (!ctx.hasTools) {
+    await pipeOpenAIStream(resp, writer, model, req, signal);
+    return;
+  }
+
+  const MAX_STREAM_ATTEMPTS = 3;
+  let currentResp: Response = resp;
+
+  for (let attempt = 0; attempt < MAX_STREAM_ATTEMPTS; attempt++) {
+    const sp = new StreamProcessor(model, req);
+    // NOTE: readBufferedAttempt holds every chunk until the upstream closes,
+    // so "the detector flushed the refusal as plain text" is recoverable —
+    // nothing has been written to the client yet. This is the entire reason
+    // transparent streaming retry is even possible.
+    const buffered = await readBufferedAttempt(currentResp, sp, signal);
+    if (buffered.aborted) return;
+
+    const sawToolCalls = buffered.chunks.some((c) => c.choices?.[0]?.delta?.tool_calls);
+    const refusal =
+      !sawToolCalls && sp.toolCallFinishReason() !== 'tool_calls' && looksLikeRefusal(sp.lastFullText);
+
+    if (refusal && attempt < MAX_STREAM_ATTEMPTS - 1) {
+      try {
+        await currentResp.body?.cancel();
+      } catch {}
+      const retryResp = await retryToolTurn(ctx.env, {
+        model,
+        prompt: ctx.prompt,
+        imageRefs: ctx.imageRefs,
+        req,
+        client: ctx.client,
+        dm: ctx.dm,
+        signal,
+      });
+      if (retryResp) {
+        const txt = retryResp.choices?.[0]?.message?.content ?? '';
+        const stillRefused =
+          retryResp.choices?.[0]?.finish_reason !== 'tool_calls' && looksLikeRefusal(txt);
+        if (!stillRefused) {
+          // Got a usable answer — stream it out as a synthesized attempt and
+          // finish, preserving the streaming contract.
+          await emitAggregatedAsStream(writer, retryResp, model, req);
+          return;
+        }
+      }
+      // Still refused (or retry failed): fall through and emit the attempt we
+      // already buffered — the client gets a proper refusal reply instead of
+      // silence. This mirrors the non-stream branch which keeps lastResult.
+    }
+
+    // Committed to this attempt: stream whatever we buffered, then the tail.
+    for (const chunk of buffered.chunks) {
+      await emitSSE(writer, chunk);
+    }
+    for (const chunk of sp.flush()) {
+      await emitSSE(writer, chunk);
+    }
+    await emitSSE(writer, '[DONE]');
+    return;
+  }
 }
 
 /**
@@ -455,7 +690,14 @@ export function createApp(options?: AppOptions) {
 
     if (req.stream) {
       return streamSSE(c, async (sseStream) => {
-        await pipeOpenAIStream(upstreamResp!, sseStream, model, req, signal);
+        await pipeOpenAIStreamRetrying(upstreamResp!, sseStream, model, req, signal, {
+          env: c.env,
+          prompt,
+          imageRefs,
+          client,
+          dm,
+          hasTools: hasToolsForRefs,
+        });
       });
     }
 

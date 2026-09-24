@@ -32,6 +32,45 @@ function mkAssistantEvent(text: string, metadata?: any) {
 }
 
 describe('StreamProcessor', () => {
+  it('strips bare :::writing{…} fences when they arrive whole in one snapshot', () => {
+    const sp = new StreamProcessor('gpt-4o');
+    const text =
+      '当然，给你一版简洁、正式的：\n' +
+      ':::writing{variant="document" id="58321" title="请假条"}\n' +
+      '**请假条**\n尊敬的老师：……\n' +
+      ':::';
+    const chunks = sp.processEvent(mkAssistantEvent(text));
+    const streamed = chunks.map((c) => (c.choices[0].delta as any)?.content ?? '').join('');
+    expect(streamed).toBe('当然，给你一版简洁、正式的：\n**请假条**\n尊敬的老师：……');
+    const flushed = sp
+      .flush()
+      .map((c) => (c.choices[0].delta as any)?.content ?? '')
+      .join('');
+    expect(flushed).toBe('');
+  });
+
+  it('withholds a partial :::writing fence split across snapshots', () => {
+    const sp = new StreamProcessor('gpt-4o');
+    // Snapshot 1 ends mid-fence.
+    const c1 = sp.processEvent(mkAssistantEvent('如下：\n:::writing{variant="doc'));
+    const s1 = c1.map((c) => (c.choices[0].delta as any)?.content ?? '').join('');
+    expect(s1).toBe('如下：\n');
+    // Snapshot 2 completes the fence and adds body.
+    const c2 = sp.processEvent(
+      mkAssistantEvent('如下：\n:::writing{variant="document"}\n正文内容\n:::')
+    );
+    const s2 = c2.map((c) => (c.choices[0].delta as any)?.content ?? '').join('');
+    expect(s2).toBe('正文内容');
+  });
+
+  it('keeps ::: inside a fenced code block instead of stripping it', () => {
+    const sp = new StreamProcessor('gpt-4o');
+    const text = '示例：\n```markdown\n:::writing{variant="document"}\n正文\n:::\n```\n结束';
+    const chunks = sp.processEvent(mkAssistantEvent(text));
+    const streamed = chunks.map((c) => (c.choices[0].delta as any)?.content ?? '').join('');
+    expect(streamed).toBe(text);
+  });
+
   it('emits role chunk on first assistant event and calculates deltas', () => {
     const sp = new StreamProcessor('gpt-4o');
 

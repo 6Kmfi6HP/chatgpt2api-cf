@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Runtime-Cloudflare%20Workers-orange?logo=cloudflare" alt="Cloudflare Workers" />
   <img src="https://img.shields.io/badge/Framework-Hono-E36002?logo=hono" alt="Hono" />
   <img src="https://img.shields.io/badge/TypeScript-Strict-blue?logo=typescript" alt="TypeScript" />
-  <img src="https://img.shields.io/badge/Tests-112%20Passing-brightgreen" alt="Tests" />
+  <img src="https://img.shields.io/badge/Tests-258%20Passing-brightgreen" alt="Tests" />
   <img src="https://img.shields.io/badge/Bundle%20Size-~44%20KiB-success" alt="Bundle Size" />
   <img src="https://img.shields.io/badge/License-MIT-lightgrey" alt="License" />
 </p>
@@ -340,9 +340,9 @@ pnpm exec tsc --noEmit
 
 - **Model Pass-through**: No name mapping. The slug you send goes upstream verbatim; unknown/empty models resolve to `auto`. See `GET /v1/models` for the real anonymous catalog.
 - **Web Search ON by default**: requests send `forceUseSearch: true`; reply citations are auto-formatted as Markdown links. Per-request opt-out: `"search": false`.
-- **Sampling Knobs**: Knobs like `temperature`, `top_p`, `seed`, and function calling/tools are accepted for client compatibility, but ignored by upstream.
+- **Sampling Knobs**: Knobs like `temperature`, `top_p`, `seed` are accepted for client compatibility, but ignored by upstream.
 - **Multimodal**: Image parts are supported (re-uploaded to the anonymous file pipeline, ~10 uploads/day per pooled device, pooled automatically). Audio and other attachment types are stripped. Image upload throttling upstream is per-device; the device pool rotates on 429 automatically.
-- **Tool calling**: implemented via a compiled system protocol (the anonymous upstream has no native tools API). Model adherence varies across anonymous replicas; retries may be needed. Requests with tools default `search` off (the upstream web tool can hijack tool-call turns); set `"search": true` to override. `tool_choice: "none"` disables tool-calling.
+- **Tool calling**: implemented via a compiled system protocol (the anonymous upstream has no native tools API). On refusal-text replies the gateway transparently retries the turn on fresh devices (up to 3 attempts) for BOTH non-stream and stream requests — behavior is identical, and streaming clients no longer see degraded adherence. Requests with tools default `search` off (the upstream web tool can hijack tool-call turns); set `"search": true` to override. `tool_choice: "none"` disables tool-calling. Note: `"search": false` is sent upstream as `forceUseSearch: false`, but the upstream model may still decide to search on its own — treat the toggle as advisory, not enforced.
 - **Regional Restrictions**: Requests originating from Cloudflare edge locations in unsupported countries (e.g. Hong Kong, China) may trigger OpenAI's regional 403 blocks. Deploying with location hints or Smart Placement resolves this.
 
 ---

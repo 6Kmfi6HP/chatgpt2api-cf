@@ -25,6 +25,33 @@ const CITATION_PARTIAL = /^(?:t(?:u(?:r(?:n[\da-z]*)?)?)?|c(?:i(?:t(?:e(?:turn[\
 // singleKeyRe finds individual citation keys inside an ASCII citation run.
 const SINGLE_KEY_RE = /turn\d+[a-z]+[0-9]+(?:c[0-9]+)?/g;
 
+// GENUI_CONTAINER_OPEN tags the opener fence line of a bare genui container
+// the upstream model sometimes emits verbatim
+// (":::writing{variant="document" id="…"}"): no PUA wrapping, just the colon
+// fence lines around the real body. The name must start right after ":::"
+// and the line must END at the optional closing brace, so prose containing
+// ":::" is never touched.
+const GENUI_CONTAINER_OPEN = /^:::[A-Za-z][\w-]*(?:\{[^\n]*\})?[ \t]*$/;
+// GENUI_CONTAINER_CLOSE matches the bare closing fence line ":::".
+const GENUI_CONTAINER_CLOSE = /^:::[ \t]*$/;
+// GENUI_CONTAINER_PARTIAL matches a line-starting prefix that could still
+// grow into a bare container opener or closer ("::", ":::writ", the opener
+// tail with a partial brace, …). Used to withhold fragments split across
+// cumulative snapshots.
+export const GENUI_CONTAINER_PARTIAL =
+  /^(?::(?::(?:(?:[A-Za-z][\w-]*)?(?:\{[^\n]*)?)?)?)?[ \t]*$/;
+// GENUI_MAX_ATTR_RUN caps how far back splitGenuiContainerTail rescans for
+// an unfinished "{…" attribute run — a bounded window avoids pathological
+// cost on huge replies (the whole reply is always cheap anyway, carried by
+// the caller's already-linear formatCitations pass).
+const GENUI_MAX_ATTR_RUN = 200;
+
+// nestedCitationLink repairs a citation link that landed INSIDE the parens
+// of a markdown link the model wrote itself, producing broken nesting:
+// "[来源：x]( [aljazeera.com](https://…) )" → "[来源：x](https://…)".
+const NESTED_CITATION_LINK = /(\[[^\]\n]*\]\()\s*\[[^\]\n]*\]\(([^()\s]+)\)\s*(\))/g;
+
+
 /**
  * cleanURL removes tracking parameters (e.g. utm_source) and trims whitespace.
  */
@@ -155,10 +182,121 @@ export function ingestMetadata(sources: Map<string, SearchSource>, rawJSON: any)
 }
 
 /**
+ * stripGenuiContainers removes bare (non-PUA-wrapped) genui container fence
+ * lines — ":::writing{…}" openers and bare ":::" closers — keeping the
+ * content between them. Nested containers are unwrapped level by level.
+ * Fence-looking text inside fenced code blocks (``` / ~~~) is preserved,
+ * since there it is user-visible code, not container markup.
+ */
+export function stripGenuiContainers(text: string): string {
+  if (!text || !text.includes(':::')) {
+    return text;
+  }
+  const lines = text.split('\n');
+  const out: string[] = [];
+  // depth counts OPEN container fences we dropped: only closers seen while
+  // depth > 0 are markup; an unbalanced stray ":::" line stays as content.
+  let depth = 0;
+  // codeFence tracks the open code fence (""" 或 ~~~, 可能带 info string)
+  // so its lines — ":::writing{void}" included — pass through untouched.
+  let codeFence: '```' | '~~~' | '' = '';
+  for (const line of lines) {
+    //  fenced code block boundary: ```xxx / ~~~ (closing fence has no info)
+    const fenceMatch = line.match(/^[ \t]*(`{3,}|~{3,})/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1].startsWith('~') ? '~~~' : '```';
+      if (codeFence === '') {
+        codeFence = marker;
+      } else if (codeFence === marker) {
+        codeFence = '';
+      }
+      out.push(line);
+      continue;
+    }
+    if (codeFence !== '') {
+      out.push(line);
+      continue;
+    }
+    if (GENUI_CONTAINER_OPEN.test(line)) {
+      depth++;
+      continue; // drop the opener fence line, keep following content
+    }
+    if (depth > 0 && GENUI_CONTAINER_CLOSE.test(line)) {
+      depth--;
+      continue; // matching closer fence line
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
+/**
+ * splitGenuiContainerTail removes and returns the longest trailing fragment
+ * of s that sits INSIDE a bare genui opener line still being written
+ * ("::", ":::writing{variant=""…" split mid-attribute). Mirrors
+ * splitCitationTail: the fragment is withheld until later snapshots complete
+ * the line, at which point stripGenuiContainers drops it.
+ */
+export function splitGenuiContainerTail(text: string): { keep: string; tail: string } {
+  if (!text || !text.includes(':')) {
+    return { keep: text, tail: '' };
+  }
+  const nl = text.lastIndexOf('\n');
+  const lineStart = nl + 1;
+  const lastLine = text.slice(lineStart);
+
+  // Find the last ":::" run on the last line: everything from there is the
+  // candidate fragment. We tolerate the fragment starting after text, since
+  // cumulative snapshots could have emitted any prefix of the fence already.
+  const fenceIdx = lastLine.lastIndexOf(':::');
+  if (fenceIdx >= 0) {
+    const candidate = lastLine.slice(fenceIdx);
+    const braceOpen = candidate.indexOf('{');
+    if (braceOpen === -1) {
+      // Partial or complete name-only opener prefix (":", "::", ":::wri").
+      if (/^:::[A-Za-z]?[\w-]*[ \t]*$/.test(candidate)) {
+        return { keep: text.slice(0, lineStart + fenceIdx), tail: candidate };
+      }
+      return { keep: text, tail: '' };
+    }
+    // Unfinished attribute run: withhold until '}' arrives.
+    const attrRun = candidate.slice(braceOpen);
+    if (attrRun.length <= GENUI_MAX_ATTR_RUN && !attrRun.includes('}')) {
+      return { keep: text.slice(0, lineStart + fenceIdx), tail: candidate };
+    }
+    return { keep: text, tail: '' };
+  }
+
+  // Rare alternative form seen in the wild: an unwrapped text token
+  // "genui<attrs>" (e.g. "genui5j") — presumably the inner 'writing' node's
+  // attribute id bleeding through. Withhold at line end so a following "{…}"
+  // or closing action can complete (or be dropped by resolveWithheld).
+  const genuiTailMatch = lastLine.match(/(genui[\w-]*)$/);
+  if (genuiTailMatch && lineStart + lastLine.length - genuiTailMatch[1].length >= lineStart) {
+    const cut = text.length - genuiTailMatch[1].length;
+    return { keep: text.slice(0, cut), tail: genuiTailMatch[1] };
+  }
+
+  // No ":::" yet: a trailing ":" / "::" (wherever it starts on the line)
+  // may still grow into a fence. Withhold only that suffix.
+  const trailing = lastLine.match(/(:{1,2})$/);
+  if (trailing) {
+    const cut = text.length - trailing[1].length;
+    return { keep: text.slice(0, cut), tail: trailing[1] };
+  }
+  return { keep: text, tail: '' };
+}
+
+/**
  * formatCitations replaces citation markers with inline markdown links.
- * If a key has no known source, it is safely stripped.
+ * If a key has no known source, it is safely stripped. When replacement
+ * lands a link inside a model-written markdown link, the nesting is repaired.
  */
 export function formatCitations(text: string, sources?: Map<string, SearchSource>): string {
+  // Fast path: no PUA runs, no ASCII citation markers, and nothing the
+  // post-pass could repair (a bare ":::" line is handled by
+  // stripGenuiContainers separately — formatCitations itself only needs the
+  // nested-link pass when replacements actually ran).
   if (
     !text.includes(PUA_ANNOTATION_START) &&
     !text.includes(PUA_ANNOTATION_SEP) &&
@@ -250,6 +388,11 @@ export function formatCitations(text: string, sources?: Map<string, SearchSource
   let s = text.replace(ANNOTATION_BLOCK, replaceBlock);
   s = s.replace(CITATION_RUN, replaceRun);
   s = s.replace(PUA_STRAY, '');
+  // Second pass: a link the replacement emitted may have landed INSIDE the
+  // parens of a markdown link the model wrote itself ("[来源：x]( [y](u) )"),
+  // which renders as broken nesting. Collapse it to the model's link text
+  // pointing at the citation URL.
+  s = s.replace(NESTED_CITATION_LINK, '$1$2$3');
   return s;
 }
 
@@ -302,6 +445,18 @@ export function resolveWithheld(fragment: string): string {
     fragment.includes(PUA_ANNOTATION_START) ||
     fragment.includes(PUA_ANNOTATION_SEP)
   ) {
+    return '';
+  }
+  // A withheld ":::"-fragment ("::", ":::writing{…") never made it to a full
+  // opener line: it is a truncated genui fence, not real content. Drop it;
+  // real prose never consists of only colon-fragments at line end.
+  if (fragment && /^:{1,3}[A-Za-z]?[\w-]*(?:\{[^\n]*)?[ \t]*$/.test(fragment)) {
+    return '';
+  }
+  // Bare "genui<attrs>" orphans (e.g. "genui5j") are fragments of an
+  // unwrapped writing-node attribute run. Real prose never ends in a bare
+  // "genui…" word — drop it.
+  if (fragment && /^genui[\w-]*$/.test(fragment)) {
     return '';
   }
   return fragment;

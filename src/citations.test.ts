@@ -5,6 +5,8 @@ import {
   ingestMetadata,
   formatCitations,
   stripCitations,
+  stripGenuiContainers,
+  splitGenuiContainerTail,
   splitCitationTail,
   resolveWithheld,
   PUA_ANNOTATION_START,
@@ -232,5 +234,155 @@ describe('ingestMetadata', () => {
     ingestMetadata(sources, 'invalid json');
     ingestMetadata(sources, {});
     expect(sources.size).toBe(0);
+  });
+});
+
+describe('stripGenuiContainers (bare ::: fence leakage)', () => {
+  it('removes bare :::writing{…} fences and keeps the body', () => {
+    const text =
+      '当然，给你一版简洁、正式的：\n' +
+      ':::writing{variant="document" id="58321" title="请假条"}\n' +
+      '**请假条**\n' +
+      '尊敬的老师：……\n' +
+      ':::';
+    expect(stripGenuiContainers(text)).toBe(
+      '当然，给你一版简洁、正式的：\n**请假条**\n尊敬的老师：……'
+    );
+  });
+
+  it('removes nested containers level by level', () => {
+    const text =
+      ':::writing{variant="chat_message"}\n' +
+      ':::writing{variant="document"}\n' +
+      '正文内容\n' +
+      ':::\n' +
+      ':::';
+    expect(stripGenuiContainers(text)).toBe('正文内容');
+  });
+
+  it('keeps an unbalanced stray ::: line as content', () => {
+    const text = '前文：\n:::';
+    expect(stripGenuiContainers(text)).toBe(text);
+  });
+
+  it('never touches ::: inside fenced code blocks', () => {
+    const text =
+      '示例：\n```markdown\n:::writing{variant="document"}\n正文\n:::\n```\n结束';
+    expect(stripGenuiContainers(text)).toBe(text);
+  });
+
+  it('treats prose containing ::: mid-line as content', () => {
+    const text = '时间格式是 hh:::mm，不是别的';
+    expect(stripGenuiContainers(text)).toBe(text);
+  });
+
+  it('is idempotent on already-clean text', () => {
+    const text = '普通回答，没有任何标记。';
+    expect(stripGenuiContainers(text)).toBe(text);
+  });
+
+  it('strips the fence while keeping inline citations renderable', () => {
+    const src = new Map<string, SearchSource>([
+      [
+        'turn0news30',
+        {
+          url: 'https://www.reuters.com/x',
+          title: 'Reuters X',
+          attribution: 'Reuters',
+        },
+      ],
+    ]);
+    const text =
+      ':::writing{variant="document"}\n' +
+      '内容' + pua('cite', 'turn0news30') + '。\n' +
+      ':::';
+    const formatted = formatCitations(text, src);
+    expect(stripGenuiContainers(formatted)).toBe(
+      '内容 [Reuters](https://www.reuters.com/x)。'
+    );
+  });
+});
+
+describe('splitGenuiContainerTail', () => {
+  it('withholds a partial opener fragment at line end', () => {
+    const r = splitGenuiContainerTail('如下：\n:::writ');
+    expect(r.keep).toBe('如下：\n');
+    expect(r.tail).toBe(':::writ');
+  });
+
+  it('withholds an opener whose attribute brace is unfinished', () => {
+    const r = splitGenuiContainerTail('正文\n:::writing{variant="doc');
+    expect(r.keep).toBe('正文\n');
+    expect(r.tail).toBe(':::writing{variant="doc');
+  });
+
+  it('releases a fragment that closed its brace', () => {
+    const r = splitGenuiContainerTail('正文\n:::writing{variant="doc"}');
+    expect(r.keep).toBe('正文\n:::writing{variant="doc"}');
+    expect(r.tail).toBe('');
+  });
+
+  it('withholds a bare "::" prefix', () => {
+    const r = splitGenuiContainerTail('正文::');
+    expect(r.keep).toBe('正文');
+    expect(r.tail).toBe('::');
+  });
+
+  it('leaves plain prose untouched', () => {
+    const r = splitGenuiContainerTail('普通一句话：结尾');
+    expect(r.keep).toBe('普通一句话：结尾');
+    expect(r.tail).toBe('');
+  });
+
+  it('resolveWithheld drops a truncated genui fence fragment', () => {
+    expect(resolveWithheld(':::writing{variant="doc')).toBe('');
+    expect(resolveWithheld('::')).toBe('');
+    expect(resolveWithheld(':::writing')).toBe('');
+    expect(resolveWithheld('普通结尾')).toBe('普通结尾');
+  });
+
+  it('withholds a bare "genui<attrs>" orphan at line end', () => {
+    const r = splitGenuiContainerTail('前文 [x](https://y.cn)\n\ngenui5j');
+    expect(r.keep).toBe('前文 [x](https://y.cn)\n\n');
+    expect(r.tail).toBe('genui5j');
+    expect(resolveWithheld(r.tail)).toBe('');
+  });
+
+  it('keeps real prose that happens to mention "genui" mid-line', () => {
+    const text = '请参阅 genui 节点说明'; // no tail match — mid-word usage
+    const r = splitGenuiContainerTail(text);
+    expect(r.keep).toBe(text);
+    expect(r.tail).toBe('');
+  });
+});
+
+describe('formatCitations nested link repair', () => {
+  it('collapses a citation link emitted inside a model-written link', () => {
+    const src = new Map<string, SearchSource>([
+      [
+        'turn0news1',
+        {
+          url: 'https://www.aljazeera.com/news/2026/9/24/x',
+          title: 'AJ',
+          attribution: 'Al Jazeera',
+        },
+      ],
+    ]);
+    const text =
+      '据报道 [来源：Al Jazeera（2026年9月24日）](\n' +
+      pua('cite', 'turn0news1') + '\n' +
+      ') 披露了细节。';
+    const formatted = formatCitations(text, src);
+    expect(formatted).toBe(
+      '据报道 [来源：Al Jazeera（2026年9月24日）](https://www.aljazeera.com/news/2026/9/24/x) 披露了细节。'
+    );
+  });
+
+  it('leaves normal inline replacement untouched', () => {
+    const src = new Map<string, SearchSource>([
+      ['turn0news2', { url: 'https://a.com/x', title: 'A', attribution: 'a.com' }],
+    ]);
+    const text = '事实' + pua('cite', 'turn0news2') + '完成。';
+    expect(formatCitations(text, src)).toBe('事实 [a.com](https://a.com/x)完成。');
   });
 });
