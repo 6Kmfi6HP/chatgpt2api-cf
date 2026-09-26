@@ -1144,6 +1144,191 @@ describe('Tool calling (OpenAI tools API)', () => {
   });
 });
 
+describe('Streaming incrementality with tools (typing effect)', () => {
+  it('streams tool-request prose incrementally instead of one buffered burst', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({
+      client,
+      deviceManager: dm,
+      // Keep the time trigger from firing so the byte trigger alone decides.
+      nonStreamCommitDeadlineMs: 60_000,
+      keepAliveIntervalMs: 60_000,
+    });
+
+    // Cumulative snapshots of a long non-refusal answer, released with real
+    // gaps so a "buffer everything" regression is observable in the timing.
+    const encoder = new TextEncoder();
+    const snap = (text: string, finished = false) =>
+      encoder.encode(
+        `data: ${JSON.stringify({
+          type: 'message_stream',
+          message: {
+            id: 'live-1',
+            author: { role: 'assistant' },
+            content: { content_type: 'text', parts: [text] },
+            status: finished ? 'finished_successfully' : 'in_progress',
+            end_turn: finished ? true : undefined,
+            metadata: { message_type: 'next' },
+            channel: finished ? 'final' : undefined,
+          },
+        })}\n\n`
+      );
+
+    // First snapshot already exceeds TOOL_REFUSAL_DECISION_CHARS (80), so the
+    // commit decision happens on frame one: anything after that must stream
+    // straight through rather than wait for the socket to close.
+    const parts = ['A'.repeat(100), 'A'.repeat(160), 'A'.repeat(220), 'A'.repeat(280)];
+    const queued: Array<() => void> = [];
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let i = 0;
+        const push = () => {
+          if (i >= parts.length) return;
+          const text = parts[i];
+          const last = i === parts.length - 1;
+          i++;
+          controller.enqueue(snap(text, last));
+          if (!last) queued.push(push);
+        };
+        push();
+      },
+    });
+    client.conversationHandler = async () =>
+      new Response(body, { headers: { 'Content-Type': 'text/event-stream' } });
+
+    const res = await testApp.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'auto',
+          stream: true,
+          tools: [
+            {
+              type: 'function',
+              function: { name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } },
+            },
+          ],
+          messages: [{ role: 'user', content: '写一篇长文' }],
+        }),
+      },
+      mockEnv
+    );
+
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let seen = '';
+    // First frame must arrive BEFORE the upstream stream ends (i.e. before the
+    // remaining snapshots are released) — the whole point of the fix.
+    while (!seen.includes('"content":"AAAA')) {
+      const { done, value } = await reader.read();
+      expect(done).toBe(false);
+      if (value) seen += decoder.decode(value, { stream: true });
+    }
+    // Release the rest so the handler can finish.
+    for (const release of queued) release();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) seen += decoder.decode(value, { stream: true });
+    }
+
+    const contents = seen
+      .split('\n')
+      .filter((l) => l.startsWith('data: ') && l.slice(6).trim() !== '[DONE]')
+      .map((l) => JSON.parse(l.slice(6)) as { choices?: Array<{ delta?: { content?: string } }> })
+      .map((c) => c.choices?.[0]?.delta?.content)
+      .filter((c): c is string => typeof c === 'string');
+    // Multiple content frames, not one burst: incremental delivery.
+    expect(contents.length).toBeGreaterThan(1);
+    expect(contents.join('')).toContain('A'.repeat(280));
+  });
+
+  it('still holds a long refusal so it can be retried on a fresh device', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({ client, deviceManager: dm, keepAliveIntervalMs: 60_000 });
+
+    const encoder = new TextEncoder();
+    const snap = (text: string) =>
+      encoder.encode(
+        `data: ${JSON.stringify({
+          type: 'message_stream',
+          message: {
+            id: 'live-1',
+            author: { role: 'assistant' },
+            content: { content_type: 'text', parts: [text] },
+            status: 'in_progress',
+            metadata: { message_type: 'next' },
+          },
+        })}\n\n`
+      );
+
+    let call = 0;
+    client.conversationHandler = async () => {
+      call++;
+      if (call === 1) {
+        // Long refusal: exceeds the byte trigger several times over, yet must
+        // never be committed early — it has to remain retryable.
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(snap("I'm unable to access the weather tool, so I cannot check that for you. ".repeat(4)));
+              c.close();
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } }
+        );
+      }
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(
+              snap('{"tool_calls":[{"name":"get_weather","arguments":{"city":"上海"}}]}')
+            );
+            c.close();
+          },
+        }),
+        { headers: { 'Content-Type': 'text/event-stream' } }
+      );
+    };
+
+    const res = await testApp.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'auto',
+          stream: true,
+          tools: [
+            {
+              type: 'function',
+              function: { name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } },
+            },
+          ],
+          messages: [{ role: 'user', content: '上海天气' }],
+        }),
+      },
+      mockEnv
+    );
+
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    // Retried and recovered: the tool call reached the client, and the refusal
+    // prose was never streamed as the answer.
+    expect(text).toContain('"tool_calls"');
+    expect(text).toContain('"finish_reason":"tool_calls"');
+    expect(call).toBeGreaterThan(1);
+    expect(text).not.toContain('unable to access the weather tool');
+  });
+});
+
 describe('Transport behavior (heartbeat / keepalive)', () => {
   it('emits SSE : ping comment lines while the upstream stream is idle', async () => {
     const client = new MockUpstreamClient();

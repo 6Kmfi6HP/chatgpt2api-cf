@@ -129,6 +129,23 @@ const SSE_PING_INTERVAL_MS = 5000;
 /** Whitespace heartbeat payload written between the early 200 commit and the JSON body. */
 const NONSTREAM_HEARTBEAT = '\n';
 
+/**
+ * Tool-request refusal decision window. A refusal ("I'm unable to access the
+ * weather tool") is legible in its opening clause, so the attempt commits as
+ * soon as either trigger fires on non-refusal text:
+ *
+ *  - TOOL_REFUSAL_DECISION_CHARS of text, or
+ *  - TOOL_REFUSAL_DECISION_MS held since the first unsent chunk.
+ *
+ * Buffering the whole reply (the previous behavior) destroyed the typing effect
+ * for every client that sends `tools` — which is most of them. The byte trigger
+ * alone was still too coarse because upstream delivers its opening snapshots in
+ * a burst, so the time trigger bounds how long the client waits for the first
+ * frame when the model starts slowly.
+ */
+const TOOL_REFUSAL_DECISION_CHARS = 80;
+const TOOL_REFUSAL_DECISION_MS = 600;
+
 /** OpenAI-shaped error payload (mirrors the global onError handler's mapping). */
 export function openAIErrorBody(err: unknown): {
   status: number;
@@ -199,37 +216,78 @@ async function emitSSE(
 }
 
 /**
- * BufferedAttempt reads one upstream SSE response completely into a
- * StreamProcessor, WITHOUT emitting anything. Retrying-before-anything-emits
- * is safe because nothing has left the gateway yet; once a single chunk
- * goes out we must stay on this attempt.
+ * Outcome of streaming one upstream attempt.
+ *
+ * `committed` means chunks have already gone to the client, so the attempt can
+ * no longer be retried. When false, `chunks` holds everything produced so far
+ * (nothing was emitted) and the caller may still retry on a fresh device.
  */
-interface BufferedAttempt {
+interface AttemptOutcome {
   chunks: import('./types').ChatCompletionChunk[];
   sp: StreamProcessor;
   aborted: boolean;
+  committed: boolean;
 }
 
-async function readBufferedAttempt(
+/**
+ * Streams one upstream attempt with a BOUNDED decision window.
+ *
+ * Why not buffer everything (the previous behavior): for any client that sends
+ * `tools` — which is most of them — the whole reply was held until the socket
+ * closed, so the first byte arrived seconds late and every content frame then
+ * landed in one burst. The typing effect was destroyed even for plain prose
+ * that could never have been a tool call.
+ *
+ * A refusal ("I'm unable to access the weather tool") is legible in its opening
+ * sentence, and the tool-call detector already decides "this cannot be tool-call
+ * JSON" from the first character. So the window is tiny:
+ *
+ *  - tool_calls deltas appear (detector resolved the JSON) → commit immediately
+ *  - plain prose of >= TOOL_REFUSAL_DECISION_CHARS that is not a refusal, when
+ *    the request does NOT mandate a tool call → commit immediately
+ *  - otherwise hold: a refusal (retryable) or a mandated-choice reply whose
+ *    compliance is still unknown
+ *
+ * Holding is bounded by the reply itself (refusals and tool-call JSON are
+ * short); once committed, every later chunk streams straight through.
+ */
+async function streamAttempt(
   resp: Response,
+  writer: SSEWriter,
   sp: StreamProcessor,
+  commitOnPlainText: boolean,
   signal?: AbortSignal
-): Promise<BufferedAttempt> {
-  const chunks: import('./types').ChatCompletionChunk[] = [];
+): Promise<AttemptOutcome> {
+  const pending: import('./types').ChatCompletionChunk[] = [];
+  let committed = false;
   let aborted = false;
+  let sawToolCalls = false;
+  /** When the first chunk that has not been sent yet appeared. */
+  let firstUnsentAt = 0;
+
   const parser = createParser({
     onEvent: (event) => {
       if (event.data === '[DONE]') return;
       try {
         const parsed = JSON.parse(event.data);
         for (const c of sp.processEvent(parsed)) {
-          chunks.push(c);
+          if (c.choices?.[0]?.delta?.tool_calls) sawToolCalls = true;
+          pending.push(c);
         }
       } catch {
         // Ignore non-JSON frames
       }
     },
   });
+
+  const drainPending = async (): Promise<void> => {
+    while (pending.length > 0) {
+      if (signal?.aborted) return;
+      await emitSSE(writer, pending.shift()!);
+    }
+    firstUnsentAt = 0;
+  };
+
   if (resp.body) {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -276,6 +334,31 @@ async function readBufferedAttempt(
             parser.feed(decoder.decode(value, { stream: true }));
           }
         }
+
+        // Commit as soon as the attempt is provably not a retry candidate.
+        if (!committed) {
+          if (pending.length > 0 && firstUnsentAt === 0) {
+            firstUnsentAt = Date.now();
+          }
+          if (sawToolCalls) {
+            // The detector resolved the reply as tool-call JSON.
+            committed = true;
+          } else if (commitOnPlainText && !looksLikeRefusal(sp.lastFullText)) {
+            // Refusal text must stay held so it can be retried on a fresh
+            // device; any other prose is a legitimate answer. Commit once the
+            // byte or time trigger fires so the typing effect starts early.
+            const byteTrigger = sp.lastFullText.length >= TOOL_REFUSAL_DECISION_CHARS;
+            const timeTrigger =
+              firstUnsentAt > 0 && Date.now() - firstUnsentAt >= TOOL_REFUSAL_DECISION_MS;
+            if (byteTrigger || timeTrigger) {
+              committed = true;
+            }
+          }
+        }
+        if (committed) {
+          await drainPending();
+        }
+
         if (done) break;
         // Idle-based window: reset after processing so drain time does not
         // consume it (mirrors pipeOpenAIStream; see STREAM_TAIL_GRACE_MS).
@@ -301,7 +384,10 @@ async function readBufferedAttempt(
       // ignore
     }
   }
-  return { chunks, sp, aborted };
+  if (committed) {
+    await drainPending();
+  }
+  return { chunks: pending, sp, aborted, committed };
 }
 
 /**
@@ -365,13 +451,15 @@ async function emitAggregatedAsStream(
  * pipeOpenAIStreamRetrying is the streaming counterpart to the non-stream
  * retryToolTurn path: when tool calling is active and the upstream model
  * replies with a refusal text instead of a tool call, retry the turn on
- * fresh devices up to 3 attempts before streaming what remains.
+ * fresh devices up to 3 attempts.
  *
- * Streaming-vs-buffering: because the tool-call detector itself buffers
- * while a reply could still resolve into the tool-call JSON convention,
- * NOTHING reaches the client in that window. As long as nothing has been
- * emitted, switching attempts is transparent. Once any content or tool_calls
- * chunk is emitted we stay on the attempt and stream it to the end.
+ * Streaming-vs-buffering: retrying is only possible while NOTHING has been
+ * emitted. The decision window is deliberately tiny (see streamAttempt): a
+ * tool call commits on the first tool_calls delta, and plain prose commits as
+ * soon as enough non-refusal text exists — so a normal answer streams
+ * incrementally from ~200 characters in, instead of arriving in one burst
+ * after the socket closes. Only a genuine refusal (or a mandated tool_choice
+ * whose compliance is still unknown) is ever held back.
  *
  * hasTools=false: no ambiguity to resolve; falls through to pipeOpenAIStream.
  */
@@ -388,19 +476,34 @@ async function pipeOpenAIStreamRetrying(
     return;
   }
 
+  // Under a mandatory tool_choice the contract is only satisfiable by a tool
+  // call, so a plain answer must not be committed early if it is still a
+  // candidate for retry. Under "auto" a non-refusal plain answer is always
+  // acceptable, so prose commits as soon as the decision window is filled.
+  const commitOnPlainText = !requiresToolCall(req);
+
   const MAX_STREAM_ATTEMPTS = 3;
   let currentResp: Response = resp;
 
   for (let attempt = 0; attempt < MAX_STREAM_ATTEMPTS; attempt++) {
     const sp = new StreamProcessor(model, req);
-    // NOTE: readBufferedAttempt holds every chunk until the upstream closes,
-    // so "the detector flushed the refusal as plain text" is recoverable —
-    // nothing has been written to the client yet. This is the entire reason
-    // transparent streaming retry is even possible.
-    const buffered = await readBufferedAttempt(currentResp, sp, signal);
-    if (buffered.aborted) return;
+    const outcome = await streamAttempt(currentResp, writer, sp, commitOnPlainText, signal);
+    if (outcome.aborted) return;
 
-    const sawToolCalls = buffered.chunks.some((c) => c.choices?.[0]?.delta?.tool_calls);
+    if (outcome.committed) {
+      // Already mid-stream on the client: finish this attempt.
+      for (const chunk of outcome.chunks) {
+        await emitSSE(writer, chunk);
+      }
+      for (const chunk of sp.flush()) {
+        await emitSSE(writer, chunk);
+      }
+      await emitSSE(writer, '[DONE]');
+      return;
+    }
+
+    const chunks = outcome.chunks;
+    const sawToolCalls = chunks.some((c) => c.choices?.[0]?.delta?.tool_calls);
     // Same contract as the non-stream path: a refusal, or any tool-less reply
     // under a mandatory tool_choice, warrants a retry on a fresh device.
     const bufferedCompletion: ChatCompletionResponse = {
@@ -415,7 +518,7 @@ async function pipeOpenAIStreamRetrying(
             role: 'assistant',
             content: sawToolCalls ? null : sp.lastFullText,
             tool_calls: sawToolCalls
-              ? buffered.chunks
+              ? chunks
                   .flatMap((c) => c.choices?.[0]?.delta?.tool_calls ?? [])
                   .map((tc) => ({
                     id: tc.id ?? '',
@@ -456,12 +559,12 @@ async function pipeOpenAIStreamRetrying(
         }
       }
       // Still violating (or retry failed): fall through and emit the attempt we
-      // already buffered — the client gets a proper reply instead of silence.
+      // already held — the client gets a proper reply instead of silence.
       // This mirrors the non-stream branch which keeps lastResult.
     }
 
-    // Committed to this attempt: stream whatever we buffered, then the tail.
-    for (const chunk of buffered.chunks) {
+    // Committed to this attempt: stream what was held, then the tail.
+    for (const chunk of chunks) {
       await emitSSE(writer, chunk);
     }
     for (const chunk of sp.flush()) {
