@@ -193,6 +193,15 @@ curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
   }'
 ```
 
+关于 SSE 流的说明（用量统计严格遵循 OpenAI 规范交付）：
+
+- 带上 `stream_options.include_usage: true` 时，token 用量**只交付一次**，位于 `choices` 为 `[]` 的
+  最后一个分片，紧接 `data: [DONE]` 之前；其余所有分片（包括 `finish_reason: "stop"` 那一片）
+  **都不带** `usage` 字段。
+- 不带 `stream_options.include_usage` 时，任何分片都不会携带 `usage`。
+- token 数为近似值（启发式估算：中日韩文字按每字约 1.5 计，其余字符按每 4 字符约 1 计），任何非空文本至少记 1。
+- 等待上游较久时，网关会发送 SSE `: ping` 注释行以保活连接。
+
 #### 非流式对话 (`stream: false`):
 
 ```bash
@@ -206,6 +215,18 @@ curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
     ]
   }'
 ```
+
+关于延迟：非流式响应体必须等上游生成结束才会产出，因此生成较慢时首个字节可能要 20 秒以上才到达。
+超过约 8 秒的请求会转为分块（chunked）空白心跳响应体，避免客户端读空闲超时误触发 —— JSON 值之前
+允许出现前导空白，响应体仍可被 `JSON.parse` 解析。建议：交互式客户端优先用 `stream: true`，或将
+读取超时设置为至少 120 秒。
+
+提前提交的代价：一旦 200 已发出，状态码就无法再更改，因此在约 8 秒截止之后才暴露的上游故障会以
+HTTP 200 + OpenAI 风格的 `{"error": {...}}` 响应体返回（截止之前发生的错误仍保留真实状态码，如
+429/401）。因此，依赖状态码分支的客户端也应检查响应体中是否含有 `error`。
+
+关于流结束：一旦上游报告本轮已结束，网关最多再等 250 毫秒的上游静默以接收末尾帧，随后立即关闭流，
+而不再等待上游 socket 关闭所需的 1–3 秒。客户端可以立刻拿到 `finish_reason` 与 `[DONE]`。
 
 ### 2. Python (官方 `openai` SDK)
 
@@ -314,11 +335,27 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 
 流式模式会输出 `delta.tool_calls` 帧与 `finish_reason: "tool_calls"`。
 
+`tool_choice` 的处理规则：
+
+- `"none"`：完全禁用工具调用（请求中不会编译任何工具协议文案）。
+- `"auto"`（默认值）：由模型自行决定是否调用工具；直接给出文本回答时按原样返回。
+- `"required"`：要求必须调用工具。由于匿名上游没有原生 tool-choice 开关，网关不仅会编译语气更
+  强制的协议文案，**还会强制校验**：未产生工具调用的回复会在新设备上有界重试，第一个符合约定的
+  结果胜出；若所有尝试都违约，则返回最后一次的回复而不是报错。
+- `{"type": "function", "function": {"name": "X"}}`：同上，并且要求回复必须调用**该**工具 ——
+  调用其它工具同样视为违约并触发重试。
+
 ### 5. 常见客户端配置（NextChat、Chatbox、Cursor、Cline 等）
 
 - **接口地址 (Base URL / API Host)**: `https://<your-worker>.workers.dev/v1`
 - **API Key**: 若环境变量 `API_KEYS` 留空，可填任意占位符（如 `sk-test`）；若设置了密钥则填入对应值。
 - **模型名称 (Model)**: `auto`、`gpt-5-5`、`gpt-5-6`、`gpt-5-3-mini`、`gpt-5-5-mini`、`gpt-5-6-mini`（实时目录见 `GET /v1/models`）。
+
+### 6. 错误处理
+
+若 `role: "tool"` 消息的 `tool_call_id` 匹配不到任何前置 assistant 消息的 `tool_calls[].id`，
+网关会直接返回 HTTP 400 `invalid_request_error`（与 OpenAI 行为一致），而不是给它一个 200 的
+普通聊天回复 —— 静默接受这种孤立消息会把工具结果当作用户意图喂给模型，从而掩盖客户端的 bug。
 
 ---
 
@@ -327,7 +364,7 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 本项目包含完整的单元测试与端到端测试套件，涵盖协议转换、引用清洗、三阶段状态机、KV 轮换淘汰与流式差分：
 
 ```bash
-# 运行全部 112 项测试用例 (基于 Vitest)
+# 运行全部 285 项测试用例 (基于 Vitest)
 pnpm test
 
 # 严格 TypeScript 类型检查
@@ -338,7 +375,7 @@ pnpm exec tsc --noEmit
 
 ## 📋 客观局限性说明
 
-- **模型透传**：不做名称映射，客户端传入的模型 slug 原样发往上层；空/无效回退为 `auto`。
+- **模型透传**：不做名称映射，也不做校验。`model` 缺失或为空时按 `"auto"` 处理；其余任何 slug —— 包括匿名目录里并不存在的（如 `gpt-4o`）—— 都会原样转发给上游，并在响应 `model` 字段中原样回显。请通过 `GET /v1/models` 获取真实目录。
 - **联网搜索默认开启**：请求携带 `forceUseSearch: true`，引用自动整理为 Markdown 链接。单次请求关闭：`"search": false`。
 - **采样参数**：上游匿名层不支持 `temperature`、`top_p`、`seed`；网关会正常吸收这些参数以兼容客户端，但不会影响上游输出。函数调用与工具调用本身不受此限制。
 - **多模态**：支持图片部分（自动重上传至匿名文件管线，每设备每日约 10 次上传配额，由设备池自动轮换）；音频及其他附件类型仍会被剔除。

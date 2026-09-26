@@ -946,4 +946,301 @@ describe('Tool calling (OpenAI tools API)', () => {
     // No tool protocol system message inserted
     expect(msgs[0].author.role).not.toBe('system');
   });
+
+  it('rejects an orphan role:"tool" message with 400 invalid_request_error', async () => {
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({
+      client: new MockUpstreamClient(),
+      deviceManager: new DeviceManager(),
+    });
+
+    const payload = {
+      model: 'auto',
+      stream: false,
+      messages: [
+        { role: 'user', content: 'weather?' },
+        { role: 'tool', tool_call_id: 'call_missing', name: 'get_weather', content: '{}' },
+      ],
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, mockEnv);
+
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; message: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.message).toContain('tool');
+  });
+
+  it('accepts a role:"tool" message whose id matches a preceding tool_calls id', async () => {
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({
+      client: new MockUpstreamClient(),
+      deviceManager: new DeviceManager(),
+    });
+
+    const payload = {
+      model: 'auto',
+      stream: false,
+      messages: [
+        { role: 'user', content: 'weather?' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            { id: 'call_ok1', type: 'function', function: { name: 'get_weather', arguments: '{}' } },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'call_ok1', name: 'get_weather', content: '{"temp_c":26}' },
+      ],
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, mockEnv);
+
+    expect(res.status).toBe(200);
+  });
+
+  it('retries a tool-less plain reply under tool_choice:"required" and returns the eventual tool call', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({ client, deviceManager: dm });
+
+    let callCount = 0;
+    client.conversationHandler = async () => {
+      callCount++;
+      if (callCount === 1) {
+        // Violation: fluent prose instead of the mandated tool call.
+        return createSseResponse([
+          `data: ${JSON.stringify(mkAssistantEvent('北京今天晴，气温 22 度左右。'))}\n\n`,
+        ]);
+      }
+      return createSseResponse([
+        `data: ${JSON.stringify(
+          mkAssistantEvent('{"tool_calls":[{"name":"get_weather","arguments":{"city":"北京"}}]}')
+        )}\n\n`,
+      ]);
+    };
+
+    const payload = {
+      model: 'auto',
+      stream: false,
+      tool_choice: 'required',
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } },
+        },
+      ],
+      messages: [{ role: 'user', content: '北京天气' }],
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, mockEnv);
+
+    expect(res.status).toBe(200);
+    const data: { choices: Array<{ finish_reason: string; message: { tool_calls?: Array<{ function: { name: string } }> } }> } = await res.json();
+    expect(callCount).toBeGreaterThan(1);
+    expect(data.choices[0].finish_reason).toBe('tool_calls');
+    expect(data.choices[0].message.tool_calls?.[0].function.name).toBe('get_weather');
+  });
+
+  it('does NOT retry a plain reply when tool_choice is auto', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({ client, deviceManager: dm });
+
+    let callCount = 0;
+    client.conversationHandler = async () => {
+      callCount++;
+      return createSseResponse([
+        `data: ${JSON.stringify(mkAssistantEvent('北京今天晴，气温 22 度左右。'))}\n\n`,
+      ]);
+    };
+
+    const payload = {
+      model: 'auto',
+      stream: false,
+      tool_choice: 'auto',
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } },
+        },
+      ],
+      messages: [{ role: 'user', content: '北京天气' }],
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, mockEnv);
+
+    expect(res.status).toBe(200);
+    const data: { choices: Array<{ finish_reason: string }> } = await res.json();
+    // Plain answer accepted as-is: no retry, single upstream call.
+    expect(callCount).toBe(1);
+    expect(data.choices[0].finish_reason).toBe('stop');
+  });
+
+  it('retries when a named tool_choice produced a call to a DIFFERENT tool', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({ client, deviceManager: dm });
+
+    let callCount = 0;
+    client.conversationHandler = async () => {
+      callCount++;
+      if (callCount === 1) {
+        // Wrong tool: contract demanded get_weather, the model called search.
+        return createSseResponse([
+          `data: ${JSON.stringify(
+            mkAssistantEvent('{"tool_calls":[{"name":"web_search","arguments":{"q":"北京"}}]}')
+          )}\n\n`,
+        ]);
+      }
+      return createSseResponse([
+        `data: ${JSON.stringify(
+          mkAssistantEvent('{"tool_calls":[{"name":"get_weather","arguments":{"city":"北京"}}]}')
+        )}\n\n`,
+      ]);
+    };
+
+    const payload = {
+      model: 'auto',
+      stream: false,
+      tool_choice: { type: 'function', function: { name: 'get_weather' } },
+      tools: [
+        { type: 'function', function: { name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } } },
+        { type: 'function', function: { name: 'web_search', description: 's', parameters: { type: 'object', properties: {} } } },
+      ],
+      messages: [{ role: 'user', content: '北京天气' }],
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, mockEnv);
+
+    expect(res.status).toBe(200);
+    const data: { choices: Array<{ finish_reason: string; message: { tool_calls?: Array<{ function: { name: string } }> } }> } = await res.json();
+    expect(callCount).toBeGreaterThan(1);
+    expect(data.choices[0].finish_reason).toBe('tool_calls');
+    expect(data.choices[0].message.tool_calls?.[0].function.name).toBe('get_weather');
+  });
+});
+
+describe('Transport behavior (heartbeat / keepalive)', () => {
+  it('emits SSE : ping comment lines while the upstream stream is idle', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const testApp = createApp({ client, deviceManager: dm, keepAliveIntervalMs: 10 });
+
+    // Upstream sends nothing until we release it, forcing the ping timer to fire.
+    const gate = Promise.withResolvers<void>();
+    const encoder = new TextEncoder();
+    client.conversationHandler = async () => {
+      const body = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          await gate.promise;
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(mkAssistantEvent('Late answer.'))}\n\n`)
+          );
+          controller.close();
+        },
+      });
+      return new Response(body, { headers: { 'Content-Type': 'text/event-stream' } });
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    }, mockEnv);
+
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let seen = '';
+    // Read until at least one ping comment is observed.
+    while (!seen.includes(': ping')) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      seen += decoder.decode(value, { stream: true });
+    }
+    expect(seen).toContain(': ping');
+
+    gate.resolve();
+    // Drain the rest so the handler's finally/cleanup runs.
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+  });
+
+  it('commits early with a whitespace-heartbeat body when the non-stream deadline elapses', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager();
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    // Tiny deadline so the slow path triggers deterministically in-test.
+    const testApp = createApp({ client, deviceManager: dm, nonStreamCommitDeadlineMs: 10, keepAliveIntervalMs: 10 });
+
+    const gate = Promise.withResolvers<void>();
+    const encoder = new TextEncoder();
+    client.conversationHandler = async () => {
+      const body = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          await gate.promise;
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(mkAssistantEvent('Slow final answer.'))}\n\n`)
+          );
+          controller.close();
+        },
+      });
+      return new Response(body, { headers: { 'Content-Type': 'text/event-stream' } });
+    };
+
+    const res = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'auto', stream: false, messages: [{ role: 'user', content: 'hi' }] }),
+    }, mockEnv);
+
+    // Committed before the body was ready: chunked, and still parses once
+    // the whitespace heartbeats are stripped.
+    expect(res.status).toBe(200);
+    expect(res.headers.get('transfer-encoding')).toBe('chunked');
+
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let seen = '';
+    const firstRead = await reader.read();
+    seen += decoder.decode(firstRead.value, { stream: true });
+    // First byte is whitespace (heartbeat), not JSON.
+    expect(seen.trim()).toBe('');
+
+    gate.resolve();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      seen += decoder.decode(value, { stream: true });
+    }
+    const parsed = JSON.parse(seen.trim()) as { choices: Array<{ message: { content: string } }> };
+    expect(parsed.choices[0].message.content).toBe('Slow final answer.');
+  });
 });

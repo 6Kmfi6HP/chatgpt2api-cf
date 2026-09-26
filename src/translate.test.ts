@@ -229,26 +229,21 @@ describe('buildOpenAIChunk', () => {
 });
 
 describe('buildFinalChunk', () => {
-  it('builds final chunk with finish_reason: "stop" and usage when provided', () => {
-    const chunk = buildFinalChunk('chatcmpl-test', 1234567890, 'auto', 15, 25);
+  it('builds final chunk with finish_reason and never carries usage', () => {
+    const chunk = buildFinalChunk('chatcmpl-test', 1234567890, 'auto');
     expect(chunk.id).toBe('chatcmpl-test');
     expect(chunk.object).toBe('chat.completion.chunk');
     expect(chunk.choices).toHaveLength(1);
     expect(chunk.choices[0].delta).toEqual({});
     expect(chunk.choices[0].finish_reason).toBe('stop');
-    expect(chunk.usage).toEqual({
-      prompt_tokens: 15,
-      completion_tokens: 25,
-      total_tokens: 40,
-    });
+    // Spec: usage belongs ONLY to the dedicated choices:[] usage chunk.
+    expect(chunk.usage).toBeUndefined();
   });
 
-  it('omits usage when promptTokens and completionTokens are 0 or omitted', () => {
-    const chunkZero = buildFinalChunk('chatcmpl-zero', 1234567890, 'auto', 0, 0);
-    expect(chunkZero.usage).toBeUndefined();
-
-    const chunkOmitted = buildFinalChunk('chatcmpl-omitted', 1234567890, 'auto');
-    expect(chunkOmitted.usage).toBeUndefined();
+  it('carries finish_reason "tool_calls" for tool-call streams', () => {
+    const chunk = buildFinalChunk('chatcmpl-tool', 1234567890, 'auto', 'tool_calls');
+    expect(chunk.choices[0].finish_reason).toBe('tool_calls');
+    expect(chunk.usage).toBeUndefined();
   });
 });
 
@@ -296,9 +291,12 @@ describe('buildOpenAICompletion', () => {
 });
 
 describe('countRoughTokens', () => {
-  it('estimates tokens as floor(chars / 4)', () => {
+  it('estimates tokens as floor(chars / 4), floored at 1 for non-empty text', () => {
     expect(countRoughTokens('')).toBe(0);
-    expect(countRoughTokens('hi')).toBe(0);
+    // Non-empty text always costs at least one token ("1" used to round to 0,
+    // which billing-aware clients read as an empty completion).
+    expect(countRoughTokens('hi')).toBe(1);
+    expect(countRoughTokens('1')).toBe(1);
     expect(countRoughTokens('1234')).toBe(1);
     expect(countRoughTokens('12345678')).toBe(2);
     expect(countRoughTokens('a'.repeat(100))).toBe(25);

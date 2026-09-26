@@ -55,8 +55,16 @@ export const TOOL_CALL_REPLY_FORMAT = '{"tool_calls":[{"name":"<tool>","argument
  *  2. an explicit "you do not know this from training - MUST call, never
  *     guess" clause (otherwise the model hallucinates plausible answers);
  *  3. a concrete single-line JSON template shown once per request.
+ *
+ * `toolChoice` is an optional strong hint. The upstream DTO has no native
+ * tool-choice knob, so "required" and a named function only strengthen the
+ * protocol wording (the tool list stays complete); they are not guarantees.
+ * "auto" and undefined leave the wording byte-identical.
  */
-export function buildToolProtocolSystemMessage(tools: ToolDefinition[]): string {
+export function buildToolProtocolSystemMessage(
+  tools: ToolDefinition[],
+  toolChoice?: 'auto' | 'required' | { type: 'function'; function: { name: string } }
+): string {
   const toolLines: string[] = [];
   for (const t of tools) {
     const f = t.function;
@@ -86,6 +94,24 @@ export function buildToolProtocolSystemMessage(tools: ToolDefinition[]): string 
     '',
     'If — and only if — the question is fully answerable without any tool, answer in plain text.',
   ];
+
+  if (toolChoice === 'required') {
+    lines.push(
+      '',
+      'MANDATORY TOOL USE (this request):',
+      'You MUST reply with a tool call. A plain-text answer is INVALID and will be rejected.'
+    );
+  } else if (toolChoice && typeof toolChoice === 'object') {
+    const name = toolChoice.function?.name;
+    if (typeof name === 'string' && name.length > 0) {
+      lines.push(
+        '',
+        'MANDATORY TOOL USE (this request):',
+        `You MUST call the tool "${name}". No other tool and no plain-text answer is acceptable.`
+      );
+    }
+  }
+
   return lines.join('\n');
 }
 

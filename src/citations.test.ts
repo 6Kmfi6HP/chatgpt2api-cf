@@ -161,6 +161,56 @@ describe('formatCitations', () => {
   });
 });
 
+describe('formatCitations ASCII cite prefix residue', () => {
+  const sources = new Map<string, SearchSource>([
+    ['turn0news3', { url: 'https://news.bjd.com.cn/a', title: '', attribution: 'news.bjd.com.cn' }],
+  ]);
+
+  it('drops an ASCII "cite" written directly before a PUA annotation', () => {
+    const input = '阵风可达6级左右。cite' + pua('cite', 'turn0news3');
+    expect(formatCitations(input, sources)).toBe(
+      '阵风可达6级左右。 [news.bjd.com.cn](https://news.bjd.com.cn/a)',
+    );
+  });
+
+  it('does not leave a double space when the residue is space-separated', () => {
+    const input = '。 cite' + pua('cite', 'turn0news3');
+    expect(formatCitations(input, sources)).toBe(
+      '。 [news.bjd.com.cn](https://news.bjd.com.cn/a)',
+    );
+  });
+
+  it('collapses a residue followed by its own space into a single separator', () => {
+    // Upstream also emits "cite " (trailing space) before the annotation; the
+    // residue's own whitespace run must be consumed, not left as a 2nd space.
+    const input = 'The report said so. cite ' + pua('cite', 'turn0news3');
+    expect(formatCitations(input, sources)).toBe(
+      'The report said so. [news.bjd.com.cn](https://news.bjd.com.cn/a)',
+    );
+  });
+
+  it('collapses a tab-separated residue without leaving a stray tab', () => {
+    const input = 'x cite\t' + pua('cite', 'turn0news3');
+    expect(formatCitations(input, sources)).toBe(
+      'x [news.bjd.com.cn](https://news.bjd.com.cn/a)',
+    );
+  });
+
+  it('keeps a word ending in "cite" intact', () => {
+    const input = 'excite' + pua('cite', 'turn0news3');
+    expect(formatCitations(input, sources)).toBe(
+      'excite [news.bjd.com.cn](https://news.bjd.com.cn/a)',
+    );
+  });
+
+  it('leaves a bare annotation block unchanged', () => {
+    const input = '阵风可达6级左右。' + pua('cite', 'turn0news3');
+    expect(formatCitations(input, sources)).toBe(
+      '阵风可达6级左右。 [news.bjd.com.cn](https://news.bjd.com.cn/a)',
+    );
+  });
+});
+
 describe('ingestMetadata', () => {
   it('ingests search_result_groups and content_references', () => {
     const sources = new Map<string, SearchSource>();

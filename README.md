@@ -193,6 +193,15 @@ curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
   }'
 ```
 
+Notes on the SSE stream (usage is delivered exactly as the OpenAI spec prescribes):
+
+- With `stream_options.include_usage: true`, token usage is delivered exactly **once**, in the
+  final chunk whose `choices` is `[]`, immediately before `data: [DONE]`. Every other chunk —
+  including the `finish_reason: "stop"` chunk — carries **no** `usage` field.
+- Without `stream_options.include_usage`, no chunk carries `usage` at all.
+- Token counts are approximate (CJK-aware chars/4 heuristic), floored at 1 for any non-empty text.
+- During long upstream waits the gateway emits SSE `: ping` comment lines to keep the connection alive.
+
 #### Non-Streaming (`stream: false`):
 
 ```bash
@@ -206,6 +215,21 @@ curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
     ]
   }'
 ```
+
+Notes on latency: a non-streaming response body is only produced once the upstream generation
+finishes, so a slow generation can take 20s+ before the first byte arrives. Requests that exceed
+~8s switch to a chunked whitespace-heartbeat body so client read-idle timers do not fire — leading
+whitespace is legal before a JSON value, and the body is still `JSON.parse`-able. Recommendation:
+use `stream: true` for interactive clients, or set a read timeout of at least 120s.
+
+Trade-off of the early commit: once the 200 is sent the status can no longer change, so an upstream
+failure that surfaces **after** the ~8s deadline is delivered as HTTP 200 carrying the
+OpenAI-shaped `{"error": {...}}` body (errors before the deadline keep their real status, e.g.
+429/401). Clients that branch on status codes should therefore also inspect the body for `error`.
+
+Notes on stream completion: once the upstream reports the turn has ended, the gateway waits at most
+250ms of upstream silence for any final trailing frames and then closes the stream instead of
+waiting 1–3s for the upstream socket to close. Clients see `finish_reason` and `[DONE]` immediately.
 
 ### 2. Python (`openai` SDK)
 
@@ -314,17 +338,35 @@ print(response.choices[0].message.content)  # "John Hartman works on the 7th flo
 
 Streaming emits `delta.tool_calls` frames and `finish_reason: "tool_calls"`.
 
+`tool_choice` handling:
+
+- `"none"` disables tool-calling entirely (no tool protocol is compiled into the request).
+- `"auto"` (the default) lets the model decide; a plain-text answer is returned as-is.
+- `"required"` demands a tool call. The anonymous upstream has no native tool-choice knob, so the
+  gateway compiles stronger mandatory protocol wording **and enforces it**: a tool-less reply is
+  retried on fresh devices (bounded) and the first compliant result wins. If every attempt still
+  violates it, the last reply is returned rather than an error.
+- `{"type": "function", "function": {"name": "X"}}` is the same, plus the reply must call **that**
+  tool — calling a different tool counts as a violation and is retried.
+
 ### 5. Third-Party Clients (NextChat, Chatbox, Cursor, etc.)
 
 - **Base URL / Endpoint**: `https://<your-worker>.workers.dev/v1`
 - **API Key**: Any dummy string (e.g. `sk-test`) if `API_KEYS` is empty, or your secret key.
 - **Model**: `auto`, `gpt-5-5`, `gpt-5-6`, `gpt-5-3-mini`, `gpt-5-5-mini`, `gpt-5-6-mini` (see `GET /v1/models` for the live catalog).
 
+### 6. Error Handling
+
+An orphan `role: "tool"` message whose `tool_call_id` does not match any preceding assistant
+`tool_calls[].id` is rejected with HTTP 400 `invalid_request_error` (matching OpenAI), instead of
+being answered with a 200 chat reply — a silently accepted orphan would feed the tool payload to
+the model as user intent and hide the client bug.
+
 ---
 
 ## 🧪 Testing
 
-The test suite contains **112 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
+The test suite contains **285 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
 
 ```bash
 # Run Vitest test suite
@@ -338,7 +380,7 @@ pnpm exec tsc --noEmit
 
 ## 📋 Honest Limitations
 
-- **Model Pass-through**: No name mapping. The slug you send goes upstream verbatim; unknown/empty models resolve to `auto`. See `GET /v1/models` for the real anonymous catalog.
+- **Model Pass-through**: No name mapping or validation. A missing/empty `model` becomes `"auto"`; any other slug — including slugs the anonymous catalog does not contain, e.g. `gpt-4o` — is forwarded upstream verbatim and echoed back verbatim in the response `model` field. Read `GET /v1/models` for the real catalog.
 - **Web Search ON by default**: requests send `forceUseSearch: true`; reply citations are auto-formatted as Markdown links. Per-request opt-out: `"search": false`.
 - **Sampling Knobs**: Knobs like `temperature`, `top_p`, `seed` are accepted for client compatibility, but ignored by upstream.
 - **Multimodal**: Image parts are supported (re-uploaded to the anonymous file pipeline, ~10 uploads/day per pooled device, pooled automatically). Audio and other attachment types are stripped. Image upload throttling upstream is per-device; the device pool rotates on 429 automatically.

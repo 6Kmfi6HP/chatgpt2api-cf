@@ -68,6 +68,55 @@ describe('buildToolProtocolSystemMessage', () => {
     expect(msg).toContain('ping');
     expect(msg).toContain('no arguments');
   });
+
+  it('leaves the wording unchanged for auto and undefined', () => {
+    const plain = buildToolProtocolSystemMessage([weatherTool, searchTool]);
+    expect(buildToolProtocolSystemMessage([weatherTool, searchTool], 'auto')).toBe(plain);
+    expect(buildToolProtocolSystemMessage([weatherTool, searchTool], undefined)).toBe(plain);
+    expect(plain).not.toContain('MANDATORY TOOL USE (this request)');
+  });
+
+  it('appends the mandatory clause for tool_choice "required"', () => {
+    const plain = buildToolProtocolSystemMessage([weatherTool]);
+    const msg = buildToolProtocolSystemMessage([weatherTool], 'required');
+    expect(msg).toBe(
+      `${plain}\n\nMANDATORY TOOL USE (this request):\n` +
+        'You MUST reply with a tool call. A plain-text answer is INVALID and will be rejected.'
+    );
+  });
+
+  it('appends the named-tool clause for a named tool_choice', () => {
+    const plain = buildToolProtocolSystemMessage([weatherTool]);
+    const msg = buildToolProtocolSystemMessage([weatherTool], {
+      type: 'function',
+      function: { name: 'get_weather' },
+    });
+    expect(msg).toBe(
+      `${plain}\n\nMANDATORY TOOL USE (this request):\n` +
+        'You MUST call the tool "get_weather". No other tool and no plain-text answer is acceptable.'
+    );
+  });
+
+  it('emits the named directive even when the name is absent from tools', () => {
+    const msg = buildToolProtocolSystemMessage([weatherTool], {
+      type: 'function',
+      function: { name: 'ghost_tool' },
+    });
+    expect(msg).toContain('You MUST call the tool "ghost_tool".');
+  });
+
+  it('keeps the full tool list in both mandatory cases', () => {
+    const tools = [weatherTool, searchTool];
+    const choices: Array<'required' | { type: 'function'; function: { name: string } }> = [
+      'required',
+      { type: 'function', function: { name: 'get_weather' } },
+    ];
+    for (const choice of choices) {
+      const msg = buildToolProtocolSystemMessage(tools, choice);
+      expect(msg).toContain('- get_weather(');
+      expect(msg).toContain('- web_search(');
+    }
+  });
 });
 
 describe('tryParseToolCall', () => {

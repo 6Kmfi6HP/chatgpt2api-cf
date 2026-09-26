@@ -270,7 +270,7 @@ describe('StreamProcessor', () => {
     expect(finalChunks[0].choices[0].finish_reason).toBe('stop');
   });
 
-  it('emits extra usage chunk when stream_options.include_usage is true', () => {
+  it('emits exactly one usage chunk (choices: []) when stream_options.include_usage is true', () => {
     const req: ChatCompletionRequest = {
       model: 'gpt-4o',
       messages: [{ role: 'user', content: 'What is 2+2? Please give a detailed explanation.' }],
@@ -283,18 +283,37 @@ describe('StreamProcessor', () => {
     const finalChunks = sp.flush();
     expect(finalChunks.length).toBe(2);
 
-    // Penultimate chunk: finish_reason: 'stop' with usage
+    // Finish chunk: finish_reason present, NO usage (spec: usage only in the
+    // dedicated choices:[] chunk, so clients never see it twice).
     const stopChunk = finalChunks[0];
     expect(stopChunk.choices[0].finish_reason).toBe('stop');
-    expect(stopChunk.usage).toBeDefined();
-    expect(stopChunk.usage!.total_tokens).toBeGreaterThan(0);
+    expect(stopChunk.usage).toBeUndefined();
 
-    // Last chunk: choices: [] with usage
+    // Last chunk: choices: [] with the single usage payload
     const usageChunk = finalChunks[1];
     expect(usageChunk.choices.length).toBe(0);
     expect(usageChunk.usage).toBeDefined();
     expect(usageChunk.usage!.prompt_tokens).toBeGreaterThan(0);
     expect(usageChunk.usage!.completion_tokens).toBeGreaterThan(0);
+    expect(usageChunk.usage!.total_tokens).toBe(
+      usageChunk.usage!.prompt_tokens + usageChunk.usage!.completion_tokens
+    );
+  });
+
+  it('emits no usage anywhere when stream_options.include_usage is absent', () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'Say hi.' }],
+      stream: true,
+    };
+    const sp = new StreamProcessor('gpt-4o', req);
+    const chunks = sp.processEvent(mkAssistantEvent('Hi there.'));
+    const finalChunks = sp.flush();
+    for (const c of [...chunks, ...finalChunks]) {
+      expect(c.usage).toBeUndefined();
+    }
+    expect(finalChunks).toHaveLength(1);
+    expect(finalChunks[0].choices[0].finish_reason).toBe('stop');
   });
 });
 
@@ -388,6 +407,189 @@ describe('pipeOpenAIStream', () => {
 
     await pipeOpenAIStream(resp, writer, 'gpt-4o', undefined, controller.signal);
     expect(written).not.toContain('[DONE]');
+  });
+
+  it('finalizes promptly after end_turn instead of waiting for the socket close', async () => {
+    // Real-timer test by necessity: the behavior under test IS the grace
+    // window (an upstream socket that never closes), so there is no
+    // deterministic clock to stand in for it.
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              type: 'message_stream',
+              message: {
+                id: 'live-1',
+                author: { role: 'assistant' },
+                content: { content_type: 'text', parts: ['Instant answer.'] },
+                status: 'in_progress',
+                metadata: { message_type: 'next' },
+              },
+            })}\n\n`
+          )
+        );
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              type: 'message_stream',
+              message: {
+                id: 'live-1',
+                author: { role: 'assistant' },
+                content: { content_type: 'text', parts: ['Instant answer.'] },
+                status: 'finished_successfully',
+                end_turn: true,
+                channel: 'final',
+                metadata: { message_type: 'next', finish_details: { type: 'stop' } },
+              },
+            })}\n\n`
+          )
+        );
+        // Intentionally never closed: mimics upstream holding the socket open.
+      },
+    });
+
+    const resp = new Response(body, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+    const written: string[] = [];
+    const writer = {
+      writeSSE: async (msg: { data: string }) => {
+        written.push(msg.data);
+      },
+    };
+
+    await pipeOpenAIStream(resp, writer, 'gpt-4o');
+
+    // Without the fix this never returns (the socket never closes).
+    expect(written[written.length - 1]).toBe('[DONE]');
+    const stopChunk = JSON.parse(written[written.length - 2]);
+    expect(stopChunk.choices[0].finish_reason).toBe('stop');
+  });
+
+  it('keeps reading trailing frames that arrive inside the grace window', async () => {
+    const encoder = new TextEncoder();
+    const snap = (text: string, finished: boolean) =>
+      encoder.encode(
+        `data: ${JSON.stringify({
+          type: 'message_stream',
+          message: {
+            id: 'live-1',
+            author: { role: 'assistant' },
+            content: { content_type: 'text', parts: [text] },
+            status: finished ? 'finished_successfully' : 'in_progress',
+            end_turn: finished ? true : undefined,
+            metadata: { message_type: 'next' },
+            channel: finished ? 'final' : undefined,
+          },
+        })}\n\n`
+      );
+
+    // Pull-driven: each read() hands over the next frame, so ordering is
+    // deterministic (no wall-clock guessing). The 4th pull never resolves,
+    // which forces the grace window to end the stream.
+    const frames = [
+      snap('Part 1', false),
+      snap('Part 1, Part 2', true),
+      snap('Part 1, Part 2, Part 3', true),
+    ];
+    let pullIndex = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pullIndex < frames.length) {
+          controller.enqueue(frames[pullIndex++]);
+        }
+        // Beyond the last frame: stay open without enqueuing (upstream idle).
+      },
+    });
+
+    const resp = new Response(body, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+    const written: string[] = [];
+    const writer = {
+      writeSSE: async (msg: { data: string }) => {
+        written.push(msg.data);
+      },
+    };
+
+    await pipeOpenAIStream(resp, writer, 'gpt-4o');
+    const contents = written
+      .filter((d) => d !== '[DONE]')
+      .map((d) => JSON.parse(d) as { choices?: Array<{ delta?: { content?: string } }> })
+      .map((c) => c.choices?.[0]?.delta?.content)
+      .filter((c): c is string => typeof c === 'string');
+    // The frame that arrived after end_turn (inside the grace window) is kept.
+    expect(contents.join('')).toContain('Part 3');
+  });
+
+  it('does not drop an in-window frame when the client sink is slow', async () => {
+    // Regression guard: the grace window is IDLE-based (reset after each
+    // emission), so a client whose writes are slower than the window can no
+    // longer consume the window and lose a trailing frame.
+    const encoder = new TextEncoder();
+    const snap = (text: string, finished: boolean) =>
+      encoder.encode(
+        `data: ${JSON.stringify({
+          type: 'message_stream',
+          message: {
+            id: 'live-1',
+            author: { role: 'assistant' },
+            content: { content_type: 'text', parts: [text] },
+            status: finished ? 'finished_successfully' : 'in_progress',
+            end_turn: finished ? true : undefined,
+            metadata: { message_type: 'next' },
+            channel: finished ? 'final' : undefined,
+          },
+        })}\n\n`
+      );
+
+    let step = 0;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (step === 0) {
+          controller.enqueue(snap('A', false));
+          step++;
+          return;
+        }
+        if (step === 1) {
+          controller.enqueue(snap('AB', true));
+          step++;
+          return;
+        }
+        if (step === 2) {
+          step++;
+          await new Promise((r) => setTimeout(r, 120));
+          controller.enqueue(snap('ABC', true));
+          return;
+        }
+        // Stay open: only the idle window may end the stream.
+      },
+    });
+
+    const resp = new Response(body, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+    const written: string[] = [];
+    const writer = {
+      // Emitting each frame outlasts STREAM_TAIL_GRACE_MS, which is exactly
+      // the condition that used to drop the in-window trailer.
+      writeSSE: async (msg: { data: string }) => {
+        await new Promise((r) => setTimeout(r, 300));
+        written.push(msg.data);
+      },
+    };
+
+    await pipeOpenAIStream(resp, writer, 'gpt-4o');
+    const content = written
+      .filter((d) => d !== '[DONE]')
+      .map((d) => JSON.parse(d) as { choices?: Array<{ delta?: { content?: string } }> })
+      .map((c) => c.choices?.[0]?.delta?.content)
+      .filter((c): c is string => typeof c === 'string')
+      .join('');
+    expect(content).toBe('ABC');
+    expect(written[written.length - 1]).toBe('[DONE]');
   });
 });
 

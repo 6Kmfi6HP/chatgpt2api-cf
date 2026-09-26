@@ -385,7 +385,18 @@ export function formatCitations(text: string, sources?: Map<string, SearchSource
     return ' ' + links.join(' ');
   };
 
-  let s = text.replace(ANNOTATION_BLOCK, replaceBlock);
+  // citePrefixResidue: an ASCII "cite" the model wrote directly before a PUA
+  // annotation survives ANNOTATION_BLOCK; drop just that word (the block itself
+  // is still replaced with its markdown link by the pass below). The residue's
+  // OWN trailing space/tab run is consumed too — otherwise "cite " left the
+  // separator space plus the annotation's leading space, emitting two spaces.
+  // The lookahead stops at the annotation START rune: ANNOTATION_BLOCK handles
+  // the (possibly still-growing) block itself, and matching through to the END
+  // rune inside a lookahead made this pass superlinear on unterminated input.
+  const CITE_PREFIX_RESIDUE = /(^|[^A-Za-z0-9_])cite[ \t]*(?=\ue200)/g;
+  let s = text.replace(CITE_PREFIX_RESIDUE, '$1');
+
+  s = s.replace(ANNOTATION_BLOCK, replaceBlock);
   s = s.replace(CITATION_RUN, replaceRun);
   s = s.replace(PUA_STRAY, '');
   // Second pass: a link the replacement emitted may have landed INSIDE the

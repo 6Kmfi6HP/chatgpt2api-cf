@@ -53,6 +53,13 @@ export class StreamProcessor {
    * live snapshot designates it.
    */
   public liveMessageId = '';
+  /**
+   * True once the live message reports its turn is over
+   * (status "finished_successfully" + end_turn). Upstream then holds the
+   * socket open for another 1-3s before closing; pipeOpenAIStream uses this
+   * to stop waiting (see STREAM_TAIL_GRACE_MS) instead of idling.
+   */
+  public endedTurn = false;
 
   constructor(
     model: string,
@@ -107,6 +114,17 @@ export class StreamProcessor {
       this.prevText = '';
       this.withheld = '';
       this.withheldGenui = '';
+    }
+
+    // The live message reached its terminal frame: the turn is over, so no
+    // further content can arrive on this message. end_turn is only set by the
+    // upstream when the model actually ended its turn, which makes it a safe
+    // stop signal (a history echo already returned above).
+    if (
+      ev.message.status === 'finished_successfully' &&
+      ev.message.end_turn === true
+    ) {
+      this.endedTurn = true;
     }
 
     const parts: string[] = [];
@@ -206,8 +224,9 @@ export class StreamProcessor {
   /**
    * Flushes stream tail and emits terminal chunks:
    * 1. Any resolved withheld citation fragment (if any)
-   * 2. Final chunk with finish_reason: "stop" and token usage
-   * 3. Usage chunk if stream_options.include_usage was requested
+   * 2. Final chunk with finish_reason ("stop"/"tool_calls"), never carrying usage
+   * 3. When stream_options.include_usage was requested: exactly one usage chunk
+   *    (choices: []) — the only usage-bearing frame of the stream
    */
   flush(): ChatCompletionChunk[] {
     const out: ChatCompletionChunk[] = [];
@@ -244,12 +263,13 @@ export class StreamProcessor {
         this.messageId,
         this.created,
         this.model,
-        promptTokens,
-        completionTokens,
         this.toolCallState ? this.toolCallState.finishReason() : 'stop'
       )
     );
 
+    // Spec-conformant usage delivery: only when stream_options.include_usage
+    // was requested, and only in this dedicated `choices: []` chunk. The
+    // finish chunk above never carries usage.
     if (wantsStreamUsage(this.originalReq)) {
       out.push(
         buildUsageChunk(
@@ -284,6 +304,18 @@ async function emitChunk(
 }
 
 /**
+ * Upstream keeps the SSE socket open 1.3-3s AFTER the live message reports
+ * end_turn. Waiting for that close only stalls the client, so once the
+ * terminal frame is seen the reader waits at most this long for any trailing
+ * frames (late metadata/history echoes) and then finalizes the stream.
+ * Shared with the buffered retry reader in src/index.ts.
+ */
+export const STREAM_TAIL_GRACE_MS = 250;
+
+/** Sentinel returned by the bounded tail read when the grace window expires. */
+export const READ_TIMEOUT = Symbol('read-timeout');
+
+/**
  * pipeOpenAIStream streams upstream SSE response body to the SSEWriter,
  * converting cumulative assistant snapshots into OpenAI chat completion chunks.
  */
@@ -315,6 +347,7 @@ export async function pipeOpenAIStream(
   if (resp.body) {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
+    let readTimedOut = false;
 
     const onAbort = () => {
       try {
@@ -333,6 +366,8 @@ export async function pipeOpenAIStream(
     }
 
     try {
+      // Armed once the live turn ends; bounds how long we wait for the socket.
+      let graceDeadline = 0;
       while (true) {
         if (signal?.aborted) {
           try {
@@ -341,18 +376,59 @@ export async function pipeOpenAIStream(
           return;
         }
 
-        const { done, value } = await reader.read();
-        if (done) break;
-        parser.feed(decoder.decode(value, { stream: true }));
+        let done = false;
+        if (graceDeadline > 0) {
+          const remaining = graceDeadline - Date.now();
+          if (remaining <= 0) {
+            readTimedOut = true;
+            break;
+          }
+          const timeout = Promise.withResolvers<typeof READ_TIMEOUT>();
+          const tid = setTimeout(() => timeout.resolve(READ_TIMEOUT), remaining);
+          const raced = await Promise.race([reader.read(), timeout.promise]);
+          clearTimeout(tid);
+          if (raced === READ_TIMEOUT) {
+            readTimedOut = true;
+            break;
+          }
+          done = raced.done;
+          if (!done && raced.value) {
+            parser.feed(decoder.decode(raced.value, { stream: true }));
+          }
+        } else {
+          const { done: d, value } = await reader.read();
+          done = d;
+          if (!done && value) {
+            parser.feed(decoder.decode(value, { stream: true }));
+          }
+        }
+
         while (pendingChunks.length > 0) {
           if (signal?.aborted) return;
           const chunk = pendingChunks.shift()!;
           await emitChunk(writer, chunk);
         }
+
+        if (done) break;
+        // Idle-based window: reset AFTER emission so a slow client sink (whose
+        // drain can take longer than the grace period) never consumes the
+        // window and causes an in-window trailing frame to be dropped. The
+        // stream now ends after STREAM_TAIL_GRACE_MS of upstream silence
+        // following the last emitted frame.
+        if (sp.endedTurn) {
+          graceDeadline = Date.now() + STREAM_TAIL_GRACE_MS;
+        }
       }
     } finally {
       if (signal) {
         signal.removeEventListener('abort', onAbort);
+      }
+      if (readTimedOut) {
+        // A read is still in flight on the abandoned socket; cancel before
+        // releasing the lock.
+        try {
+          await reader.cancel();
+        } catch {}
       }
       reader.releaseLock();
     }

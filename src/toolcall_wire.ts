@@ -132,10 +132,16 @@ function toGenericMessages(messages: any[]): GenericMessage[] {
 }
 
 /** Build the tool protocol system message as an upstream frame. */
-function toolProtocolFrame(tools: ToolDefinition[]): UpstreamMessage {
+function toolProtocolFrame(
+  tools: ToolDefinition[],
+  toolChoice?: WireToolCallRequest['tool_choice']
+): UpstreamMessage {
   return {
     author: { role: 'system' },
-    content: { content_type: 'text', parts: [buildToolProtocolSystemMessage(tools)] },
+    content: {
+      content_type: 'text',
+      parts: [buildToolProtocolSystemMessage(tools, toolChoice)],
+    },
   };
 }
 
@@ -182,7 +188,7 @@ export function buildAnonRequestBodyWithTools(
   // is prepended (mirrors the handler's hasTools gate and StreamProcessor's
   // toolCallState gate).
   if (tools.length > 0 && req?.tool_choice !== 'none') {
-    messages = [toolProtocolFrame(tools), ...messages];
+    messages = [toolProtocolFrame(tools, req?.tool_choice), ...messages];
   }
 
   if (opts.messageContent && typeof opts.messageContent === 'object') {

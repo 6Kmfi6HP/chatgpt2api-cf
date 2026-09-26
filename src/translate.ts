@@ -200,20 +200,22 @@ export function buildOpenAIChunk(
 }
 
 /**
- * buildFinalChunk marks the end of an OpenAI stream with choices[0].finish_reason = "stop".
- * If promptTokens and completionTokens are supplied (> 0), includes token usage metrics.
+ * buildFinalChunk marks the end of an OpenAI stream with
+ * choices[0].finish_reason = "stop" (or "tool_calls").
+ *
+ * Per the OpenAI streaming spec this chunk NEVER carries a `usage` field:
+ * usage is only ever delivered by the separate `choices: []` chunk that
+ * buildUsageChunk mints when stream_options.include_usage is set. Attaching
+ * usage here duplicated it for spec-conformant clients that read the last
+ * usage-bearing chunk.
  */
 export function buildFinalChunk(
   id: string,
   created: number,
   model: string,
-  promptTokens?: number,
-  completionTokens?: number,
   finishReason?: 'stop' | 'tool_calls'
 ): ChatCompletionChunk {
-  const pTokens = promptTokens ?? 0;
-  const cTokens = completionTokens ?? 0;
-  const chunk: ChatCompletionChunk = {
+  return {
     id,
     object: 'chat.completion.chunk',
     created,
@@ -226,14 +228,6 @@ export function buildFinalChunk(
       },
     ],
   };
-  if (pTokens > 0 || cTokens > 0) {
-    chunk.usage = {
-      prompt_tokens: pTokens,
-      completion_tokens: cTokens,
-      total_tokens: pTokens + cTokens,
-    };
-  }
-  return chunk;
 }
 
 /**
@@ -300,6 +294,10 @@ export function buildOpenAICompletion(
  * countRoughTokens approximates token usage:
  * - English/ASCII text: ~chars / 4
  * - CJK ideographs/Kana/Hangul: ~1.5 tokens per character (matching tiktoken cl100k)
+ *
+ * Any non-empty text costs at least 1 token: a real tokenizer never bills an
+ * empty count for text the model actually produced ("1" used to round to 0,
+ * which billing-aware clients read as "no output").
  */
 export function countRoughTokens(s: string): number {
   if (!s) {
@@ -310,7 +308,7 @@ export function countRoughTokens(s: string): number {
   const nonCjkLength = s.length - cjkCount;
   const cjkTokens = Math.ceil(cjkCount * 1.5);
   const asciiTokens = Math.floor(nonCjkLength / 4);
-  return cjkTokens + asciiTokens;
+  return Math.max(1, cjkTokens + asciiTokens);
 }
 
 /**

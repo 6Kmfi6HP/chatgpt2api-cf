@@ -107,6 +107,51 @@ describe('buildAnonRequestBodyWithTools', () => {
     expect(dto.messages[1].content.parts).toEqual(['weather in Paris?']);
   });
 
+  it('appends the mandatory clause for tool_choice "required"', () => {
+    const req = baseReq({
+      messages: [{ role: 'user', content: 'weather in Paris?' }],
+      tools: [{ type: 'function', function: { name: 'get_weather' } }],
+      tool_choice: 'required',
+    });
+    const proto = buildAnonRequestBodyWithTools(req, { prompt: 'p' }).messages[0].content.parts.join('\n');
+    expect(proto).toContain('MANDATORY TOOL USE (this request)');
+    expect(proto).toContain('You MUST reply with a tool call.');
+    expect(proto).toContain('get_weather');
+  });
+
+  it('appends the named-tool clause for a named tool_choice', () => {
+    const req = baseReq({
+      messages: [{ role: 'user', content: 'weather in Paris?' }],
+      tools: [{ type: 'function', function: { name: 'get_weather' } }],
+      tool_choice: { type: 'function', function: { name: 'get_weather' } },
+    });
+    const proto = buildAnonRequestBodyWithTools(req, { prompt: 'p' }).messages[0].content.parts.join('\n');
+    expect(proto).toContain('You MUST call the tool "get_weather".');
+  });
+
+  it('emits the named directive even when the name is absent from tools', () => {
+    const req = baseReq({
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ type: 'function', function: { name: 'get_weather' } }],
+      tool_choice: { type: 'function', function: { name: 'ghost_tool' } },
+    });
+    const proto = buildAnonRequestBodyWithTools(req, { prompt: 'p' }).messages[0].content.parts.join('\n');
+    expect(proto).toContain('You MUST call the tool "ghost_tool".');
+  });
+
+  it('leaves the protocol wording unchanged for tool_choice "auto"', () => {
+    const tools = [{ type: 'function' as const, function: { name: 'get_weather' } }];
+    const plain = buildAnonRequestBodyWithTools(
+      baseReq({ messages: [{ role: 'user', content: 'hi' }], tools }),
+      { prompt: 'p' }
+    ).messages[0].content.parts;
+    const auto = buildAnonRequestBodyWithTools(
+      baseReq({ messages: [{ role: 'user', content: 'hi' }], tools, tool_choice: 'auto' }),
+      { prompt: 'p' }
+    ).messages[0].content.parts;
+    expect(auto).toEqual(plain);
+  });
+
   it('preserves caller system messages after the protocol message', () => {
     const req = baseReq({
       messages: [
@@ -185,6 +230,16 @@ describe('buildAnonRequestBodyWithTools', () => {
     expect(dto.messages).toHaveLength(2); // protocol + user placeholder
     expect(dto.messages[1].author.role).toBe('user');
     expect(dto.messages[1].content).toEqual(multimodal);
+  });
+
+  it('does not insert a protocol frame when tool_choice is "none"', () => {
+    const req = baseReq({
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ type: 'function', function: { name: 'get_weather' } }],
+      tool_choice: 'none',
+    });
+    const dto = buildAnonRequestBodyWithTools(req, { prompt: 'p' });
+    expect(dto.messages.map((m: { author: { role: string } }) => m.author.role)).toEqual(['user']);
   });
 
   it('does not insert a system message when there are no tools', () => {

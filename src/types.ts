@@ -89,11 +89,17 @@ export interface ChatCompletionRequest {
    */
   tools?: OpenAIToolDefinition[];
   /**
-   * Accepted for OpenAI compatibility: "auto" | "none" | named function.
-   * "none" disables tool-calling for the request; other values behave as
-   * "auto" (upstream has no native tool-choice knob).
+   * Accepted for OpenAI compatibility: "auto" | "none" | "required" | named
+   * function. "none" disables tool-calling; "auto" is the default; "required"
+   * and a named function are approximated by stronger protocol wording (the
+   * upstream has no native tool-choice knob), so they are strong hints, not
+   * guarantees.
    */
-  tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
+  tool_choice?:
+    | 'auto'
+    | 'none'
+    | 'required'
+    | { type: 'function'; function: { name: string } };
 }
 
 export interface ChatCompletionChoice {
