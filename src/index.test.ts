@@ -396,6 +396,7 @@ describe('Hono Application (src/index.ts)', () => {
         const data: any = await res.json();
         expect(data.error.code).toBe(expectedCode);
         expect(data.error.type).toBe('invalid_request_error');
+        expect(data.error.message).toBe('Incorrect API key provided');
       }
     });
   });
