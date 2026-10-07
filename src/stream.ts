@@ -546,7 +546,7 @@ export async function aggregateNonStream(
 
   const finalText =
     emitted + resolveWithheld(withheldGenui) + resolveWithheld(withheld);
-  const promptText = originalReq?.messages
+  const promptText = originalReq.messages
     ? flattenMessages(originalReq.messages)
     : '';
   const promptTokens = countRoughTokens(promptText);
