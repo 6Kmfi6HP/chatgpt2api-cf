@@ -11,8 +11,6 @@ import { tryParseToolCall, stripGenuiMarkers, type ParsedToolCall } from './tool
 
 export const DEFAULT_MAX_TOOLCALL_BUFFER = 1200;
 
-const TOOLCALL_OPENERS = ['{', '```'];
-
 export interface DetectorDecision {
   decision: 'buffer' | 'flush' | 'emit_tool_calls';
   toolCalls?: ParsedToolCall[];
@@ -30,20 +28,12 @@ export class ToolCallStreamDetector {
       typeof mb === 'number' && Number.isFinite(mb) && mb > 0 ? mb : DEFAULT_MAX_TOOLCALL_BUFFER;
   }
 
-  /** Sticky: once flushed/emitted the detector never returns to buffering. */
-  private isSettled(): boolean {
-    return this.flushed || this.emitted;
-  }
-
   feed(accumulatedText: string): DetectorDecision {
-    if (this.flushed) {
-      return { decision: 'flush', text: '' };
-    }
-    if (this.emitted) {
+    if (this.flushed || this.emitted) {
       return { decision: 'flush', text: '' };
     }
 
-    const raw = accumulatedText ?? '';
+    const raw = accumulatedText;
     const trimmed = raw.trim();
 
     // Empty / whitespace-only: keep buffering (nothing decidable yet).
@@ -53,7 +43,7 @@ export class ToolCallStreamDetector {
 
     // Fast rejection: a plain reply never opens with { or ```.
     const firstChar = trimmed[0];
-    if (!TOOLCALL_OPENERS.includes(firstChar) && !trimmed.startsWith('```json')) {
+    if (firstChar !== '{' && !trimmed.startsWith('```')) {
       this.flushed = true;
       return { decision: 'flush', text: raw };
     }
@@ -129,11 +119,11 @@ export class ToolCallStreamState {
       // After tool calls were emitted the accumulated text is the tool-call
       // JSON itself — never leak it as content.
       if (this.emittedToolCalls) {
-        this.lastEmittedLen = (accumulated ?? '').length;
+        this.lastEmittedLen = accumulated.length;
         return [];
       }
       // Emit the delta between what we already sent and the full text.
-      const text = accumulated ?? '';
+      const text = accumulated;
       if (text.length > this.lastEmittedLen) {
         const delta = text.slice(this.lastEmittedLen);
         this.lastEmittedLen = text.length;
@@ -148,7 +138,6 @@ export class ToolCallStreamState {
     const out: StreamEmit[] = [];
     // The accumulated text IS the tool-call JSON — never leak it as content.
     // (Any stray leading prose would have triggered 'flush' earlier.)
-    void stripGenuiMarkers;
     const calls = decision.toolCalls ?? [];
     calls.forEach((c, i) => {
       out.push({
