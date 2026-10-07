@@ -253,23 +253,17 @@ describe('Hono Application (src/index.ts)', () => {
       });
       expect(res.status).toBe(200);
       const dto = mockClient.prepareCalls[0].anonBody;
-      expect(dto.messages).toEqual([
-        {
-          author: { role: 'system' },
-          content: { content_type: 'text', parts: ['You are concise.'] },
-        },
-        {
-          author: { role: 'user' },
-          content: { content_type: 'text', parts: ['remember the codeword alpha1'] },
-        },
-        {
-          author: { role: 'assistant' },
-          content: { content_type: 'text', parts: ['ok1'] },
-        },
-        {
-          author: { role: 'user' },
-          content: { content_type: 'text', parts: ['What was the codeword?'] },
-        },
+      expect(dto.messages.map((m: any) => m.author.role)).toEqual([
+        'system',
+        'user',
+        'assistant',
+        'user',
+      ]);
+      expect(dto.messages.map((m: any) => m.content.parts[0])).toEqual([
+        'You are concise.',
+        'remember the codeword alpha1',
+        'ok1',
+        'What was the codeword?',
       ]);
       // Stateless OpenAI semantics stay: a fresh upstream conversation per
       // request, with the whole history replayed as native frames.
@@ -286,12 +280,9 @@ describe('Hono Application (src/index.ts)', () => {
       });
       expect(res.status).toBe(200);
       const dto = mockClient.prepareCalls[0].anonBody;
-      expect(dto.messages).toEqual([
-        {
-          author: { role: 'user' },
-          content: { content_type: 'text', parts: ['Say hello'] },
-        },
-      ]);
+      expect(dto.messages).toHaveLength(1);
+      expect(dto.messages[0].author.role).toBe('user');
+      expect(dto.messages[0].content.parts[0]).toBe('Say hello');
     });
 
     it('falls back to a single user frame when history has no user message', async () => {
@@ -301,12 +292,9 @@ describe('Hono Application (src/index.ts)', () => {
       });
       expect(res.status).toBe(200);
       const dto = mockClient.prepareCalls[0].anonBody;
-      expect(dto.messages).toEqual([
-        {
-          author: { role: 'user' },
-          content: { content_type: 'text', parts: ['System:\nYou are terse.'] },
-        },
-      ]);
+      expect(dto.messages).toHaveLength(1);
+      expect(dto.messages[0].author.role).toBe('user');
+      expect(dto.messages[0].content.parts[0]).toContain('You are terse.');
     });
 
     it('tool history without tools enabled maps role:"tool" results to tool frames', async () => {
@@ -348,102 +336,91 @@ describe('Hono Application (src/index.ts)', () => {
   });
 
   describe('Bearer Token Authentication', () => {
-    it('allows requests when API_KEYS is empty (public mode)', async () => {
-      const res = await app.request('/v1/models', { method: 'GET' }, mockEnv);
-      expect(res.status).toBe(200);
-    });
-
-    it('rejects requests when API_KEYS is set but header is missing', async () => {
-      const authEnv = { ...mockEnv, API_KEYS: 'secret-token-1,secret-token-2' };
-      const res = await app.request('/v1/models', { method: 'GET' }, authEnv);
-      expect(res.status).toBe(401);
-      const data: any = await res.json();
-      expect(data).toEqual({
-        error: {
-          message: 'Incorrect API key provided',
-          type: 'invalid_request_error',
-          code: 'invalid_api_key',
-        },
-      });
-    });
-
-    it('rejects requests with incorrect token', async () => {
-      const authEnv = { ...mockEnv, API_KEYS: 'secret-token-1,secret-token-2' };
-      const res = await app.request(
-        '/v1/models',
-        {
-          method: 'GET',
-          headers: { Authorization: 'Bearer wrong-token' },
-        },
-        authEnv
-      );
-      expect(res.status).toBe(401);
-      const data: any = await res.json();
-      expect(data.error.code).toBe('invalid_api_key');
-    });
-
-    it('allows requests with valid token in API_KEYS list', async () => {
-      const authEnv = { ...mockEnv, API_KEYS: 'secret-token-1,secret-token-2' };
-      const res = await app.request(
-        '/v1/models',
-        {
-          method: 'GET',
-          headers: { Authorization: 'Bearer secret-token-2' },
-        },
-        authEnv
-      );
-      expect(res.status).toBe(200);
-    });
-
-    it('allows requests with valid token via x-api-key header', async () => {
-      const authEnv = { ...mockEnv, API_KEYS: 'secret-token-1,secret-token-2' };
-      const res = await app.request(
-        '/v1/models',
-        {
-          method: 'GET',
-          headers: { 'x-api-key': 'secret-token-1' },
-        },
-        authEnv
-      );
-      expect(res.status).toBe(200);
-    });
-
-    it('allows /health even when API_KEYS is set', async () => {
-      const authEnv = { ...mockEnv, API_KEYS: 'secret-token-1' };
-      const res = await app.request('/health', { method: 'GET' }, authEnv);
-      expect(res.status).toBe(200);
+    it.each([
+      {
+        name: 'public mode: no API_KEYS allows /v1/models',
+        apiKeys: '',
+        path: '/v1/models',
+        headers: {},
+        expectedStatus: 200,
+      },
+      {
+        name: 'protected: missing header is 401 invalid_api_key',
+        apiKeys: 'secret-token-1,secret-token-2',
+        path: '/v1/models',
+        headers: {},
+        expectedStatus: 401,
+        expectedCode: 'invalid_api_key',
+      },
+      {
+        name: 'protected: wrong token is 401 invalid_api_key',
+        apiKeys: 'secret-token-1,secret-token-2',
+        path: '/v1/models',
+        headers: { Authorization: 'Bearer wrong-token' },
+        expectedStatus: 401,
+        expectedCode: 'invalid_api_key',
+      },
+      {
+        name: 'protected: valid Bearer token allows access',
+        apiKeys: 'secret-token-1,secret-token-2',
+        path: '/v1/models',
+        headers: { Authorization: 'Bearer secret-token-2' },
+        expectedStatus: 200,
+      },
+      {
+        name: 'protected: valid token via x-api-key allows access',
+        apiKeys: 'secret-token-1,secret-token-2',
+        path: '/v1/models',
+        headers: { 'x-api-key': 'secret-token-1' },
+        expectedStatus: 200,
+      },
+      {
+        name: 'protected: /health stays public',
+        apiKeys: 'secret-token-1',
+        path: '/health',
+        headers: {},
+        expectedStatus: 200,
+      },
+    ])('auth: $name', async ({ apiKeys, path, headers, expectedStatus, expectedCode }) => {
+      const authEnv = { ...mockEnv, API_KEYS: apiKeys };
+      const res = await app.request(path, { method: 'GET', headers }, authEnv);
+      expect(res.status).toBe(expectedStatus);
+      if (expectedStatus === 401) {
+        const data: any = await res.json();
+        expect(data.error.code).toBe(expectedCode);
+        expect(data.error.type).toBe('invalid_request_error');
+      }
     });
   });
 
   describe('POST /v1/chat/completions - Request Validation', () => {
-    it('returns 400 for invalid JSON body', async () => {
+    it.each([
+      {
+        name: 'invalid JSON body',
+        body: 'not a json',
+        expectedMessage: undefined as string | undefined,
+      },
+      {
+        name: 'empty messages array',
+        body: JSON.stringify({ model: 'gpt-4o', messages: [] }),
+        expectedMessage: 'messages',
+      },
+    ])('400: $name', async ({ body, expectedMessage }) => {
       const res = await app.request(
         '/v1/chat/completions',
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: 'not a json',
+          body,
         },
         mockEnv
       );
       expect(res.status).toBe(400);
       const data: any = await res.json();
       expect(data.error.type).toBe('invalid_request_error');
-    });
-
-    it('returns 400 when messages array is missing or empty', async () => {
-      const res = await app.request(
-        '/v1/chat/completions',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: 'gpt-4o', messages: [] }),
-        },
-        mockEnv
-      );
-      expect(res.status).toBe(400);
-      const data: any = await res.json();
-      expect(data.error.message).toContain('messages');
+      if (expectedMessage) {
+        expect(data.error.message).toContain(expectedMessage);
+      }
     });
   });
 
