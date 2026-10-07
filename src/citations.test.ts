@@ -69,7 +69,7 @@ describe('stripCitations', () => {
 });
 
 describe('splitCitationTail', () => {
-  const cases = [
+  it.each([
     { in: 'done', keep: 'done', tail: '' },
     { in: 'text. cite', keep: 'text.', tail: ' cite' },
     { in: 'text. citeturn0news7', keep: 'text.', tail: ' citeturn0news7' },
@@ -89,32 +89,29 @@ describe('splitCitationTail', () => {
       keep: 'This is a longer answer about the topic and it ends cleanly',
       tail: '',
     },
-  ];
-
-  for (const tc of cases) {
-    it(`splits: "${tc.in.slice(0, 25)}"`, () => {
-      const { keep, tail } = splitCitationTail(tc.in);
-      expect(keep).toBe(tc.keep);
-      expect(tail).toBe(tc.tail);
-    });
-  }
+  ])('splits: "$in"', ({ keep, tail, ...tc }) => {
+    const r = splitCitationTail(tc.in);
+    expect(r.keep).toBe(keep);
+    expect(r.tail).toBe(tail);
+  });
 });
 
 describe('resolveWithheld', () => {
-  it('drops fragments with digits or PUA delimiters', () => {
-    expect(resolveWithheld('citeturn0new')).toBe('');
-    expect(resolveWithheld(' turn0ne')).toBe('');
-    expect(resolveWithheld(PUA_ANNOTATION_START + 'cite')).toBe('');
-    expect(resolveWithheld(PUA_ANNOTATION_SEP + 'tail')).toBe('');
-  });
-
-  it('keeps pure-letter tail', () => {
-    expect(resolveWithheld('turn')).toBe('turn');
-    expect(resolveWithheld('about')).toBe('about');
-  });
-
-  it('handles empty string', () => {
-    expect(resolveWithheld('')).toBe('');
+  it.each([
+    { name: 'citation run with digits', fragment: 'citeturn0new', want: '' },
+    { name: 'leading-space citation tail', fragment: ' turn0ne', want: '' },
+    { name: 'PUA start rune prefix', fragment: PUA_ANNOTATION_START + 'cite', want: '' },
+    { name: 'PUA sep rune prefix', fragment: PUA_ANNOTATION_SEP + 'tail', want: '' },
+    { name: 'truncated genui fence with attrs', fragment: ':::writing{variant="doc', want: '' },
+    { name: 'bare double-colon prefix', fragment: '::', want: '' },
+    { name: 'bare genui opener', fragment: ':::writing', want: '' },
+    { name: 'genui orphan with attrs', fragment: 'genui5j', want: '' },
+    { name: 'pure-letter tail "turn"', fragment: 'turn', want: 'turn' },
+    { name: 'pure-letter tail "about"', fragment: 'about', want: 'about' },
+    { name: 'CJK tail passes through', fragment: '普通结尾', want: '普通结尾' },
+    { name: 'empty string', fragment: '', want: '' },
+  ])('$name', ({ fragment, want }) => {
+    expect(resolveWithheld(fragment)).toBe(want);
   });
 });
 
@@ -288,47 +285,49 @@ describe('ingestMetadata', () => {
 });
 
 describe('stripGenuiContainers (bare ::: fence leakage)', () => {
-  it('removes bare :::writing{…} fences and keeps the body', () => {
-    const text =
-      '当然，给你一版简洁、正式的：\n' +
-      ':::writing{variant="document" id="58321" title="请假条"}\n' +
-      '**请假条**\n' +
-      '尊敬的老师：……\n' +
-      ':::';
-    expect(stripGenuiContainers(text)).toBe(
-      '当然，给你一版简洁、正式的：\n**请假条**\n尊敬的老师：……'
-    );
-  });
-
-  it('removes nested containers level by level', () => {
-    const text =
-      ':::writing{variant="chat_message"}\n' +
-      ':::writing{variant="document"}\n' +
-      '正文内容\n' +
-      ':::\n' +
-      ':::';
-    expect(stripGenuiContainers(text)).toBe('正文内容');
-  });
-
-  it('keeps an unbalanced stray ::: line as content', () => {
-    const text = '前文：\n:::';
-    expect(stripGenuiContainers(text)).toBe(text);
-  });
-
-  it('never touches ::: inside fenced code blocks', () => {
-    const text =
-      '示例：\n```markdown\n:::writing{variant="document"}\n正文\n:::\n```\n结束';
-    expect(stripGenuiContainers(text)).toBe(text);
-  });
-
-  it('treats prose containing ::: mid-line as content', () => {
-    const text = '时间格式是 hh:::mm，不是别的';
-    expect(stripGenuiContainers(text)).toBe(text);
-  });
-
-  it('is idempotent on already-clean text', () => {
-    const text = '普通回答，没有任何标记。';
-    expect(stripGenuiContainers(text)).toBe(text);
+  it.each([
+    {
+      name: 'removes bare :::writing{…} fences and keeps the body',
+      text:
+        '当然，给你一版简洁、正式的：\n' +
+        ':::writing{variant="document" id="58321" title="请假条"}\n' +
+        '**请假条**\n' +
+        '尊敬的老师：……\n' +
+        ':::',
+      want: '当然，给你一版简洁、正式的：\n**请假条**\n尊敬的老师：……',
+    },
+    {
+      name: 'removes nested containers level by level',
+      text:
+        ':::writing{variant="chat_message"}\n' +
+        ':::writing{variant="document"}\n' +
+        '正文内容\n' +
+        ':::\n' +
+        ':::',
+      want: '正文内容',
+    },
+    {
+      name: 'keeps an unbalanced stray ::: line as content',
+      text: '前文：\n:::',
+      want: '前文：\n:::',
+    },
+    {
+      name: 'never touches ::: inside fenced code blocks',
+      text: '示例：\n```markdown\n:::writing{variant="document"}\n正文\n:::\n```\n结束',
+      want: '示例：\n```markdown\n:::writing{variant="document"}\n正文\n:::\n```\n结束',
+    },
+    {
+      name: 'treats prose containing ::: mid-line as content',
+      text: '时间格式是 hh:::mm，不是别的',
+      want: '时间格式是 hh:::mm，不是别的',
+    },
+    {
+      name: 'is idempotent on already-clean text',
+      text: '普通回答，没有任何标记。',
+      want: '普通回答，没有任何标记。',
+    },
+  ])('$name', ({ text, want }) => {
+    expect(stripGenuiContainers(text)).toBe(want);
   });
 
   it('strips the fence while keeping inline citations renderable', () => {
@@ -354,55 +353,25 @@ describe('stripGenuiContainers (bare ::: fence leakage)', () => {
 });
 
 describe('splitGenuiContainerTail', () => {
-  it('withholds a partial opener fragment at line end', () => {
-    const r = splitGenuiContainerTail('如下：\n:::writ');
-    expect(r.keep).toBe('如下：\n');
-    expect(r.tail).toBe(':::writ');
+  it.each([
+    { name: 'withholds a partial opener fragment at line end', text: '如下：\n:::writ', keep: '如下：\n', tail: ':::writ' },
+    { name: 'withholds an opener whose attribute brace is unfinished', text: '正文\n:::writing{variant="doc', keep: '正文\n', tail: ':::writing{variant="doc' },
+    { name: 'releases a fragment that closed its brace', text: '正文\n:::writing{variant="doc"}', keep: '正文\n:::writing{variant="doc"}', tail: '' },
+    { name: 'withholds a bare "::" prefix', text: '正文::', keep: '正文', tail: '::' },
+    { name: 'leaves plain prose untouched', text: '普通一句话：结尾', keep: '普通一句话：结尾', tail: '' },
+    // no tail match — mid-word usage
+    { name: 'keeps real prose that mentions "genui" mid-line', text: '请参阅 genui 节点说明', keep: '请参阅 genui 节点说明', tail: '' },
+  ])('$name', ({ text, keep, tail }) => {
+    const r = splitGenuiContainerTail(text);
+    expect(r.keep).toBe(keep);
+    expect(r.tail).toBe(tail);
   });
 
-  it('withholds an opener whose attribute brace is unfinished', () => {
-    const r = splitGenuiContainerTail('正文\n:::writing{variant="doc');
-    expect(r.keep).toBe('正文\n');
-    expect(r.tail).toBe(':::writing{variant="doc');
-  });
-
-  it('releases a fragment that closed its brace', () => {
-    const r = splitGenuiContainerTail('正文\n:::writing{variant="doc"}');
-    expect(r.keep).toBe('正文\n:::writing{variant="doc"}');
-    expect(r.tail).toBe('');
-  });
-
-  it('withholds a bare "::" prefix', () => {
-    const r = splitGenuiContainerTail('正文::');
-    expect(r.keep).toBe('正文');
-    expect(r.tail).toBe('::');
-  });
-
-  it('leaves plain prose untouched', () => {
-    const r = splitGenuiContainerTail('普通一句话：结尾');
-    expect(r.keep).toBe('普通一句话：结尾');
-    expect(r.tail).toBe('');
-  });
-
-  it('resolveWithheld drops a truncated genui fence fragment', () => {
-    expect(resolveWithheld(':::writing{variant="doc')).toBe('');
-    expect(resolveWithheld('::')).toBe('');
-    expect(resolveWithheld(':::writing')).toBe('');
-    expect(resolveWithheld('普通结尾')).toBe('普通结尾');
-  });
-
-  it('withholds a bare "genui<attrs>" orphan at line end', () => {
+  it('withholds a bare "genui<attrs>" orphan at line end and drops it via resolveWithheld', () => {
     const r = splitGenuiContainerTail('前文 [x](https://y.cn)\n\ngenui5j');
     expect(r.keep).toBe('前文 [x](https://y.cn)\n\n');
     expect(r.tail).toBe('genui5j');
     expect(resolveWithheld(r.tail)).toBe('');
-  });
-
-  it('keeps real prose that happens to mention "genui" mid-line', () => {
-    const text = '请参阅 genui 节点说明'; // no tail match — mid-word usage
-    const r = splitGenuiContainerTail(text);
-    expect(r.keep).toBe(text);
-    expect(r.tail).toBe('');
   });
 });
 

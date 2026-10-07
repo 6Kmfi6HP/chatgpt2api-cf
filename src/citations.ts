@@ -56,7 +56,7 @@ const NESTED_CITATION_LINK = /(\[[^\]\n]*\]\()\s*\[[^\]\n]*\]\(([^()\s]+)\)\s*(\
  * cleanURL removes tracking parameters (e.g. utm_source) and trims whitespace.
  */
 export function cleanURL(raw: string): string {
-  raw = (raw || '').trim();
+  raw = raw.trim();
   if (!raw) {
     return '';
   }
@@ -75,7 +75,7 @@ export function cleanURL(raw: string): string {
  * cleanAttribution removes leading www/www2 and falls back to targetURL hostname or "source".
  */
 export function cleanAttribution(attr: string, targetURL: string): string {
-  let cleaned = (attr || '').trim();
+  let cleaned = attr.trim();
   if (cleaned.startsWith('www.')) {
     cleaned = cleaned.slice(4);
   } else if (cleaned.startsWith('www2.')) {
@@ -104,7 +104,7 @@ export function cleanAttribution(attr: string, targetURL: string): string {
  * Assistant messages, caching them in the sources map by citation key (e.g. turn0news30).
  */
 export function ingestMetadata(sources: Map<string, SearchSource>, rawJSON: any): void {
-  if (!rawJSON || !sources) {
+  if (!rawJSON) {
     return;
   }
   let ev = rawJSON;
@@ -189,7 +189,7 @@ export function ingestMetadata(sources: Map<string, SearchSource>, rawJSON: any)
  * since there it is user-visible code, not container markup.
  */
 export function stripGenuiContainers(text: string): string {
-  if (!text || !text.includes(':::')) {
+  if (!text.includes(':::')) {
     return text;
   }
   const lines = text.split('\n');
@@ -238,7 +238,7 @@ export function stripGenuiContainers(text: string): string {
  * the line, at which point stripGenuiContainers drops it.
  */
 export function splitGenuiContainerTail(text: string): { keep: string; tail: string } {
-  if (!text || !text.includes(':')) {
+  if (!text.includes(':')) {
     return { keep: text, tail: '' };
   }
   const nl = text.lastIndexOf('\n');
@@ -420,9 +420,6 @@ export function stripCitations(text: string): string {
  * that could still grow into a citation annotation ("" when the text ends clean).
  */
 export function splitCitationTail(text: string): { keep: string; tail: string } {
-  if (!text) {
-    return { keep: text, tail: '' };
-  }
   const idx = text.lastIndexOf(PUA_ANNOTATION_START);
   if (idx >= 0) {
     let splitIdx = idx;

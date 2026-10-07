@@ -9,6 +9,8 @@
  * assemble the upstream parts from already-uploaded file mappings.
  */
 
+import { sniffImageMime } from './upload';
+
 export interface UploadedImageInfo {
   fileId: string;
   sizeBytes: number;
@@ -229,7 +231,10 @@ export function parseImageSize(
 /**
  * Resolve an image reference to bytes + dimensions. data URLs are decoded
  * directly; http(s) URLs are fetched via the injected fetcher (default
- * globalThis.fetch) with ok + image/* content-type validation.
+ * globalThis.fetch). The response body is accepted based on its bytes: when
+ * parseImageSize() can read dimensions the payload is an image regardless of
+ * the content-type header (some CDNs serve octet-stream or omit the header);
+ * only unparseable bytes are rejected as non-images.
  */
 export async function resolveImage(
   ref: ImageRef,
@@ -246,14 +251,28 @@ export async function resolveImage(
     if (!res.ok) {
       throw new Error(`Failed to fetch image ${ref.source}: HTTP ${res.status}`);
     }
-    const contentType = res.headers.get('content-type') ?? '';
-    if (!contentType.toLowerCase().startsWith('image/')) {
+    bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.length === 0) {
+      throw new Error(`Empty image payload from ${ref.source}`);
+    }
+    // Accept on content, not headers: missing or bogus content-types
+    // (octet-stream, text/plain, none) are common on real CDNs. Only when
+    // the bytes fail to parse as PNG/GIF/JPEG/WebP do we reject them.
+    try {
+      const sniffed = parseImageSize(bytes);
+      const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
+      mimeType = contentType.startsWith('image/') ? contentType : sniffed.mimeType;
+      return { bytes, mimeType, width: sniffed.width, height: sniffed.height };
+    } catch {
+      const sniffed = sniffImageMime(bytes);
+      if (sniffed !== 'application/octet-stream') {
+        throw new Error(`Cannot parse ${sniffed} dimensions from ${ref.source}`);
+      }
+      const contentType = res.headers.get('content-type') ?? '';
       throw new Error(
         `URL ${ref.source} did not return an image (content-type: ${contentType || 'none'})`
       );
     }
-    mimeType = contentType.toLowerCase();
-    bytes = new Uint8Array(await res.arrayBuffer());
   }
   if (bytes.length === 0) {
     throw new Error(`Empty image payload from ${ref.source}`);

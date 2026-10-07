@@ -183,36 +183,32 @@ export async function uploadImage(opts: UploadImageOptions): Promise<UploadImage
 
   let completed = false;
   let errorDetail = '';
-  try {
-    const lines = text
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-    for (const line of lines) {
-      let obj: any;
-      try {
-        obj = JSON.parse(line);
-      } catch {
-        continue; // tolerate stray non-JSON lines
-      }
-      const event = typeof obj?.event === 'string' ? obj.event : '';
-      if (event === 'file.processing.completed') {
-        completed = true;
-      } else if (event === 'file.processing.error') {
-        const extra = obj.extra ?? {};
-        const errorCode =
-          typeof extra?.error_code === 'string' && extra.error_code
-            ? extra.error_code
-            : typeof obj.error_code === 'string' && obj.error_code
-              ? obj.error_code
-              : 'unknown';
-        errorDetail =
-          `chatgpt-anon process: file.processing.error (error_code=${errorCode})` +
-          (typeof obj.message === 'string' ? `: ${obj.message}` : '');
-      }
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  for (const line of lines) {
+    let obj: any;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue; // tolerate stray non-JSON lines
     }
-  } catch (err: any) {
-    throw new Error(`chatgpt-anon process: decode: ${err?.message ?? String(err)}`);
+    const event = typeof obj?.event === 'string' ? obj.event : '';
+    if (event === 'file.processing.completed') {
+      completed = true;
+    } else if (event === 'file.processing.error') {
+      const extra = obj.extra ?? {};
+      const errorCode =
+        typeof extra?.error_code === 'string' && extra.error_code
+          ? extra.error_code
+          : typeof obj.error_code === 'string' && obj.error_code
+            ? obj.error_code
+            : 'unknown';
+      errorDetail =
+        `chatgpt-anon process: file.processing.error (error_code=${errorCode})` +
+        (typeof obj.message === 'string' ? `: ${obj.message}` : '');
+    }
   }
 
   if (errorDetail) {

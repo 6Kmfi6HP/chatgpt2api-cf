@@ -60,7 +60,7 @@ export interface WireToolCallRequest {
  * Entries without a usable name are skipped.
  */
 export function normalizeToolDefinitions(req: WireToolCallRequest): ToolDefinition[] {
-  const tools = req?.tools;
+  const tools = req.tools;
   if (!Array.isArray(tools)) return [];
   const out: ToolDefinition[] = [];
   for (const t of tools) {
@@ -165,20 +165,20 @@ export function buildAnonRequestBodyWithTools(
 ): Record<string, any> {
   const tools = normalizeToolDefinitions(req);
 
-  const dto = buildAnonRequest(req?.model ?? '', opts.prompt, {
+  const dto = buildAnonRequest(req.model ?? '', opts.prompt, {
     // Tool requests default search OFF: the upstream web tool competes with
     // tool-calling and breaks the reply convention. Explicit search=true opts in.
-    search: req?.search ?? false,
-    thinkingEffort: req?.reasoning_effort,
-    serviceTier: req?.service_tier,
-    oneOffModelOverride: req?.one_off_model_override,
-    systemHints: req?.system_hints,
-    localFunctionNames: req?.local_function_names,
-    mapSearchParams: req?.map_search_params,
+    search: req.search ?? false,
+    thinkingEffort: req.reasoning_effort,
+    serviceTier: req.service_tier,
+    oneOffModelOverride: req.one_off_model_override,
+    systemHints: req.system_hints,
+    localFunctionNames: req.local_function_names,
+    mapSearchParams: req.map_search_params,
     attachmentMimeTypes: opts.attachmentMimeTypes,
   });
 
-  const rawMessages = Array.isArray(req?.messages) ? req.messages : [];
+  const rawMessages = Array.isArray(req.messages) ? req.messages : [];
   let messages: UpstreamMessage[] = buildUpstreamMessages(toGenericMessages(rawMessages));
   if (messages.length === 0) {
     // No caller messages: keep buildAnonRequest's prompt-placeholder user message.
@@ -187,13 +187,13 @@ export function buildAnonRequestBodyWithTools(
   // tool_choice:"none" opts out of tool-calling entirely: no protocol frame
   // is prepended (mirrors the handler's hasTools gate and StreamProcessor's
   // toolCallState gate).
-  if (tools.length > 0 && req?.tool_choice !== 'none') {
-    messages = [toolProtocolFrame(tools, req?.tool_choice), ...messages];
+  if (tools.length > 0 && req.tool_choice !== 'none') {
+    messages = [toolProtocolFrame(tools, req.tool_choice), ...messages];
   }
 
   if (opts.messageContent && typeof opts.messageContent === 'object') {
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].author?.role === 'user') {
+      if (messages[i].author.role === 'user') {
         messages[i] = {
           ...messages[i],
           content: opts.messageContent as UpstreamMessage['content'],
