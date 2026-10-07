@@ -288,6 +288,36 @@ describe('resolveImage', () => {
     expect(Array.from(result.bytes)).toEqual(Array.from(png));
   });
 
+  it('accepts valid image bytes served as octet-stream (misconfigured CDN)', async () => {
+    const png = pngBytes(64, 32);
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(png as unknown as BodyInit, {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      })
+    );
+    const result = await resolveImage(
+      { kind: 'url', source: 'https://example.com/cdn-blob', partIndex: 0 },
+      fetcher as unknown as typeof fetch
+    );
+    expect(result.mimeType).toBe('image/png');
+    expect(result.width).toBe(64);
+    expect(result.height).toBe(32);
+    expect(Array.from(result.bytes)).toEqual(Array.from(png));
+  });
+
+  it('accepts valid image bytes with a missing content-type header', async () => {
+    const png = pngBytes(16, 16);
+    const fetcher = vi.fn().mockResolvedValue(new Response(png as unknown as BodyInit, { status: 200 }));
+    const result = await resolveImage(
+      { kind: 'url', source: 'https://example.com/no-header', partIndex: 0 },
+      fetcher as unknown as typeof fetch
+    );
+    expect(result.mimeType).toBe('image/png');
+    expect(result.width).toBe(16);
+    expect(result.height).toBe(16);
+  });
+
   it('rejects non-image content types with a clear error', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response('<html>not an image</html>', {

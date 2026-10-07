@@ -830,9 +830,11 @@ export function createApp(options?: AppOptions) {
 
     // Collect image references (order preserved). With tools enabled only
     // user messages carry images (tool/assistant frames never do).
-    const hasToolsForRefs =
+    // Computed once: req.tools / req.tool_choice are never mutated below,
+    // so the retry loop and downstream uses share this value.
+    const hasTools =
       Array.isArray(req.tools) && req.tools.length > 0 && req.tool_choice !== 'none';
-    const refSource = hasToolsForRefs
+    const refSource = hasTools
       ? req.messages.filter((m) => m.role === 'user')
       : req.messages;
     const imageRefs = refSource.flatMap((m) => collectImageRefs(m.content as any));
@@ -861,10 +863,7 @@ export function createApp(options?: AppOptions) {
         // the retry loop with the same device that runs the conversation. A
         // 429/403 from the upload path cools this device down and the loop
         // retries with a fresh one.
-        const hasTools =
-          Array.isArray(req.tools) &&
-          req.tools.length > 0 &&
-          req.tool_choice !== 'none';
+        // (hasTools is computed once before the loop; req is never mutated.)
 
         // Resolve and upload image attachments (order preserved). All images
         // ride the last user frame, exactly like the pre-existing behavior.
@@ -1004,7 +1003,7 @@ export function createApp(options?: AppOptions) {
             imageRefs,
             client,
             dm,
-            hasTools: hasToolsForRefs,
+            hasTools: hasTools,
           });
         } finally {
           stopPing();
@@ -1023,7 +1022,7 @@ export function createApp(options?: AppOptions) {
     // those bytes; the final document is still one JSON.parse-able value.
     const resultPromise = (async (): Promise<ChatCompletionResponse> => {
       let result = await aggregateNonStream(upstreamResp!, model, req);
-      if (hasToolsForRefs && violatesToolContract(req, result)) {
+      if (hasTools && violatesToolContract(req, result)) {
         try {
           await upstreamResp!.body?.cancel();
         } catch {}

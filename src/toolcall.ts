@@ -169,9 +169,9 @@ export function tryParseToolCall(text: string): ParsedToolCall[] | null {
   const out: ParsedToolCall[] = [];
   for (const c of calls) {
     if (!c || typeof c !== 'object') return null;
-    const name = typeof c.name === 'string' ? c.name : c?.function?.name;
+    const name = typeof c.name === 'string' ? c.name : c.function?.name;
     if (typeof name !== 'string' || name.length === 0) return null;
-    let args = c.arguments !== undefined ? c.arguments : c?.function?.arguments;
+    let args = c.arguments !== undefined ? c.arguments : c.function?.arguments;
     if (args === undefined || args === null) args = {};
     if (typeof args === 'string') {
       const s = args.trim();

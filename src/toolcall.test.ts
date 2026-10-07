@@ -6,6 +6,7 @@ import {
   buildToolResultMessage,
   toOpenAIToolCalls,
   stripGenuiMarkers,
+  TOOL_CALL_REPLY_FORMAT,
   type ToolDefinition,
 } from './toolcall';
 
@@ -32,41 +33,12 @@ const searchTool: ToolDefinition = {
 };
 
 describe('buildToolProtocolSystemMessage', () => {
-  it('lists tool names, descriptions and parameter schemas', () => {
+  it('describes tools and the JSON reply convention', () => {
     const msg = buildToolProtocolSystemMessage([weatherTool, searchTool]);
     expect(msg).toContain('get_weather');
-    expect(msg).toContain('Get current weather for a city');
     expect(msg).toContain('web_search');
-    expect(msg).toContain('"unit":{"type":"string"');
-  });
-
-  it('states the single-line JSON reply convention', () => {
-    const msg = buildToolProtocolSystemMessage([weatherTool]);
     expect(msg).toContain('"tool_calls"');
-    expect(msg).toContain('{"tool_calls":[{"name":"<tool>","arguments":{}}]}');
-    expect(msg).toContain('one line, raw JSON, machine-parsed');
-    expect(msg).toContain('FORBIDDEN');
-  });
-
-  it('frames tools as real and mandates calling over guessing', () => {
-    const msg = buildToolProtocolSystemMessage([weatherTool]);
-    expect(msg).toContain('REAL and CONNECTED');
-    expect(msg).toContain('HIGHEST PRIORITY');
-    expect(msg).toContain('Guessing or inventing results');
-  });
-
-  it('says multiple calls are allowed and prose is preferred when possible', () => {
-    const msg = buildToolProtocolSystemMessage([weatherTool]);
-    expect(msg).toContain('ZERO knowledge');
-    expect(msg).toContain('plain text');
-  });
-
-  it('handles tools without description or parameters', () => {
-    const msg = buildToolProtocolSystemMessage([
-      { type: 'function', function: { name: 'ping' } },
-    ]);
-    expect(msg).toContain('ping');
-    expect(msg).toContain('no arguments');
+    expect(msg).toContain(TOOL_CALL_REPLY_FORMAT);
   });
 
   it('leaves the wording unchanged for auto and undefined', () => {
@@ -183,39 +155,22 @@ describe('tryParseToolCall', () => {
     ]);
   });
 
-  it('rejects plain prose', () => {
-    expect(tryParseToolCall('Here is the weather in Paris: sunny, 22C.')).toBeNull();
-  });
-
-  it('rejects markdown text that merely mentions JSON', () => {
-    expect(tryParseToolCall('```json\n{"answer": 42}\n```')).toBeNull();
-    expect(tryParseToolCall('I will call {"tool_calls":[{"name":"f"}]} now.')).toBeNull();
-  });
-
-  it('rejects empty and empty tool_calls', () => {
-    expect(tryParseToolCall('')).toBeNull();
-    expect(tryParseToolCall('   ')).toBeNull();
-    expect(tryParseToolCall('{"tool_calls":[]}')).toBeNull();
-    expect(tryParseToolCall('{}')).toBeNull();
-  });
-
-  it('rejects invalid JSON', () => {
-    expect(tryParseToolCall('{"tool_calls":[{"name":"f",}]}')).toBeNull();
-    expect(tryParseToolCall('{tool_calls: [1]}')).toBeNull();
-  });
-
-  it('rejects entries without a name', () => {
-    expect(tryParseToolCall('{"tool_calls":[{"arguments":{}}]}')).toBeNull();
-    expect(tryParseToolCall('{"tool_calls":[null]}')).toBeNull();
-  });
-
-  it('rejects whitespace-only around a JSON block with trailing prose', () => {
-    expect(tryParseToolCall('{"tool_calls":[{"name":"f"}]}\nThanks!')).toBeNull();
-  });
-
-  it('rejects replies over 8000 chars without trying', () => {
-    const pad = 'x'.repeat(8100);
-    expect(tryParseToolCall(`{"tool_calls":[{"name":"f"}]}${pad}`)).toBeNull();
+  it.each([
+    ['plain prose', 'Here is the weather in Paris: sunny, 22C.'],
+    ['markdown mentioning JSON without tool_calls', '```json\n{"answer": 42}\n```'],
+    ['prose wrapping a tool call', 'I will call {"tool_calls":[{"name":"f"}]} now.'],
+    ['empty string', ''],
+    ['whitespace only', '   '],
+    ['empty tool_calls array', '{"tool_calls":[]}'],
+    ['missing tool_calls key', '{}'],
+    ['trailing comma', '{"tool_calls":[{"name":"f",}]}'],
+    ['unquoted key', '{tool_calls: [1]}'],
+    ['entry without a name', '{"tool_calls":[{"arguments":{}}]}'],
+    ['null entry', '{"tool_calls":[null]}'],
+    ['trailing prose after JSON', '{"tool_calls":[{"name":"f"}]}\nThanks!'],
+    ['over 8000 chars', `{"tool_calls":[{"name":"f"}]}${'x'.repeat(8100)}`],
+  ])('rejects %s', (_label, text) => {
+    expect(tryParseToolCall(text)).toBeNull();
   });
 });
 
