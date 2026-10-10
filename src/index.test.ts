@@ -1129,6 +1129,83 @@ describe('Tool calling (OpenAI tools API)', () => {
   });
 });
 
+describe('Tool results vs upstream web search', () => {
+  const weatherTool = {
+    type: 'function',
+    function: { name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } },
+  };
+  const toolResultTurn = [
+    { role: 'user', content: 'Thời tiết Hà Nội?' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Hà Nội"}' } }],
+    },
+    { role: 'tool', tool_call_id: 'call_1', content: '{"temp_c":17}' },
+  ];
+  // The model's own search, as upstream emits it before the visible reply.
+  const searchFrames = [
+    { message: { id: 'm-q', author: { role: 'assistant' }, recipient: 'web.run', content: { content_type: 'text', parts: [''] } } },
+    { message: { id: 'm-r', author: { role: 'tool', name: 'web.run' }, content: { content_type: 'text', parts: [''] } } },
+  ];
+  const searchedAnswer = 'Theo dự báo trên mạng, Hà Nội hiện khoảng 27°C, trời nhiều mây, độ ẩm cao và có thể có mưa rào vào buổi tối.';
+  const toolAnswer = 'Hà Nội hiện 17°C.';
+
+  function setup(handler: (call: number) => Response) {
+    const client = new MockUpstreamClient();
+    const testApp = createApp({ client, deviceManager: new DeviceManager() });
+    const env = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    let calls = 0;
+    client.conversationHandler = async () => handler(++calls);
+    const post = (payload: object) =>
+      testApp.request('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }, env);
+    return { post, calls: () => calls };
+  }
+
+  const searchedReply = () =>
+    createSseResponse([
+      ...searchFrames.map((f) => `data: ${JSON.stringify(f)}\n\n`),
+      `data: ${JSON.stringify(mkAssistantEvent(searchedAnswer))}\n\n`,
+    ]);
+  const toolReply = () => createSseResponse([`data: ${JSON.stringify(mkAssistantEvent(toolAnswer))}\n\n`]);
+
+  it('retries a non-stream reply that searched the web instead of using the tool result', async () => {
+    const t = setup((n) => (n === 1 ? searchedReply() : toolReply()));
+    const res = await t.post({ model: 'auto', stream: false, tools: [weatherTool], messages: toolResultTurn });
+    const data: any = await res.json();
+    expect(t.calls()).toBe(2);
+    expect(data.choices[0].message.content).toBe(toolAnswer);
+  });
+
+  it('retries a streaming reply that searched the web, never leaking the searched text', async () => {
+    const t = setup((n) => (n === 1 ? searchedReply() : toolReply()));
+    const res = await t.post({ model: 'auto', stream: true, tools: [weatherTool], messages: toolResultTurn });
+    const body = await res.text();
+    expect(t.calls()).toBe(2);
+    expect(body).toContain('17°C');
+    expect(body).not.toContain('27°C');
+  });
+
+  it('does not retry when the caller opted into search', async () => {
+    const t = setup(() => searchedReply());
+    const res = await t.post({ model: 'auto', stream: false, search: true, tools: [weatherTool], messages: toolResultTurn });
+    const data: any = await res.json();
+    expect(t.calls()).toBe(1);
+    expect(data.choices[0].message.content).toBe(searchedAnswer);
+  });
+
+  it('does not retry a search when the last message is not a tool result', async () => {
+    const t = setup(() => searchedReply());
+    const res = await t.post({ model: 'auto', stream: false, tools: [weatherTool], messages: [{ role: 'user', content: 'Thời tiết Hà Nội?' }] });
+    await res.json();
+    expect(t.calls()).toBe(1);
+  });
+});
+
 describe('Streaming incrementality with tools (typing effect)', () => {
   it('streams tool-request prose incrementally instead of one buffered burst', async () => {
     const client = new MockUpstreamClient();
