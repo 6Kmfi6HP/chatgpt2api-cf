@@ -8,6 +8,7 @@ import {
   stripGenuiContainers,
   splitGenuiContainerTail,
   splitCitationTail,
+  splitOpenAnnotation,
   resolveWithheld,
   PUA_ANNOTATION_START,
   PUA_ANNOTATION_SEP,
@@ -155,6 +156,46 @@ describe('formatCitations', () => {
   it('replaces ASCII citation runs when sources match', () => {
     const input = 'see turn0news72 now';
     expect(formatCitations(input, sources)).toBe('see [news.com](https://news.com/72) now');
+  });
+});
+
+describe('splitOpenAnnotation', () => {
+  it.each([
+    { in: 'plain text', keep: 'plain text', tail: '' },
+    { in: 'a ' + pua('entity', '["city","Huế"]') + ' b', keep: 'a ' + pua('entity', '["city","Huế"]') + ' b', tail: '' },
+    { in: 'Tháng 11, ' + PUA_ANNOTATION_START + 'entity' + PUA_ANNOTATION_SEP + '["ci', keep: 'Tháng 11,', tail: ' ' + PUA_ANNOTATION_START + 'entity' + PUA_ANNOTATION_SEP + '["ci' },
+    { in: '到' + PUA_ANNOTATION_START + 'url', keep: '到', tail: PUA_ANNOTATION_START + 'url' },
+    {
+      in: pua('cite', 'turn0news1') + ' then ' + PUA_ANNOTATION_START + 'cite',
+      keep: pua('cite', 'turn0news1') + ' then',
+      tail: ' ' + PUA_ANNOTATION_START + 'cite',
+    },
+  ])('splits: "$in"', ({ keep, tail, ...tc }) => {
+    const r = splitOpenAnnotation(tc.in);
+    expect(r.keep).toBe(keep);
+    expect(r.tail).toBe(tail);
+  });
+});
+
+describe('formatCitations entity annotations', () => {
+  it('keeps the entity display name in place of the annotation', () => {
+    const input = 'Tháng 11, ' + pua('entity', '["city","Huế","Thừa Thiên Huế, Việt Nam"]') + ' thường mưa nhiều.';
+    expect(formatCitations(input, new Map())).toBe('Tháng 11, Huế thường mưa nhiều.');
+  });
+
+  it('keeps the entity display name when there are no search sources', () => {
+    const input = 'Visit ' + pua('entity', '["city","Paris","France"]') + ' in spring.';
+    expect(stripCitations(input)).toBe('Visit Paris in spring.');
+  });
+
+  it('keeps an entity directly adjacent to text without adding spaces', () => {
+    const input = '到' + pua('entity', '["city","上海","中国"]') + '旅游';
+    expect(formatCitations(input, new Map())).toBe('到上海旅游');
+  });
+
+  it('drops an entity whose payload is not a [type, name, …] array', () => {
+    expect(stripCitations('a ' + pua('entity', 'not json') + ' b')).toBe('a b');
+    expect(stripCitations('a ' + pua('entity', '[1,2]') + ' b')).toBe('a b');
   });
 });
 
