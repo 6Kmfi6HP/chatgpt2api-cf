@@ -255,6 +255,22 @@ describe('StreamProcessor', () => {
     expect(finalChunks[1].choices[0].finish_reason).toBe('stop');
   });
 
+  it('streams an entity annotation split across snapshots as its display name', () => {
+    const sp = new StreamProcessor('gpt-4o');
+    const entity = pua('entity', '["city","Huế","Thừa Thiên Huế, Việt Nam"]');
+    const snapshots = [
+      'Tháng 11, ' + entity.slice(0, 12),
+      'Tháng 11, ' + entity,
+      'Tháng 11, ' + entity + ' thường mưa nhiều.',
+    ];
+    const streamed = snapshots
+      .flatMap((s) => sp.processEvent(mkAssistantEvent(s)))
+      .concat(sp.flush())
+      .map((c) => (c.choices[0].delta as any)?.content ?? '')
+      .join('');
+    expect(streamed).toBe('Tháng 11, Huế thường mưa nhiều.');
+  });
+
   it('drops trailing partial citation marker containing digits on flush', () => {
     const sp = new StreamProcessor('gpt-4o');
 
@@ -650,6 +666,21 @@ describe('aggregateNonStream', () => {
     expect(result.usage.total_tokens).toBe(
       result.usage.prompt_tokens + result.usage.completion_tokens
     );
+  });
+
+  it('keeps an entity display name and drops an annotation cut off at stream end', async () => {
+    const entity = pua('entity', '["city","Huế","Thừa Thiên Huế, Việt Nam"]');
+    const resp = createSseResponse([
+      `data: ${JSON.stringify(mkAssistantEvent('Tháng 11, ' + entity + ' mưa.'))}\n\n`,
+      `data: ${JSON.stringify(mkAssistantEvent('Tháng 11, ' + entity + ' mưa. ' + entity.slice(0, 12)))}\n\n`,
+    ]);
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'Huế tháng 11?' }],
+    };
+
+    const result = await aggregateNonStream(resp, 'gpt-4o', req);
+    expect(result.choices[0].message.content).toBe('Tháng 11, Huế mưa.');
   });
 
   it('handles empty response stream gracefully', async () => {
