@@ -27,6 +27,16 @@ import {
 } from './translate';
 
 /**
+ * True when an upstream message frame belongs to the model's own web search:
+ * the assistant addressing the web tool (recipient "web.run") or that tool's
+ * reply. Callers never send such frames, so they cannot be history echoes.
+ */
+export function isWebSearchFrame(message: any): boolean {
+  const isWebTool = (name: unknown) => typeof name === 'string' && (name === 'web' || name.startsWith('web.'));
+  return isWebTool(message?.recipient) || (message?.author?.role === 'tool' && isWebTool(message.author.name));
+}
+
+/**
  * StreamProcessor manages the state of cumulative snapshots from ChatGPT upstream SSE,
  * diffing deltas, formatting citations, and generating OpenAI streaming chunks.
  */
@@ -60,6 +70,8 @@ export class StreamProcessor {
    * to stop waiting (see STREAM_TAIL_GRACE_MS) instead of idling.
    */
   public endedTurn = false;
+  /** True once the upstream model ran its own web search during this reply. */
+  public usedWebSearch = false;
 
   constructor(
     model: string,
@@ -89,6 +101,9 @@ export class StreamProcessor {
     ingestMetadata(this.sources, rawJSON);
 
     const ev = rawJSON;
+    if (ev.message && isWebSearchFrame(ev.message)) {
+      this.usedWebSearch = true;
+    }
     if (!ev.message || ev.message.author?.role !== 'assistant') {
       return [];
     }
@@ -470,7 +485,21 @@ export async function aggregateNonStream(
   model: string,
   originalReq: ChatCompletionRequest
 ): Promise<ChatCompletionResponse> {
+  return (await aggregateNonStreamWithSignals(resp, model, originalReq)).result;
+}
+
+/**
+ * aggregateNonStreamWithSignals is aggregateNonStream plus upstream signals
+ * that are not part of the OpenAI response body (whether the model ran its
+ * own web search), for the tool-contract retry decision.
+ */
+export async function aggregateNonStreamWithSignals(
+  resp: Response,
+  model: string,
+  originalReq: ChatCompletionRequest
+): Promise<{ result: ChatCompletionResponse; usedWebSearch: boolean }> {
   const sources = new Map<string, SearchSource>();
+  let usedWebSearch = false;
   let emitted = '';
   let withheld = '';
   let withheldGenui = '';
@@ -485,6 +514,9 @@ export async function aggregateNonStream(
         try {
           const parsed = JSON.parse(event.data);
           ingestMetadata(sources, parsed);
+          if (parsed.message && isWebSearchFrame(parsed.message)) {
+            usedWebSearch = true;
+          }
           if (!parsed.message || parsed.message.author?.role !== 'assistant') {
             return;
           }
@@ -557,7 +589,7 @@ export async function aggregateNonStream(
   // finish_reason "tool_calls".
   const toolMsg = buildToolCallsChatMessage(finalText);
   if (toolMsg) {
-    return {
+    const result = {
       id: genID('chatcmpl-'),
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
@@ -575,9 +607,10 @@ export async function aggregateNonStream(
         total_tokens: promptTokens + completionTokens,
       },
     } as any;
+    return { result, usedWebSearch };
   }
 
-  return buildOpenAICompletion(
+  const result = buildOpenAICompletion(
     genID('chatcmpl-'),
     Math.floor(Date.now() / 1000),
     model,
@@ -585,4 +618,5 @@ export async function aggregateNonStream(
     promptTokens,
     completionTokens
   );
+  return { result, usedWebSearch };
 }
