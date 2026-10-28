@@ -9,6 +9,7 @@ import {
   ingestMetadata,
   formatCitations,
   splitCitationTail,
+  splitOpenAnnotation,
   splitGenuiContainerTail,
   stripGenuiContainers,
   resolveWithheld,
@@ -138,7 +139,9 @@ export class StreamProcessor {
       }
     }
     const full = parts.join('');
-    const formatted = formatCitations(full, this.sources);
+    // An annotation still being streamed is withheld raw (see splitOpenAnnotation).
+    const { keep: closedText, tail: openAnnotation } = splitOpenAnnotation(full);
+    const formatted = formatCitations(closedText, this.sources);
     // Bare genui containers (":::writing{…}" fence lines around the body)
     // are stripped AFTER citations so a link inside a container survives,
     // while its fence lines are removed.
@@ -195,7 +198,7 @@ export class StreamProcessor {
       delta = fullClean.slice(this.prevText.length);
     }
     this.prevText = fullClean;
-    this.withheld = tail;
+    this.withheld = tail + openAnnotation;
 
     const out: ChatCompletionChunk[] = [];
     if (!this.emittedRole) {
@@ -510,14 +513,16 @@ export async function aggregateNonStream(
             }
           }
           const full = parts.join('');
-          const formatted = formatCitations(full, sources);
+          // An annotation still being streamed is withheld raw (see splitOpenAnnotation).
+          const { keep: closedText, tail: openAnnotation } = splitOpenAnnotation(full);
+          const formatted = formatCitations(closedText, sources);
           // Bare genui containers: strip fence lines, keep the body.
           const stripped = stripGenuiContainers(formatted);
           if (!stripped) return;
           const citeSplit = splitCitationTail(stripped);
           const genuiSplit = splitGenuiContainerTail(citeSplit.keep);
           emitted = genuiSplit.keep;
-          withheld = citeSplit.tail;
+          withheld = citeSplit.tail + openAnnotation;
           withheldGenui = genuiSplit.tail;
         } catch {
           // ignore

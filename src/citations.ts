@@ -359,6 +359,16 @@ export function formatCitations(text: string, sources?: Map<string, SearchSource
         return ` [${u}](${u})`;
       }
       return '';
+    } else if (kind === 'entity') {
+      // Inline entity reference: ["<type>", "<display name>", "<disambiguation>"].
+      // The display name is part of the sentence, so keep it together with
+      // the separator whitespace the block match consumed.
+      const name = entityDisplayName(parts.slice(1).join(PUA_ANNOTATION_SEP));
+      if (!name) {
+        return '';
+      }
+      const lead = match.slice(0, match.length - pua.length);
+      return lead + name;
     }
     return '';
   };
@@ -408,6 +418,24 @@ export function formatCitations(text: string, sources?: Map<string, SearchSource
 }
 
 /**
+ * entityDisplayName extracts the display name from an entity annotation
+ * payload (a JSON array whose second element is the visible text), or ""
+ * when the payload is not in that shape.
+ */
+function entityDisplayName(payload: string): string {
+  let arr: unknown;
+  try {
+    arr = JSON.parse(payload);
+  } catch {
+    return '';
+  }
+  if (!Array.isArray(arr) || typeof arr[1] !== 'string') {
+    return '';
+  }
+  return arr[1];
+}
+
+/**
  * stripCitations removes closed annotation blocks and ASCII citation runs
  * from assistant text when no search sources are available.
  */
@@ -439,6 +467,25 @@ export function splitCitationTail(text: string): { keep: string; tail: string } 
     }
   }
   return { keep: text, tail: '' };
+}
+
+/**
+ * splitOpenAnnotation separates a trailing annotation that has not been
+ * closed yet (START rune with no END after it), together with the single
+ * space/tab before it, from the text preceding it. It must run BEFORE
+ * formatCitations: formatting strips the stray START rune of an open block,
+ * which would leak its payload ('entity["ci…') to the client as plain text.
+ */
+export function splitOpenAnnotation(text: string): { keep: string; tail: string } {
+  const idx = text.lastIndexOf(PUA_ANNOTATION_START);
+  if (idx < 0 || text.indexOf(PUA_ANNOTATION_END, idx) >= 0) {
+    return { keep: text, tail: '' };
+  }
+  let splitIdx = idx;
+  if (splitIdx > 0 && (text[splitIdx - 1] === ' ' || text[splitIdx - 1] === '\t')) {
+    splitIdx--;
+  }
+  return { keep: text.slice(0, splitIdx), tail: text.slice(splitIdx) };
 }
 
 /**
