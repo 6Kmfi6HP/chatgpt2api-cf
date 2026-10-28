@@ -3,7 +3,8 @@ import {
   StreamProcessor,
   pipeOpenAIStream,
   aggregateNonStream,
-} from './stream';
+  aggregateNonStreamWithSignals,
+ } from './stream';
 import type { ChatCompletionRequest } from './types';
 import {
   PUA_ANNOTATION_START,
@@ -253,6 +254,49 @@ describe('StreamProcessor', () => {
     expect(finalChunks.length).toBe(2);
     expect(finalChunks[0].choices[0].delta.content).toBe(' turn');
     expect(finalChunks[1].choices[0].finish_reason).toBe('stop');
+  });
+
+  it('flush keeps a real word tail when an open annotation follows it', () => {
+    const sp = new StreamProcessor('gpt-4o');
+    const open = PUA_ANNOTATION_START + 'entity' + PUA_ANNOTATION_SEP + '["ci';
+    const chunks = sp.processEvent(mkAssistantEvent('Wait in turn ' + open));
+    const streamed = chunks.map((c) => c.choices[0]?.delta.content ?? '').join('');
+    expect(streamed).toBe('Wait in');
+    expect(sp.withheld).toBe(' turn');
+    const flushed = sp.flush().map((c) => c.choices[0]?.delta.content ?? '').join('');
+    expect(flushed).toBe(' turn');
+    expect(streamed + flushed).not.toContain('entity');
+  });
+
+  it('ignores a replayed web.run frame and latches a live one', () => {
+    const sp = new StreamProcessor('gpt-4o');
+    sp.processEvent({
+      message: {
+        id: 'hist-web',
+        author: { role: 'tool', name: 'web.run' },
+        status: 'finished_successfully',
+        content: { content_type: 'text', parts: [''] },
+      },
+    });
+    expect(sp.usedWebSearch).toBe(false);
+    sp.processEvent({
+      message: {
+        id: 'hist-assistant-web',
+        author: { role: 'assistant' },
+        recipient: 'web.run',
+        status: 'finished_successfully',
+        content: { content_type: 'text', parts: ['old search'] },
+      },
+    });
+    expect(sp.usedWebSearch).toBe(false);
+    sp.processEvent({
+      message: {
+        id: 'live-web',
+        author: { role: 'tool', name: 'web.run' },
+        content: { content_type: 'text', parts: [''] },
+      },
+    });
+    expect(sp.usedWebSearch).toBe(true);
   });
 
   it('streams an entity annotation split across snapshots as its display name', () => {
@@ -681,6 +725,40 @@ describe('aggregateNonStream', () => {
 
     const result = await aggregateNonStream(resp, 'gpt-4o', req);
     expect(result.choices[0].message.content).toBe('Tháng 11, Huế mưa.');
+  });
+
+  it('keeps a word tail when the stream ends on an open annotation', async () => {
+    const open = PUA_ANNOTATION_START + 'entity' + PUA_ANNOTATION_SEP + '["ci';
+    const resp = createSseResponse([
+      `data: ${JSON.stringify(mkAssistantEvent('Wait in turn ' + open))}\n\n`,
+    ]);
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'Wait?' }],
+    };
+    const result = await aggregateNonStream(resp, 'gpt-4o', req);
+    expect(result.choices[0].message.content).toBe('Wait in turn');
+  });
+
+  it('does not count a replayed web.run frame as this turn searching', async () => {
+    const resp = createSseResponse([
+      `data: ${JSON.stringify({
+        message: {
+          id: 'hist-web',
+          author: { role: 'tool', name: 'web.run' },
+          status: 'finished_successfully',
+          content: { content_type: 'text', parts: [''] },
+        },
+      })}\n\n`,
+      `data: ${JSON.stringify(mkAssistantEvent('Hà Nội hiện 17°C.'))}\n\n`,
+    ]);
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'weather' }],
+    };
+    const { result, usedWebSearch } = await aggregateNonStreamWithSignals(resp, 'gpt-4o', req);
+    expect(usedWebSearch).toBe(false);
+    expect(result.choices[0].message.content).toBe('Hà Nội hiện 17°C.');
   });
 
   it('handles empty response stream gracefully', async () => {

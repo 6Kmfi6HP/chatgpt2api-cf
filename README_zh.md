@@ -365,7 +365,7 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 本项目包含完整的单元测试与端到端测试套件，涵盖协议转换、引用清洗、三阶段状态机、KV 轮换淘汰与流式差分：
 
 ```bash
-# 运行全部 315 项测试用例 (基于 Vitest)
+# 运行全部 319 项测试用例 (基于 Vitest)
 pnpm test
 
 # 严格 TypeScript 类型检查

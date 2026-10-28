@@ -102,7 +102,16 @@ export class StreamProcessor {
     ingestMetadata(this.sources, rawJSON);
 
     const ev = rawJSON;
-    if (ev.message && isWebSearchFrame(ev.message)) {
+    // A replayed web.run frame is history, not this turn's search. Latch only
+    // a live frame: finished echoes have no "next"/"final" marker.
+    const searchMsg = ev.message;
+    const searchStatus = searchMsg?.status;
+    const replayedSearch =
+      !!searchMsg &&
+      (searchStatus === 'finished_successfully' || searchStatus === 'finished') &&
+      searchMsg.metadata?.message_type !== 'next' &&
+      searchMsg.channel !== 'final';
+    if (searchMsg && isWebSearchFrame(searchMsg) && !replayedSearch) {
       this.usedWebSearch = true;
     }
     if (!ev.message || ev.message.author?.role !== 'assistant') {
@@ -154,8 +163,11 @@ export class StreamProcessor {
       }
     }
     const full = parts.join('');
-    // An annotation still being streamed is withheld raw (see splitOpenAnnotation).
-    const { keep: closedText, tail: openAnnotation } = splitOpenAnnotation(full);
+    // Cut an unclosed annotation off before formatting so its payload cannot
+    // leak. Do not append that tail to the cite withhold: resolveWithheld
+    // drops any fragment that still contains a START rune, which would also
+    // delete a keepable ASCII tail such as " turn".
+    const { keep: closedText } = splitOpenAnnotation(full);
     const formatted = formatCitations(closedText, this.sources);
     // Bare genui containers (":::writing{…}" fence lines around the body)
     // are stripped AFTER citations so a link inside a container survives,
@@ -213,7 +225,7 @@ export class StreamProcessor {
       delta = fullClean.slice(this.prevText.length);
     }
     this.prevText = fullClean;
-    this.withheld = tail + openAnnotation;
+    this.withheld = tail;
 
     const out: ChatCompletionChunk[] = [];
     if (!this.emittedRole) {
@@ -517,7 +529,14 @@ export async function aggregateNonStreamWithSignals(
         try {
           const parsed = JSON.parse(event.data);
           ingestMetadata(sources, parsed);
-          if (parsed.message && isWebSearchFrame(parsed.message)) {
+          const searchMsg = parsed.message;
+          const searchStatus = searchMsg?.status;
+          const replayedSearch =
+            !!searchMsg &&
+            (searchStatus === 'finished_successfully' || searchStatus === 'finished') &&
+            searchMsg.metadata?.message_type !== 'next' &&
+            searchMsg.channel !== 'final';
+          if (searchMsg && isWebSearchFrame(searchMsg) && !replayedSearch) {
             usedWebSearch = true;
           }
           if (!parsed.message || parsed.message.author?.role !== 'assistant') {
@@ -545,8 +564,8 @@ export async function aggregateNonStreamWithSignals(
             }
           }
           const full = parts.join('');
-          // An annotation still being streamed is withheld raw (see splitOpenAnnotation).
-          const { keep: closedText, tail: openAnnotation } = splitOpenAnnotation(full);
+          // See processEvent: the open annotation stays out of `withheld`.
+          const { keep: closedText } = splitOpenAnnotation(full);
           const formatted = formatCitations(closedText, sources);
           // Bare genui containers: strip fence lines, keep the body.
           const stripped = stripGenuiContainers(formatted);
@@ -554,7 +573,7 @@ export async function aggregateNonStreamWithSignals(
           const citeSplit = splitCitationTail(stripped);
           const genuiSplit = splitGenuiContainerTail(citeSplit.keep);
           emitted = genuiSplit.keep;
-          withheld = citeSplit.tail + openAnnotation;
+          withheld = citeSplit.tail;
           withheldGenui = genuiSplit.tail;
         } catch {
           // ignore

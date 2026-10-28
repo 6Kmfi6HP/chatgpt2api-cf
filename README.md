@@ -367,7 +367,7 @@ the model as user intent and hide the client bug.
 
 ## 🧪 Testing
 
-The test suite contains **315 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
+The test suite contains **319 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
 
 ```bash
 # Run Vitest test suite
