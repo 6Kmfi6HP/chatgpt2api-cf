@@ -36,6 +36,7 @@
   - Cleans PUA Unicode markers (`\ue200` ~ `\ue201`) and ASCII citation tags (`turn0news...`).
   - Converts search citations into inline Markdown links (`[Attribution](URL)`).
   - Withholds partial citation markers split across SSE frame boundaries.
+  - Keeps the display name inside an `entity` annotation (`entity["type","Name",…]`) instead of deleting that word.
 - **🛑 Client Abort & Stream Cancellation**: Full `AbortSignal` propagation. If a client disconnects or clicks "Stop Generating", upstream fetching and reading are canceled immediately, saving CPU and quota.
 - **🌏 Accurate Token Estimation**: CJK-aware token estimator (~1.5 tokens/char for Chinese/Japanese/Korean) and chars/4 for ASCII.
 - **🔑 Dual Authentication Support**: Compatible with standard `Authorization: Bearer <key>` and `x-api-key: <key>`.
@@ -43,7 +44,7 @@
 - **📋 Live Model Catalog**: `GET /v1/models` proxies the real anonymous catalog from upstream (`GET backend-anon/models`): `gpt-5-5`, `gpt-5-6`, `gpt-5-3-mini`, `gpt-5-5-mini`, `gpt-5-6-mini`, `auto`. Cached 1h in KV; falls back to `["auto"]` if upstream is unreachable. **No name mapping** — the slug you request is passed through verbatim, so you can select `gpt-5-6` or a cheaper mini yourself.
 - **🔎 Web Search ON by Default**: Requests are sent with `forceUseSearch: true`; citations auto-format as Markdown links. Per-request opt-out: `"search": false`.
 - **🖼 Anonymous Image Understanding**: OpenAI `image_url` / `input_image` parts (data URLs or http(s) URLs) are transparently re-uploaded to the upstream anonymous file pipeline and attached as `image_asset_pointer` parts — no login required. Multi-image and streaming supported.
-- **🛠 OpenAI Tool Calling (function calling)**: pass standard `tools` definitions; the gateway compiles them into the upstream protocol, parses model tool-call replies, and returns assistant `tool_calls` with `finish_reason: "tool_calls"` (streaming deltas included). Feed results back as `role: "tool"` messages for the next turn.
+- **🛠 OpenAI Tool Calling (function calling)**: pass standard `tools` definitions; the gateway compiles them into the upstream protocol, parses model tool-call replies, and returns assistant `tool_calls` with `finish_reason: "tool_calls"` (streaming deltas included). Feed results back as `role: "tool"` messages for the next turn. A tool result is authoritative: if the model runs its own web search instead, that turn is retried unless the request set `"search": true`.
 - **📍 Configurable Placement / Egress Region**: `wrangler.jsonc` ships with `"placement": { "region": "aws:us-west-2" }` so the Worker executes in the US regardless of where the client connects from (fixes regional 403 blocks, e.g. requests received at HK edge).
 
 ---
@@ -366,7 +367,7 @@ the model as user intent and hide the client bug.
 
 ## 🧪 Testing
 
-The test suite contains **285 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
+The test suite contains **315 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
 
 ```bash
 # Run Vitest test suite
@@ -384,7 +385,7 @@ pnpm exec tsc --noEmit
 - **Web Search ON by default**: requests send `forceUseSearch: true`; reply citations are auto-formatted as Markdown links. Per-request opt-out: `"search": false`.
 - **Sampling Knobs**: Knobs like `temperature`, `top_p`, `seed` are accepted for client compatibility, but ignored by upstream.
 - **Multimodal**: Image parts are supported (re-uploaded to the anonymous file pipeline, ~10 uploads/day per pooled device, pooled automatically). Audio and other attachment types are stripped. Image upload throttling upstream is per-device; the device pool rotates on 429 automatically.
-- **Tool calling**: implemented via a compiled system protocol (the anonymous upstream has no native tools API). On refusal-text replies the gateway transparently retries the turn on fresh devices (up to 3 attempts) for BOTH non-stream and stream requests — behavior is identical, and streaming clients no longer see degraded adherence. Requests with tools default `search` off (the upstream web tool can hijack tool-call turns); set `"search": true` to override. `tool_choice: "none"` disables tool-calling. Note: `"search": false` is sent upstream as `forceUseSearch: false`, but the upstream model may still decide to search on its own — treat the toggle as advisory, not enforced.
+- **Tool calling**: implemented via a compiled system protocol (the anonymous upstream has no native tools API). On refusal-text replies the gateway transparently retries the turn on fresh devices (up to 3 attempts) for BOTH non-stream and stream requests — behavior is identical, and streaming clients no longer see degraded adherence. Requests with tools default `search` off (the upstream web tool can hijack tool-call turns); set `"search": true` to override. `tool_choice: "none"` disables tool-calling. When the last message is a `role: "tool"` result and `search` is not `true`, a reply that ran `web.run` is a contract violation and is retried the same way. On every other turn `"search": false` is still only advisory: upstream may search on its own.
 - **Regional Restrictions**: Requests originating from Cloudflare edge locations in unsupported countries (e.g. Hong Kong, China) may trigger OpenAI's regional 403 blocks. Deploying with location hints or Smart Placement resolves this.
 
 ---

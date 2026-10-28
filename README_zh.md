@@ -36,6 +36,7 @@
   - 清洗 PUA 私有字符（`\ue200` ~ `\ue201`）以及未包含标记的 ASCII 引用（如 `turn0news...`）。
   - 解析搜索结果元数据，将引用标记自动替换为 Markdown 链接（`[来源标题](URL)`）。
   - 自动暂留并处理跨 SSE 帧边界的未闭合引用碎片，避免漏字或泄漏未完成标签。
+  - 保留 `entity` 标注里的显示名（`entity["type","Name",…]`），不再把这个词从句子里删掉。
 - **🛑 客户端流式中断响应（AbortSignal）**：全链路监听客户端断开连接。当用户在前端点击“停止生成”或关闭网页时，立即中止与 OpenAI 的上游请求，彻底杜绝 Worker CPU 与上游额度浪费。
 - **🌏 精确的中日韩（CJK）Token 统计**：针对汉字/假名/谚文字符进行加权统计（中文约 1.5 token/字），与官方 `tiktoken` 表现高度贴近。
 - **🔑 双鉴权请求头支持**：同时支持标准的 `Authorization: Bearer <key>` 与 `x-api-key: <key>`，方便与各类客户端集成。
@@ -43,7 +44,7 @@
 - **📋 动态真实模型目录**：`GET /v1/models` 不再读静态配置，改为实时代理上游匿名目录（`GET backend-anon/models`）：`gpt-5-5`、`gpt-5-6`、`gpt-5-3-mini`、`gpt-5-5-mini`、`gpt-5-6-mini`、`auto`。KV 缓存 1 小时，上游不可达时回退 `["auto"]`。**无名称映射**：客户端传入的 slug 原样透传，可自选 gpt-5-6 或更省配额的 mini。
 - **🔎 联网搜索默认开启**：所有请求自动携带 `forceUseSearch: true`，引用自动渲染为 Markdown 链接。单次关闭：`"search": false`。
 - **🖼 匿名图片理解（看图）**：OpenAI `image_url` / `input_image` 内容部分（data URL 或 http(s) URL）会被透明地重新上传到上游匿名文件管线，并以 `image_asset_pointer` 形式随消息发送 —— 无需登录。支持单条消息多图与流式输出。
-- **🛠 OpenAI 工具调用（Function Calling）**：传入标准 `tools` 定义即可；网关把工具协议编译进上游 system 消息，解析模型工具调用回复，返回 assistant `tool_calls` 与 `finish_reason: "tool_calls"`（含流式 delta）。执行后以 `role: "tool"` 消息回灌即可进入下一轮。
+- **🛠 OpenAI 工具调用（Function Calling）**：传入标准 `tools` 定义即可；网关把工具协议编译进上游 system 消息，解析模型工具调用回复，返回 assistant `tool_calls` 与 `finish_reason: "tool_calls"`（含流式 delta）。执行后以 `role: "tool"` 消息回灌即可进入下一轮。工具结果是权威答案：若模型改去自行联网搜索，且请求没有 `"search": true`，这一轮会重试。
 - **📍 可配置 Placement / 出站区域**：`wrangler.jsonc` 内置 `"placement": { "region": "aws:us-west-2" }`，使 Worker 无论客户端从哪里接入均在美国机房执行（修复香港等地边缘出站被区域封锁的问题）。
 
 ---
@@ -364,7 +365,7 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 本项目包含完整的单元测试与端到端测试套件，涵盖协议转换、引用清洗、三阶段状态机、KV 轮换淘汰与流式差分：
 
 ```bash
-# 运行全部 285 项测试用例 (基于 Vitest)
+# 运行全部 315 项测试用例 (基于 Vitest)
 pnpm test
 
 # 严格 TypeScript 类型检查
@@ -379,7 +380,7 @@ pnpm exec tsc --noEmit
 - **联网搜索默认开启**：请求携带 `forceUseSearch: true`，引用自动整理为 Markdown 链接。单次请求关闭：`"search": false`。
 - **采样参数**：上游匿名层不支持 `temperature`、`top_p`、`seed`；网关会正常吸收这些参数以兼容客户端，但不会影响上游输出。函数调用与工具调用本身不受此限制。
 - **多模态**：支持图片部分（自动重上传至匿名文件管线，每设备每日约 10 次上传配额，由设备池自动轮换）；音频及其他附件类型仍会被剔除。
-- **工具调用**：通过编译的 system 协议实现（匿名上游无原生 tools API）。模型服从度因匿名副本而异；网关检测到“拒绝文案”时会自动换新设备重试（最多 3 次），**流式与非流式行为一致** —— 流式客户端不再显著劣于非流式。带 tools 的请求默认关闭联网搜索（上游 web 工具可能劫持工具调用轮次）；用 `"search": true` 可显式开启。`tool_choice: "none"` 完全禁用工具调用。注：`"search": false` 会以 `forceUseSearch: false` 透传上游，但上游模型仍可能自行搜索 —— 该开关仅为建议而非强制。
+- **工具调用**：通过编译的 system 协议实现（匿名上游无原生 tools API）。模型服从度因匿名副本而异；网关检测到“拒绝文案”时会自动换新设备重试（最多 3 次），**流式与非流式行为一致** —— 流式客户端不再显著劣于非流式。带 tools 的请求默认关闭联网搜索（上游 web 工具可能劫持工具调用轮次）；用 `"search": true` 可显式开启。`tool_choice: "none"` 完全禁用工具调用。当最后一条消息是 `role: "tool"` 结果、且请求没有 `"search": true` 时，模型若跑了 `web.run`，该回复视为违约并按同样方式重试。其余轮次里 `"search": false` 仍只是建议：上游模型仍可能自行搜索。
 - **边缘地区限制**：OpenAI 对部分国家/地区（如中国香港节点）有 IP 封锁。若你的 Worker 请求正好经由受限地区节点出站，可能会遇到 OpenAI 的地区性 403。可配置 Cloudflare Smart Placement 或 Location Hint 优化出站。
 
 ---
