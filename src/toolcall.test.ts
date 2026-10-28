@@ -41,6 +41,12 @@ describe('buildToolProtocolSystemMessage', () => {
     expect(msg).toContain(TOOL_CALL_REPLY_FORMAT);
   });
 
+  it('tells the model tool results are authoritative over web search', () => {
+    const msg = buildToolProtocolSystemMessage([weatherTool]);
+    expect(msg).toContain('A tool result is the authoritative, current answer');
+    expect(msg).toContain('Never search the web');
+  });
+
   it('leaves the wording unchanged for auto and undefined', () => {
     const plain = buildToolProtocolSystemMessage([weatherTool, searchTool]);
     expect(buildToolProtocolSystemMessage([weatherTool, searchTool], 'auto')).toBe(plain);

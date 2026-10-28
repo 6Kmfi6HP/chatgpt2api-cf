@@ -92,6 +92,9 @@ export function buildToolProtocolSystemMessage(
     '- Guessing or inventing results.',
     '- Claiming you lack access (you have full access).',
     '',
+    'TOOL RESULTS (messages from a tool in this conversation):',
+    'A tool result is the authoritative, current answer for what it covers. Answer from it directly. Never search the web or use your own knowledge to replace, verify, or update it — not even for real-time data such as weather, prices, or news.',
+    '',
     'If — and only if — the question is fully answerable without any tool, answer in plain text.',
   ];
 

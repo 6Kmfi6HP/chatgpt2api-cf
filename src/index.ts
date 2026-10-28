@@ -8,7 +8,7 @@ import { deviceManager as defaultDeviceManager, DeviceManager } from './device';
 import { flattenMessages, lastUserMessageText } from './translate';
 import { buildAnonRequestBodyWithTools } from './toolcall_wire';
 import { getModelCatalog } from './catalog';
-import { pipeOpenAIStream, aggregateNonStream, StreamProcessor, STREAM_TAIL_GRACE_MS, READ_TIMEOUT } from './stream';
+import { pipeOpenAIStream, aggregateNonStreamWithSignals, StreamProcessor, STREAM_TAIL_GRACE_MS, READ_TIMEOUT } from './stream';
 import { createParser } from 'eventsource-parser';
 import {
   collectImageRefs,
@@ -83,15 +83,28 @@ export function requiredToolName(req: ChatCompletionRequest): string | null {
 }
 
 /**
+ * True when the turn must be answered from the tool result the caller just
+ * supplied (the last message is a tool result) and the caller did not opt
+ * into web search. The upstream model treats the search toggle as advisory
+ * and may still search — overriding the tool result with web data.
+ */
+export function mustAnswerFromToolResult(req: ChatCompletionRequest): boolean {
+  const msgs = req?.messages;
+  return Array.isArray(msgs) && msgs.length > 0 && msgs[msgs.length - 1]?.role === 'tool' && req.search !== true;
+}
+
+/**
  * True when a completion breaks the request's tool contract: the model neither
  * called a tool nor produced an acceptable plain answer. A refusal-looking
  * reply always qualifies; under a mandatory tool_choice any tool-less reply
  * qualifies, even fluent prose — and a named tool_choice additionally requires
- * the model to have called THAT tool.
+ * the model to have called THAT tool. A plain answer that ran its own web
+ * search instead of using the supplied tool result qualifies too.
  */
 export function violatesToolContract(
   req: ChatCompletionRequest,
-  result: ChatCompletionResponse | null
+  result: ChatCompletionResponse | null,
+  usedWebSearch = false
 ): boolean {
   const choice = result?.choices?.[0];
   if (!choice) return false;
@@ -104,6 +117,7 @@ export function violatesToolContract(
     return false;
   }
   if (looksLikeRefusal(choice.message?.content ?? '')) return true;
+  if (usedWebSearch && mustAnswerFromToolResult(req)) return true;
   return requiresToolCall(req);
 }
 
@@ -245,8 +259,10 @@ interface AttemptOutcome {
  *  - tool_calls deltas appear (detector resolved the JSON) → commit immediately
  *  - plain prose of >= TOOL_REFUSAL_DECISION_CHARS that is not a refusal, when
  *    the request does NOT mandate a tool call → commit immediately
- *  - otherwise hold: a refusal (retryable) or a mandated-choice reply whose
- *    compliance is still unknown
+ *  - otherwise hold: a refusal (retryable), a mandated-choice reply whose
+ *    compliance is still unknown, or (holdOnWebSearch) a reply that ran its own
+ *    web search instead of using the supplied tool result — upstream searches
+ *    before writing any text, so this is known before the commit window
  *
  * Holding is bounded by the reply itself (refusals and tool-call JSON are
  * short); once committed, every later chunk streams straight through.
@@ -256,6 +272,7 @@ async function streamAttempt(
   writer: SSEWriter,
   sp: StreamProcessor,
   commitOnPlainText: boolean,
+  holdOnWebSearch: boolean,
   signal?: AbortSignal
 ): Promise<AttemptOutcome> {
   const pending: import('./types').ChatCompletionChunk[] = [];
@@ -343,7 +360,11 @@ async function streamAttempt(
           if (sawToolCalls) {
             // The detector resolved the reply as tool-call JSON.
             committed = true;
-          } else if (commitOnPlainText && !looksLikeRefusal(sp.lastFullText)) {
+          } else if (
+            commitOnPlainText &&
+            !looksLikeRefusal(sp.lastFullText) &&
+            !(holdOnWebSearch && sp.usedWebSearch)
+          ) {
             // Refusal text must stay held so it can be retried on a fresh
             // device; any other prose is a legitimate answer. Commit once the
             // byte or time trigger fires so the typing effect starts early.
@@ -481,13 +502,14 @@ async function pipeOpenAIStreamRetrying(
   // candidate for retry. Under "auto" a non-refusal plain answer is always
   // acceptable, so prose commits as soon as the decision window is filled.
   const commitOnPlainText = !requiresToolCall(req);
+  const holdOnWebSearch = mustAnswerFromToolResult(req);
 
   const MAX_STREAM_ATTEMPTS = 3;
   let currentResp: Response = resp;
 
   for (let attempt = 0; attempt < MAX_STREAM_ATTEMPTS; attempt++) {
     const sp = new StreamProcessor(model, req);
-    const outcome = await streamAttempt(currentResp, writer, sp, commitOnPlainText, signal);
+    const outcome = await streamAttempt(currentResp, writer, sp, commitOnPlainText, holdOnWebSearch, signal);
     if (outcome.aborted) return;
 
     if (outcome.committed) {
@@ -535,7 +557,7 @@ async function pipeOpenAIStreamRetrying(
       ],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     };
-    const contractViolated = violatesToolContract(req, bufferedCompletion);
+    const contractViolated = violatesToolContract(req, bufferedCompletion, sp.usedWebSearch);
 
     if (contractViolated && attempt < MAX_STREAM_ATTEMPTS - 1) {
       try {
@@ -551,10 +573,10 @@ async function pipeOpenAIStreamRetrying(
         signal,
       });
       if (retryResp) {
-        if (!violatesToolContract(req, retryResp)) {
+        if (!violatesToolContract(req, retryResp.result, retryResp.usedWebSearch)) {
           // Got a usable answer — stream it out as a synthesized attempt and
           // finish, preserving the streaming contract.
-          await emitAggregatedAsStream(writer, retryResp, model, req);
+          await emitAggregatedAsStream(writer, retryResp.result, model, req);
           return;
         }
       }
@@ -579,14 +601,15 @@ async function pipeOpenAIStreamRetrying(
  * Re-runs a tool turn on fresh devices (up to 4 attempts). Returns the first
  * result that satisfies the tool contract (a tool call, or a non-refusal plain
  * answer when no tool_choice was mandatory), or the last result if every
- * attempt violated it.
+ * attempt violated it. usedWebSearch travels with the result so the caller
+ * can re-check the contract.
  */
 async function retryToolTurn(
   env: Env,
   args: RetryArgs
-): Promise<ChatCompletionResponse | null> {
+): Promise<{ result: ChatCompletionResponse; usedWebSearch: boolean } | null> {
   const { model, prompt, imageRefs, req, client, dm, signal } = args;
-  let lastResult: ChatCompletionResponse | null = null;
+  let lastResult: { result: ChatCompletionResponse; usedWebSearch: boolean } | null = null;
   for (let i = 0; i < 4; i++) {
     try {
       const device = await dm.getHealthyDevice(env, client);
@@ -623,12 +646,12 @@ async function retryToolTurn(
       });
       const conduitToken = await client.prepare(device.id, device.sentinelToken!, anonBody, signal);
       const resp = await client.conversation(device.id, device.sentinelToken!, conduitToken, anonBody, signal);
-      const result = await aggregateNonStream(resp, model, req);
-      lastResult = result;
+      const attempt = await aggregateNonStreamWithSignals(resp, model, req);
+      lastResult = attempt;
       // Accept when the tool contract is satisfied: a tool call, or (absent a
       // mandatory tool_choice) any non-refusal plain answer.
-      if (!violatesToolContract(req, result)) {
-        return result;
+      if (!violatesToolContract(req, attempt.result, attempt.usedWebSearch)) {
+        return attempt;
       }
     } catch {
       // keep trying
@@ -1021,8 +1044,9 @@ export function createApp(options?: AppOptions) {
     // until the real body is ready. Browsers and SDKs reset read timers on
     // those bytes; the final document is still one JSON.parse-able value.
     const resultPromise = (async (): Promise<ChatCompletionResponse> => {
-      let result = await aggregateNonStream(upstreamResp!, model, req);
-      if (hasTools && violatesToolContract(req, result)) {
+      const first = await aggregateNonStreamWithSignals(upstreamResp!, model, req);
+      let result = first.result;
+      if (hasTools && violatesToolContract(req, result, first.usedWebSearch)) {
         try {
           await upstreamResp!.body?.cancel();
         } catch {}
@@ -1030,7 +1054,7 @@ export function createApp(options?: AppOptions) {
           model, prompt, imageRefs, req, client, dm, signal,
         });
         if (retryResp) {
-          result = retryResp;
+          result = retryResp.result;
           deviceRotated = true;
         }
       }
