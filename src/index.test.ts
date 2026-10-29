@@ -1491,3 +1491,80 @@ describe('Transport behavior (heartbeat / keepalive)', () => {
     expect(parsed.choices[0].message.content).toBe('Slow final answer.');
   });
 });
+
+describe('sampling parameters (max_tokens / stop)', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5-5', messages: [{ role: 'user', content: 'hi' }], ...payload }),
+      },
+      mockEnv
+    );
+  }
+
+  it('rejects max_tokens below 1 with 400', async () => {
+    const res = await post({ max_tokens: 0 });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; message: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('max_tokens');
+    expect(data.error.message).toContain('positive integer');
+  });
+
+  it('rejects a non-string stop with 400', async () => {
+    const res = await post({ stop: 123 });
+    expect(res.status).toBe(400);
+    const data: { error: { param: string } } = await res.json();
+    expect(data.error.param).toBe('stop');
+  });
+
+  it('rejects more than four stop sequences with 400', async () => {
+    const res = await post({ stop: ['a', 'b', 'c', 'd', 'e'] });
+    expect(res.status).toBe(400);
+  });
+
+  it('truncates a non-streaming reply at the stop sequence', async () => {
+    client.conversationHandler = async () =>
+      createSseResponse([
+        `data: ${JSON.stringify(mkAssistantEvent('Counting '))}\n\n`,
+        `data: ${JSON.stringify(mkAssistantEvent('Counting 1, 2, 3 STOP after'))}\n\n`,
+      ]);
+
+    const res = await post({ stream: false, stop: 'STOP' });
+    expect(res.status).toBe(200);
+    const data: {
+      choices: Array<{ message: { content: string }; finish_reason: string }>;
+    } = await res.json();
+    expect(data.choices[0].message.content).toBe('Counting 1, 2, 3 ');
+    expect(data.choices[0].finish_reason).toBe('stop');
+  });
+
+  it('caps a streaming reply at max_tokens with finish_reason length', async () => {
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('a'.repeat(200)))}\n\n`]);
+
+    const res = await post({ stream: true, max_tokens: 3 });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('"finish_reason":"length"');
+    expect(body).toContain('data: [DONE]');
+  });
+});
