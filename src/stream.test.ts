@@ -774,3 +774,177 @@ describe('aggregateNonStream', () => {
     expect(result.choices[0].finish_reason).toBe('stop');
   });
 });
+
+describe('sampling limits (stop / max_tokens)', () => {
+  function createSseResponse(events: string[]): Response {
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const ev of events) {
+          controller.enqueue(new TextEncoder().encode(ev));
+        }
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+  }
+
+  function collect(written: string[]) {
+    const chunks = written
+      .filter((w) => w !== '[DONE]')
+      .map((w) => JSON.parse(w) as any);
+    return {
+      chunks,
+      content: chunks.map((c) => c.choices?.[0]?.delta?.content ?? '').join(''),
+      finishes: chunks
+        .filter((c) => c.choices?.[0]?.finish_reason)
+        .map((c) => c.choices[0].finish_reason),
+    };
+  }
+
+  it('cuts the stream at the first stop sequence without leaking it', async () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'count' }],
+      stop: 'STOP',
+    };
+    const resp = createSseResponse([
+      `data: ${JSON.stringify(mkAssistantEvent('1, 2, ST'))}\n\n`,
+      `data: ${JSON.stringify(mkAssistantEvent('1, 2, STOP and after'))}\n\n`,
+    ]);
+    const written: string[] = [];
+    await pipeOpenAIStream(
+      resp,
+      { writeSSE: async (msg: { data: string }) => void written.push(msg.data) },
+      'gpt-4o',
+      req
+    );
+
+    const { content, finishes } = collect(written);
+    expect(content).toBe('1, 2, ');
+    expect(content).not.toContain('STOP');
+    expect(finishes).toEqual(['stop']);
+    expect(written[written.length - 1]).toBe('[DONE]');
+  });
+
+  it('releases a held stop prefix when the reply ends before it completes', async () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'count' }],
+      stop: ['STOP'],
+    };
+    const resp = createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('1, 2, ST'))}\n\n`]);
+    const written: string[] = [];
+    await pipeOpenAIStream(
+      resp,
+      { writeSSE: async (msg: { data: string }) => void written.push(msg.data) },
+      'gpt-4o',
+      req
+    );
+
+    const { content, finishes } = collect(written);
+    expect(content).toBe('1, 2, ST');
+    expect(finishes).toEqual(['stop']);
+  });
+
+  it('caps a streamed reply at max_tokens and reports finish_reason length', async () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'go' }],
+      max_tokens: 4,
+    };
+    const resp = createSseResponse([
+      `data: ${JSON.stringify(mkAssistantEvent('a'.repeat(40)))}\n\n`,
+      `data: ${JSON.stringify(mkAssistantEvent('a'.repeat(200)))}\n\n`,
+    ]);
+    const written: string[] = [];
+    await pipeOpenAIStream(
+      resp,
+      { writeSSE: async (msg: { data: string }) => void written.push(msg.data) },
+      'gpt-4o',
+      req
+    );
+
+    const { content, finishes } = collect(written);
+    expect(content.length).toBe(19);
+    expect(finishes).toEqual(['length']);
+  });
+
+  it('releases buffered tool-call text instead of dropping the reply at a cap', async () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            parameters: { type: 'object', properties: { city: { type: 'string' } } },
+          },
+        },
+      ],
+      max_tokens: 2,
+    };
+    const resp = createSseResponse([
+      `data: ${JSON.stringify(
+        mkAssistantEvent('{"name":"get_weather","arguments":{"city":"Hanoi"}}')
+      )}\n\n`,
+    ]);
+    const written: string[] = [];
+    await pipeOpenAIStream(
+      resp,
+      { writeSSE: async (msg: { data: string }) => void written.push(msg.data) },
+      'gpt-4o',
+      req
+    );
+
+    const { content, finishes } = collect(written);
+    expect(content.length).toBeGreaterThan(0);
+    expect(finishes).toEqual(['length']);
+  });
+
+  it('truncates an aggregated reply at the stop sequence', async () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'greet' }],
+      stop: ['STOP'],
+    };
+    const resp = createSseResponse([
+      `data: ${JSON.stringify(mkAssistantEvent('Hello '))}\n\n`,
+      `data: ${JSON.stringify(mkAssistantEvent('Hello world STOP tail'))}\n\n`,
+    ]);
+
+    const result = await aggregateNonStream(resp, 'gpt-4o', req);
+    expect(result.choices[0].message.content).toBe('Hello world ');
+    expect(result.choices[0].finish_reason).toBe('stop');
+    expect(result.usage?.completion_tokens).toBe(3);
+  });
+
+  it('leaves a never-completed stop prefix in the aggregated text', async () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'count' }],
+      stop: ['STOP'],
+    };
+    const resp = createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('1, 2, ST'))}\n\n`]);
+
+    const result = await aggregateNonStream(resp, 'gpt-4o', req);
+    expect(result.choices[0].message.content).toBe('1, 2, ST');
+    expect(result.choices[0].finish_reason).toBe('stop');
+  });
+
+  it('caps an aggregated reply at max_tokens and reports finish_reason length', async () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'go' }],
+      max_tokens: 3,
+    };
+    const resp = createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('a'.repeat(40)))}\n\n`]);
+
+    const result = await aggregateNonStream(resp, 'gpt-4o', req);
+    expect(result.choices[0].message.content).toBe('a'.repeat(15));
+    expect(result.choices[0].finish_reason).toBe('length');
+    expect(result.usage?.completion_tokens).toBe(3);
+  });
+});

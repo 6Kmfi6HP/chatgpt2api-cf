@@ -213,7 +213,7 @@ export function buildFinalChunk(
   id: string,
   created: number,
   model: string,
-  finishReason?: 'stop' | 'tool_calls'
+  finishReason?: 'stop' | 'length' | 'tool_calls'
 ): ChatCompletionChunk {
   return {
     id,

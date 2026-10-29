@@ -35,7 +35,20 @@ export interface ChatCompletionRequest {
     include_usage?: boolean;
   };
   temperature?: number;
+  /**
+   * Completion-token cap. Enforced by the gateway (upstream has no knob): the
+   * reply is cut at roughly this many tokens and finish_reason becomes
+   * "length". `max_completion_tokens` wins when both are present.
+   */
   max_tokens?: number;
+  /** OpenAI's newer spelling of `max_tokens`; takes precedence when present. */
+  max_completion_tokens?: number;
+  /**
+   * Stop sequence(s): the reply is cut before the earliest occurrence, and the
+   * sequence itself is never written to the client. A stop that only completes
+   * in a later upstream snapshot is withheld until it is decidable.
+   */
+  stop?: string | string[];
   /**
    * Web-search toggle. Default true (search ON). Set to false to disable
    * upstream web search for this request (forceUseSearch=false).

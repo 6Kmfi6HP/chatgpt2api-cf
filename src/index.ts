@@ -17,6 +17,7 @@ import {
   type ResolvedImage,
 } from './image_parts';
 import { uploadImage, sniffImageMime, defaultExtensionForMime } from './upload';
+import { samplingParamError } from './sampling';
 
 export interface AppOptions {
   client?: UpstreamClient;
@@ -806,6 +807,24 @@ export function createApp(options?: AppOptions) {
           error: {
             message: 'Missing or invalid "messages" array',
             type: 'invalid_request_error',
+          },
+        },
+        400
+      );
+    }
+
+    // Sampling parameters the gateway must honour or reject, never silently
+    // drop: a malformed max_tokens/stop would otherwise turn the cap and the
+    // truncation markers into no-ops.
+    const samplingErr = samplingParamError(req);
+    if (samplingErr) {
+      return c.json(
+        {
+          error: {
+            message: samplingErr.message,
+            type: 'invalid_request_error',
+            param: samplingErr.param,
+            code: 'invalid_request_error',
           },
         },
         400
