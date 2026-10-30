@@ -208,14 +208,6 @@ describe('Hono Application (src/index.ts)', () => {
       expect(mockClient.prepareCalls[0].anonBody.model).toBe('gpt-5-6');
     });
 
-    it('defaults model to auto when absent', async () => {
-      const res = await postChat(
-        JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
-      );
-      expect(res.status).toBe(200);
-      expect(mockClient.prepareCalls[0].anonBody.model).toBe('auto');
-    });
-
     it('enables forceUseSearch by default', async () => {
       const res = await postChat(chatBody());
       expect(res.status).toBe(200);
@@ -429,6 +421,47 @@ describe('Hono Application (src/index.ts)', () => {
       if (expectedMessage) {
         expect(data.error.message).toContain(expectedMessage);
       }
+    });
+
+    it.each([
+      {
+        name: 'missing model',
+        payload: { messages: [{ role: 'user', content: 'hi' }] },
+      },
+      {
+        name: 'blank model',
+        payload: { model: '  ', messages: [{ role: 'user', content: 'hi' }] },
+      },
+      {
+        name: 'non-string model',
+        payload: { model: 123, messages: [{ role: 'user', content: 'hi' }] },
+      },
+      {
+        name: 'missing model on a stream request',
+        payload: { stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      },
+    ])('400 model: $name', async ({ payload }) => {
+      const res = await app.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        },
+        mockEnv
+      );
+      expect(res.status).toBe(400);
+      // Rejected as JSON before the stream opens, never as an SSE error frame.
+      expect(res.headers.get('content-type')).toContain('application/json');
+      const data = (await res.json()) as {
+        error: { type: string; param: string; message: string };
+      };
+      expect(data.error.type).toBe('invalid_request_error');
+      expect(data.error.param).toBe('model');
+      expect(data.error.message).toContain('model');
+      // No upstream work at all: no device prepared, no conversation opened.
+      expect(mockClient.prepareCalls).toHaveLength(0);
+      expect(mockClient.conversationCalls).toHaveLength(0);
     });
   });
 
