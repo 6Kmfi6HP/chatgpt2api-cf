@@ -342,7 +342,9 @@ Streaming emits `delta.tool_calls` frames and `finish_reason: "tool_calls"`.
 `tool_choice` handling:
 
 - `"none"` disables tool-calling entirely (no tool protocol is compiled into the request).
-- `"auto"` (the default) lets the model decide; a plain-text answer is returned as-is.
+- `"auto"` (the default) lets the model decide; a plain-text answer is returned as-is. A reply with
+  neither text nor a tool call is a violation and is retried on fresh devices like the mandatory
+  cases below — upstream closes the turn empty when its own web search comes back with no results.
 - `"required"` demands a tool call. The anonymous upstream has no native tool-choice knob, so the
   gateway compiles stronger mandatory protocol wording **and enforces it**: a tool-less reply is
   retried on fresh devices (bounded) and the first compliant result wins. If every attempt still
@@ -385,7 +387,7 @@ pnpm exec tsc --noEmit
 - **Web Search ON by default**: requests send `forceUseSearch: true`; reply citations are auto-formatted as Markdown links. Per-request opt-out: `"search": false`.
 - **Sampling Knobs**: Knobs like `temperature`, `top_p`, `seed` are accepted for client compatibility, but ignored by upstream.
 - **Multimodal**: Image parts are supported (re-uploaded to the anonymous file pipeline, ~10 uploads/day per pooled device, pooled automatically). Audio and other attachment types are stripped. Image upload throttling upstream is per-device; the device pool rotates on 429 automatically.
-- **Tool calling**: implemented via a compiled system protocol (the anonymous upstream has no native tools API). On refusal-text replies the gateway transparently retries the turn on fresh devices (up to 3 attempts) for BOTH non-stream and stream requests — behavior is identical, and streaming clients no longer see degraded adherence. Requests with tools default `search` off (the upstream web tool can hijack tool-call turns); set `"search": true` to override. `tool_choice: "none"` disables tool-calling. When the last message is a `role: "tool"` result and `search` is not `true`, a reply that ran `web.run` is a contract violation and is retried the same way. On every other turn `"search": false` is still only advisory: upstream may search on its own.
+- **Tool calling**: implemented via a compiled system protocol (the anonymous upstream has no native tools API). On refusal-text replies the gateway transparently retries the turn on fresh devices (up to 3 attempts) for BOTH non-stream and stream requests — behavior is identical, and streaming clients no longer see degraded adherence. A reply that carries neither text nor a tool call is retried the same way: upstream ends the turn empty when its own web search returns nothing, and an empty 200 would end an agent loop with no output and no error. Requests with tools default `search` off (the upstream web tool can hijack tool-call turns); set `"search": true` to override. `tool_choice: "none"` disables tool-calling. When the last message is a `role: "tool"` result and `search` is not `true`, a reply that ran `web.run` is a contract violation and is retried the same way. On every other turn `"search": false` is still only advisory: upstream may search on its own.
 - **Regional Restrictions**: Requests originating from Cloudflare edge locations in unsupported countries (e.g. Hong Kong, China) may trigger OpenAI's regional 403 blocks. Deploying with location hints or Smart Placement resolves this.
 
 ---
