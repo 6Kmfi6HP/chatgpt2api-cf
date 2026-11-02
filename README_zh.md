@@ -345,6 +345,10 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
   结果胜出；若所有尝试都违约，则返回最后一次的回复而不是报错。
 - `{"type": "function", "function": {"name": "X"}}`：同上，并且要求回复必须调用**该**工具 ——
   调用其它工具同样视为违约并触发重试。
+- `tool_choice` 会在**发起任何上游请求之前**与 `tools` 交叉校验：点名未声明的函数、`"required"`
+  却没有 `tools`、或取值非法，一律返回 `400 invalid_request_error`（`param: "tool_choice"`）。
+  否则一个无法满足的强制条款会被编译成不可能完成的指令，每次回复都被判为违约，白跑 4 轮上游重试
+  后才退化成纯文本 `200`。
 
 ### 5. 常见客户端配置（NextChat、Chatbox、Cursor、Cline 等）
 

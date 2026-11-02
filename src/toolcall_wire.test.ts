@@ -119,7 +119,7 @@ describe('buildAnonRequestBodyWithTools', () => {
     expect(proto).toContain('get_weather');
   });
 
-  it('appends the named-tool clause for a named tool_choice', () => {
+  it('appends the named-tool clause for a declared named tool_choice', () => {
     const req = baseReq({
       messages: [{ role: 'user', content: 'weather in Paris?' }],
       tools: [{ type: 'function', function: { name: 'get_weather' } }],
@@ -127,16 +127,6 @@ describe('buildAnonRequestBodyWithTools', () => {
     });
     const proto = buildAnonRequestBodyWithTools(req, { prompt: 'p' }).messages[0].content.parts.join('\n');
     expect(proto).toContain('You MUST call the tool "get_weather".');
-  });
-
-  it('emits the named directive even when the name is absent from tools', () => {
-    const req = baseReq({
-      messages: [{ role: 'user', content: 'hi' }],
-      tools: [{ type: 'function', function: { name: 'get_weather' } }],
-      tool_choice: { type: 'function', function: { name: 'ghost_tool' } },
-    });
-    const proto = buildAnonRequestBodyWithTools(req, { prompt: 'p' }).messages[0].content.parts.join('\n');
-    expect(proto).toContain('You MUST call the tool "ghost_tool".');
   });
 
   it('leaves the protocol wording unchanged for tool_choice "auto"', () => {

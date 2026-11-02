@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createApp } from './index';
+import { createApp, toolChoiceError } from './index';
 import { clearCatalogCache } from './catalog';
 import { UpstreamClient, StatusError } from './client';
 import { DeviceManager } from './device';
@@ -1126,6 +1126,223 @@ describe('Tool calling (OpenAI tools API)', () => {
     expect(callCount).toBeGreaterThan(1);
     expect(data.choices[0].finish_reason).toBe('tool_calls');
     expect(data.choices[0].message.tool_calls?.[0].function.name).toBe('get_weather');
+  });
+
+  describe('tool_choice validation', () => {
+    const weatherTool = {
+      type: 'function',
+      function: {
+        name: 'get_weather',
+        description: 'w',
+        parameters: { type: 'object', properties: {} },
+      },
+    };
+
+    function setup() {
+      const client = new MockUpstreamClient();
+      const testApp = createApp({ client, deviceManager: new DeviceManager() });
+      const env = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+      const post = (payload: object) =>
+        testApp.request(
+          '/v1/chat/completions',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          },
+          env
+        );
+      return { post, client };
+    }
+
+    // Every illegal tool_choice is the caller's bug. Answering it with 200 (and,
+    // for a ghost name, burning 4 upstream retries before degrading to plain
+    // text) hides that bug and contradicts the contract the caller declared.
+    it.each([
+      {
+        name: 'named function absent from tools',
+        payload: {
+          model: 'auto',
+          messages: [{ role: 'user', content: 'weather?' }],
+          tools: [weatherTool],
+          tool_choice: { type: 'function', function: { name: 'delete_everything' } },
+        },
+      },
+      {
+        name: 'named function with no tools at all',
+        payload: {
+          model: 'auto',
+          messages: [{ role: 'user', content: 'weather?' }],
+          tool_choice: { type: 'function', function: { name: 'get_weather' } },
+        },
+      },
+      {
+        name: 'required with no tools',
+        payload: {
+          model: 'auto',
+          messages: [{ role: 'user', content: 'hi' }],
+          tool_choice: 'required',
+        },
+      },
+      {
+        name: 'required with an empty tools array',
+        payload: {
+          model: 'auto',
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [],
+          tool_choice: 'required',
+        },
+      },
+      {
+        name: 'unknown string value',
+        payload: {
+          model: 'auto',
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [weatherTool],
+          tool_choice: 'banana',
+        },
+      },
+      {
+        name: 'function object without a name',
+        payload: {
+          model: 'auto',
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [weatherTool],
+          tool_choice: { type: 'function' },
+        },
+      },
+      {
+        name: 'non-string, non-object value',
+        payload: {
+          model: 'auto',
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [weatherTool],
+          tool_choice: 7,
+        },
+      },
+      {
+        name: 'named function on a stream request',
+        payload: {
+          model: 'auto',
+          stream: true,
+          messages: [{ role: 'user', content: 'weather?' }],
+          tools: [weatherTool],
+          tool_choice: { type: 'function', function: { name: 'delete_everything' } },
+        },
+      },
+    ])('400 tool_choice: $name', async ({ payload }) => {
+      const t = setup();
+      const res = await t.post(payload);
+      expect(res.status).toBe(400);
+      // Rejected as JSON before the stream opens, never as an SSE error frame.
+      expect(res.headers.get('content-type')).toContain('application/json');
+      const data = (await res.json()) as {
+        error: { type: string; param: string; message: string };
+      };
+      expect(data.error.type).toBe('invalid_request_error');
+      expect(data.error.param).toBe('tool_choice');
+      expect(data.error.message).toContain('tool_choice');
+      // No upstream work at all: no device prepared, no conversation opened.
+      // This is the part that matters for a ghost name — the old code ran four
+      // retries before degrading to a plain-text 200.
+      expect(t.client.prepareCalls).toHaveLength(0);
+      expect(t.client.conversationCalls).toHaveLength(0);
+    });
+
+    it('keeps accepting "auto" and "none" without touching the tools array', async () => {
+      for (const choice of ['auto', 'none']) {
+        const t = setup();
+        const res = await t.post({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [weatherTool],
+          tool_choice: choice,
+        });
+        expect(res.status).toBe(200);
+        expect(t.client.conversationCalls).toHaveLength(1);
+      }
+    });
+
+    it('keeps accepting "required" and a declared named function', async () => {
+      for (const choice of ['required', { type: 'function', function: { name: 'get_weather' } }]) {
+        const t = setup();
+        // A compliant tool call: no retry, so one upstream conversation proves
+        // the choice was accepted rather than rejected.
+        t.client.conversationHandler = async () =>
+          createSseResponse([
+            `data: ${JSON.stringify(
+              mkAssistantEvent('{"tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}')
+            )}\n\n`,
+          ]);
+        const res = await t.post({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'Weather in Paris?' }],
+          tools: [weatherTool],
+          tool_choice: choice,
+        });
+        expect(res.status).toBe(200);
+        expect(t.client.conversationCalls).toHaveLength(1);
+      }
+    });
+  });
+});
+
+describe('toolChoiceError', () => {
+  const tools = [
+    {
+      type: 'function' as const,
+      function: { name: 'get_weather', parameters: { type: 'object' } },
+    },
+  ];
+  const base = (extra: Partial<ChatCompletionRequest>): ChatCompletionRequest => ({
+    model: 'auto',
+    messages: [{ role: 'user', content: 'hi' }],
+    ...extra,
+  });
+
+  it('accepts auto, none and an absent choice', () => {
+    expect(toolChoiceError(base({ tools }))).toBeNull();
+    expect(toolChoiceError(base({ tools, tool_choice: 'auto' }))).toBeNull();
+    expect(toolChoiceError(base({ tools, tool_choice: 'none' }))).toBeNull();
+  });
+
+  it('accepts required and a declared name when tools exist', () => {
+    expect(toolChoiceError(base({ tools, tool_choice: 'required' }))).toBeNull();
+    expect(
+      toolChoiceError(base({ tools, tool_choice: { type: 'function', function: { name: 'get_weather' } } }))
+    ).toBeNull();
+  });
+
+  it('rejects an undeclared function name and names it in the message', () => {
+    const err = toolChoiceError(
+      base({ tools, tool_choice: { type: 'function', function: { name: 'ghost_tool' } } })
+    );
+    expect(err).toContain('ghost_tool');
+    expect(err).toContain('tool_choice');
+  });
+
+  it('rejects required with no tools', () => {
+    expect(toolChoiceError(base({ tool_choice: 'required' }))).toContain('tool_choice');
+    expect(toolChoiceError(base({ tools: [], tool_choice: 'required' }))).toContain('tool_choice');
+  });
+
+  it('rejects malformed choices', () => {
+    expect(toolChoiceError(base({ tools, tool_choice: 'banana' as never }))).toContain('tool_choice');
+    expect(toolChoiceError(base({ tools, tool_choice: { type: 'function' } as never }))).toContain(
+      'tool_choice'
+    );
+    expect(toolChoiceError(base({ tools, tool_choice: 7 as never }))).toContain('tool_choice');
+  });
+
+  it('treats exotic function name in tools as declared', () => {
+    const exotic = [
+      { type: 'function' as const, function: { name: 'ns:do_thing', parameters: { type: 'object' } } },
+    ];
+    expect(
+      toolChoiceError(
+        base({ tools: exotic, tool_choice: { type: 'function', function: { name: 'ns:do_thing' } } })
+      )
+    ).toBeNull();
   });
 });
 

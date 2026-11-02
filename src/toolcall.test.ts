@@ -75,14 +75,6 @@ describe('buildToolProtocolSystemMessage', () => {
     );
   });
 
-  it('emits the named directive even when the name is absent from tools', () => {
-    const msg = buildToolProtocolSystemMessage([weatherTool], {
-      type: 'function',
-      function: { name: 'ghost_tool' },
-    });
-    expect(msg).toContain('You MUST call the tool "ghost_tool".');
-  });
-
   it('keeps the full tool list in both mandatory cases', () => {
     const tools = [weatherTool, searchTool];
     const choices: Array<'required' | { type: 'function'; function: { name: string } }> = [

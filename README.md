@@ -349,6 +349,11 @@ Streaming emits `delta.tool_calls` frames and `finish_reason: "tool_calls"`.
   violates it, the last reply is returned rather than an error.
 - `{"type": "function", "function": {"name": "X"}}` is the same, plus the reply must call **that**
   tool — calling a different tool counts as a violation and is retried.
+- `tool_choice` is validated against `tools` **before** any upstream call. A name that is not
+  declared, `"required"` with no tools, or a malformed value is rejected with
+  `400 invalid_request_error` (`param: "tool_choice"`). An unsatisfiable mandate would otherwise be
+  compiled into an impossible instruction, judged a violation on every reply, and burn four
+  upstream retries before degrading to a plain-text `200`.
 
 ### 5. Third-Party Clients (NextChat, Chatbox, Cursor, etc.)
 
