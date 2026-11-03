@@ -165,10 +165,11 @@ export function openAIErrorBody(err: unknown): {
   status: number;
   error: { message: string; type: string; param: string | null; code: string | null };
 } {
-  const e = err as { message?: string; status?: number; bodySniff?: string } | null;
+  const e = err as { message?: string; status?: number; bodySniff?: string; model?: string } | null;
   let status = 500;
   let type = 'api_error';
   let code: string | null = null;
+  let param: string | null = null;
   let message = e?.message || 'Internal server error';
 
   if (err instanceof StatusError && err.status >= 400 && err.status < 600) {
@@ -189,10 +190,18 @@ export function openAIErrorBody(err: unknown): {
     } else if (status >= 500) {
       type = 'server_error';
       code = 'internal_server_error';
+    } else if (status === 400) {
+      type = 'invalid_request_error';
+      // The upstream signals an unusable model with an empty conduit_token;
+      // it is the request's model field that is wrong, not the upstream.
+      if (/empty conduit_token/.test(err.bodySniff || '')) {
+        param = 'model';
+        message = `The model '${e?.model || 'unknown'}' does not exist`;
+      }
     }
   }
 
-  return { status, error: { message, type, param: null, code } };
+  return { status, error: { message, type, param, code } };
 }
 
 interface RetryArgs {
@@ -995,6 +1004,16 @@ export function createApp(options?: AppOptions) {
           msg.includes('Empty image payload')
         ) {
           err = new StatusError('upload', 400, msg);
+          lastError = err;
+          throw err;
+        }
+        // The anonymous upstream signals an unusable model by answering
+        // prepare with HTTP 200 but no conduit_token. Every device hits the
+        // same business-level rejection (it is a property of the model, not
+        // the device), so this is the caller's fault: surface 400, not 500.
+        if (/empty conduit_token \(status="ok"\)/.test(msg)) {
+          err = new StatusError('prepare', 400, msg);
+          Object.assign(err, { model });
           lastError = err;
           throw err;
         }
