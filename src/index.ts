@@ -70,6 +70,47 @@ export function requiresToolCall(req: ChatCompletionRequest): boolean {
 }
 
 /**
+ * Returns a human-readable problem with the `messages` array, or null when
+ * every entry has a shape the OpenAI wire accepts.
+ *
+ * Why the handler must check this itself: the DTO builders read
+ * `message.role` (`flattenMessages`) and iterate `content`
+ * (`contentToText` in toolcall.ts, reached by every request through
+ * buildAnonRequestBodyWithTools). A number in either position throws a
+ * TypeError, which is not a StatusError, so `app.onError` reports it as a 500
+ * `api_error` — a caller-side bug disguised as a gateway fault, with SDK
+ * retry/alert loops and internal stack text in the response.
+ */
+export function messageShapeError(messages: unknown[]): string | null {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    const path = `messages[${i}]`;
+    if (!m || typeof m !== 'object' || Array.isArray(m)) {
+      return `${path} must be an object`;
+    }
+    const { role, content } = m as { role?: unknown; content?: unknown };
+    if (typeof role !== 'string') {
+      return `${path}.role must be a string`;
+    }
+    // null and undefined are legal: assistant turns that only call tools carry
+    // no text, and some clients omit content entirely.
+    if (content === undefined || content === null || typeof content === 'string') {
+      continue;
+    }
+    if (!Array.isArray(content)) {
+      return `${path}.content must be a string, an array of content parts, or null`;
+    }
+    for (let p = 0; p < content.length; p++) {
+      const part = content[p];
+      if (!part || typeof part !== 'object' || Array.isArray(part)) {
+        return `${path}.content[${p}] must be an object`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * The tool name demanded by tool_choice, or null when the choice does not name
  * a specific function.
  */
@@ -787,7 +828,13 @@ export function createApp(options?: AppOptions) {
   app.post('/v1/chat/completions', async (c) => {
     let req: ChatCompletionRequest;
     try {
-      req = await c.req.json<ChatCompletionRequest>();
+      const parsed: unknown = await c.req.json();
+      // JSON `null` parses fine but has no fields: reading `.messages` off it
+      // threw a TypeError and surfaced as 500 api_error.
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('body is not a JSON object');
+      }
+      req = parsed as ChatCompletionRequest;
     } catch {
       return c.json(
         {
@@ -806,6 +853,23 @@ export function createApp(options?: AppOptions) {
           error: {
             message: 'Missing or invalid "messages" array',
             type: 'invalid_request_error',
+          },
+        },
+        400
+      );
+    }
+
+    // Per-message shape: reject before any upstream work rather than let the
+    // DTO builders throw a TypeError that surfaces as 500 api_error.
+    const shapeError = messageShapeError(req.messages);
+    if (shapeError) {
+      return c.json(
+        {
+          error: {
+            message: `Invalid parameter: ${shapeError}.`,
+            type: 'invalid_request_error',
+            param: 'messages',
+            code: 'invalid_request_error',
           },
         },
         400

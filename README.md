@@ -363,11 +363,18 @@ An orphan `role: "tool"` message whose `tool_call_id` does not match any precedi
 being answered with a 200 chat reply — a silently accepted orphan would feed the tool payload to
 the model as user intent and hide the client bug.
 
+Malformed entries are validated before any upstream work, so a bad request body never reaches the
+DTO builders (which read `message.role` and iterate `content`). A non-object message, a non-string
+`role`, or a `content` that is neither a string, an array of content parts, nor `null` returns
+HTTP 400 `invalid_request_error` with `param: "messages"` and the offending path, e.g.
+`Invalid parameter: messages[0].content must be a string, an array of content parts, or null.`
+The same applies to a body that is JSON `null` or a non-object value.
+
 ---
 
 ## 🧪 Testing
 
-The test suite contains **319 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
+The test suite contains **328 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
 
 ```bash
 # Run Vitest test suite

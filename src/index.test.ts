@@ -413,6 +413,11 @@ describe('Hono Application (src/index.ts)', () => {
         body: JSON.stringify({ model: 'gpt-4o', messages: [] }),
         expectedMessage: 'messages',
       },
+      {
+        name: 'JSON null body',
+        body: 'null',
+        expectedMessage: 'Invalid JSON request body',
+      },
     ])('400: $name', async ({ body, expectedMessage }) => {
       const res = await app.request(
         '/v1/chat/completions',
@@ -429,6 +434,81 @@ describe('Hono Application (src/index.ts)', () => {
       if (expectedMessage) {
         expect(data.error.message).toContain(expectedMessage);
       }
+    });
+
+    // A malformed entry used to reach the upstream DTO builders, which iterate
+    // `content` and read `message.role`: a number there threw a TypeError and
+    // surfaced as HTTP 500 api_error — a caller-side bug reported as a gateway
+    // fault (and triggering SDK retry/alert loops).
+    it.each([
+      {
+        name: 'content is a number',
+        messages: [{ role: 'user', content: 123 }],
+        expectedMessage: 'messages[0].content',
+      },
+      {
+        name: 'content is an object',
+        messages: [{ role: 'user', content: { text: 'hi' } }],
+        expectedMessage: 'messages[0].content',
+      },
+      {
+        name: 'content is a boolean (streaming)',
+        messages: [{ role: 'user', content: true }],
+        expectedMessage: 'messages[0].content',
+        stream: true,
+      },
+      {
+        name: 'message is null',
+        messages: [null],
+        expectedMessage: 'messages[0]',
+      },
+      {
+        name: 'message is a string',
+        messages: ['hi'],
+        expectedMessage: 'messages[0]',
+      },
+      {
+        name: 'role is a number',
+        messages: [{ role: 42, content: 'hi' }],
+        expectedMessage: 'messages[0].role',
+      },
+      {
+        name: 'content part is not an object',
+        messages: [{ role: 'user', content: [123] }],
+        expectedMessage: 'messages[0].content[0]',
+      },
+      {
+        name: 'tool result content is a number',
+        messages: [
+          { role: 'user', content: 'hi' },
+          {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              { id: 'call_1', type: 'function', function: { name: 'f', arguments: '{}' } },
+            ],
+          },
+          { role: 'tool', tool_call_id: 'call_1', content: 5 },
+        ],
+        expectedMessage: 'messages[2].content',
+      },
+    ])('400 on malformed message shape: $name', async ({ messages, expectedMessage, stream }) => {
+      const res = await app.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'auto', messages, ...(stream ? { stream } : {}) }),
+        },
+        mockEnv
+      );
+      expect(res.status).toBe(400);
+      const data: { error: { type: string; param: string; message: string } } = await res.json();
+      expect(data.error.type).toBe('invalid_request_error');
+      expect(data.error.param).toBe('messages');
+      expect(data.error.message).toContain(expectedMessage);
+      // Rejected before any upstream work: no device, no conversation.
+      expect(mockClient.prepareCalls).toHaveLength(0);
     });
   });
 
