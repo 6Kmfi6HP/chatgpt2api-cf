@@ -398,7 +398,15 @@ describe('splitGenuiContainerTail', () => {
     { name: 'withholds a partial opener fragment at line end', text: '如下：\n:::writ', keep: '如下：\n', tail: ':::writ' },
     { name: 'withholds an opener whose attribute brace is unfinished', text: '正文\n:::writing{variant="doc', keep: '正文\n', tail: ':::writing{variant="doc' },
     { name: 'releases a fragment that closed its brace', text: '正文\n:::writing{variant="doc"}', keep: '正文\n:::writing{variant="doc"}', tail: '' },
-    { name: 'withholds a bare "::" prefix', text: '正文::', keep: '正文', tail: '::' },
+    // A colon run only opens a genui fence at the START of a line
+    // (GENUI_CONTAINER_OPEN is `^:::`), so a mid-line run is ordinary prose
+    // and must never be withheld — that deleted the reply's last character.
+    { name: 'releases a mid-line "::" run that ends real prose', text: '正文::', keep: '正文::', tail: '' },
+    { name: 'withholds a bare ":" that starts a line', text: '正文\n:', keep: '正文\n', tail: ':' },
+    { name: 'withholds a bare "::" that starts a line', text: '正文\n::', keep: '正文\n', tail: '::' },
+    { name: 'releases a colon that ends real prose mid-line', text: 'Key details:', keep: 'Key details:', tail: '' },
+    { name: 'releases a mid-line colon at the end of a URL', text: 'see http://a.b/c:', keep: 'see http://a.b/c:', tail: '' },
+    { name: 'releases a mid-line colon after a non-ASCII word', text: '普通一句话：', keep: '普通一句话：', tail: '' },
     { name: 'leaves plain prose untouched', text: '普通一句话：结尾', keep: '普通一句话：结尾', tail: '' },
     // no tail match — mid-word usage
     { name: 'keeps real prose that mentions "genui" mid-line', text: '请参阅 genui 节点说明', keep: '请参阅 genui 节点说明', tail: '' },

@@ -363,11 +363,16 @@ An orphan `role: "tool"` message whose `tool_call_id` does not match any precedi
 being answered with a 200 chat reply — a silently accepted orphan would feed the tool payload to
 the model as user intent and hide the client bug.
 
+A trailing colon is part of the reply text, not markup. Only a colon run at the START of a line can
+grow into a bare genui fence (`^:::`), so `Key details:` ends with its colon in both stream and
+non-stream responses; a line-initial `::` is still withheld until it either completes a fence or is
+dropped at flush.
+
 ---
 
 ## 🧪 Testing
 
-The test suite contains **319 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
+The test suite contains **333 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
 
 ```bash
 # Run Vitest test suite
