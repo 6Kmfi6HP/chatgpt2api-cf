@@ -21,6 +21,8 @@ export class ToolCallStreamDetector {
   private readonly maxBuffer: number;
   private flushed = false;
   private emitted = false;
+  /** Latest accumulated text, kept so finalize() can release a stuck buffer. */
+  private lastText = '';
 
   constructor(options?: { maxBuffer?: number }) {
     const mb = options?.maxBuffer;
@@ -29,6 +31,8 @@ export class ToolCallStreamDetector {
   }
 
   feed(accumulatedText: string): DetectorDecision {
+    this.lastText = accumulatedText;
+
     if (this.flushed || this.emitted) {
       return { decision: 'flush', text: '' };
     }
@@ -70,6 +74,24 @@ export class ToolCallStreamDetector {
     // Incomplete JSON: keep buffering while small enough.
     return { decision: 'buffer' };
   }
+
+  /**
+   * Terminal decision once no more snapshots can arrive.
+   *
+   * `feed` may only ever answer "buffer" for text it cannot resolve: a plain
+   * JSON reply that is not the tool-call convention ("{"answer": 42}") parses
+   * to null forever, and nothing else triggers a decision before the turn
+   * ends. Buffering is a withholding optimization for content that MIGHT turn
+   * into a tool call — it must never outlive the turn, or the whole reply is
+   * dropped from a 200 response. So the held text is released as content.
+   */
+  finalize(): DetectorDecision {
+    if (this.flushed || this.emitted) {
+      return { decision: 'flush', text: '' };
+    }
+    this.flushed = true;
+    return { decision: 'flush', text: this.lastText };
+  }
 }
 
 
@@ -105,12 +127,15 @@ export class ToolCallStreamState {
   public flushing = false;
   public lastEmittedLen = 0;
   private detector: ToolCallStreamDetector;
+  /** Latest cumulative snapshot, so finalize() can release what feed() held. */
+  private lastAccumulated = '';
 
   constructor(options?: { maxBuffer?: number }) {
     this.detector = new ToolCallStreamDetector(options);
   }
 
   feed(accumulated: string): StreamEmit[] {
+    this.lastAccumulated = accumulated;
     const decision = this.detector.feed(accumulated);
 
     if (decision.decision === 'buffer') {
@@ -118,21 +143,7 @@ export class ToolCallStreamState {
     }
 
     if (decision.decision === 'flush') {
-      this.flushing = true;
-      // After tool calls were emitted the accumulated text is the tool-call
-      // JSON itself — never leak it as content.
-      if (this.emittedToolCalls) {
-        this.lastEmittedLen = accumulated.length;
-        return [];
-      }
-      // Emit the delta between what we already sent and the full text.
-      const text = accumulated;
-      if (text.length > this.lastEmittedLen) {
-        const delta = text.slice(this.lastEmittedLen);
-        this.lastEmittedLen = text.length;
-        return [{ delta: { content: delta } }];
-      }
-      return [];
+      return this.emitContent(accumulated);
     }
 
     // emit_tool_calls
@@ -157,6 +168,35 @@ export class ToolCallStreamState {
       });
     });
     return out;
+  }
+
+  /**
+   * Terminal drain for the turn. `feed` withholds text that might still resolve
+   * into the tool-call convention; when the turn ends unresolved (a plain JSON
+   * reply such as `{"answer": 42}`) that withheld text is real assistant
+   * content and must be emitted, not discarded.
+   */
+  finalize(): StreamEmit[] {
+    const decision = this.detector.finalize();
+    if (decision.decision !== 'flush') return [];
+    return this.emitContent(this.lastAccumulated);
+  }
+
+  /** Emit the not-yet-sent suffix of `accumulated` as one content delta. */
+  private emitContent(accumulated: string): StreamEmit[] {
+    this.flushing = true;
+    // After tool calls were emitted the accumulated text is the tool-call
+    // JSON itself — never leak it as content.
+    if (this.emittedToolCalls) {
+      this.lastEmittedLen = accumulated.length;
+      return [];
+    }
+    if (accumulated.length > this.lastEmittedLen) {
+      const delta = accumulated.slice(this.lastEmittedLen);
+      this.lastEmittedLen = accumulated.length;
+      return [{ delta: { content: delta } }];
+    }
+    return [];
   }
 
   /** Finish reason for the gateway flush stage. */

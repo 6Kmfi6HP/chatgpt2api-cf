@@ -339,6 +339,12 @@ print(response.choices[0].message.content)  # "John Hartman works on the 7th flo
 
 Streaming emits `delta.tool_calls` frames and `finish_reason: "tool_calls"`.
 
+A plain JSON answer is content, not a tool call: when a request carries `tools` but the model
+replies with an ordinary JSON document (leading `{`, no `tool_calls`), the stream ends by
+flushing that held text as a `delta.content` frame. Tool-call detection withholds text only
+while it could still resolve into the tool-call convention; the turn-end drain guarantees a
+reply is never swallowed by that buffer.
+
 `tool_choice` handling:
 
 - `"none"` disables tool-calling entirely (no tool protocol is compiled into the request).
@@ -367,7 +373,7 @@ the model as user intent and hide the client bug.
 
 ## 🧪 Testing
 
-The test suite contains **319 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
+The test suite contains **332 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
 
 ```bash
 # Run Vitest test suite
