@@ -260,6 +260,28 @@ export class StreamProcessor {
    */
   flush(): ChatCompletionChunk[] {
     const out: ChatCompletionChunk[] = [];
+    // Tool-call detection may still be holding the whole reply: a plain JSON
+    // answer (leading "{", no tool_calls) never resolves as a tool call, so the
+    // detector buffers it for the entire turn. Release it here — the turn is
+    // over, so held text is content, not a pending tool call.
+    if (this.toolCallState) {
+      for (const e of this.toolCallState.finalize()) {
+        if (!e.delta?.content) continue;
+        if (!this.emittedRole) {
+          this.emittedRole = true;
+          out.push(
+            buildOpenAIChunk(this.messageId, this.created, this.model, {
+              role: 'assistant',
+            })
+          );
+        }
+        out.push(
+          buildOpenAIChunk(this.messageId, this.created, this.model, {
+            content: e.delta.content,
+          })
+        );
+      }
+    }
     if (this.withheld || this.withheldGenui) {
       const fragment = resolveWithheld(this.withheldGenui) + resolveWithheld(this.withheld);
       this.withheld = '';

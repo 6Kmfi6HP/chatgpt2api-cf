@@ -336,6 +336,11 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 
 流式模式会输出 `delta.tool_calls` 帧与 `finish_reason: "tool_calls"`。
 
+普通 JSON 回答属于正文、不是工具调用：请求带了 `tools` 但模型回复的是一份普通 JSON 文档
+（以 `{` 开头、没有 `tool_calls`）时，流式结束会把缓冲的这段文本作为 `delta.content` 帧下发。
+工具调用检测只在"仍可能解析成工具调用约定"期间扣留文本，turn 结束时的兜底 drain 保证回复
+不会因为这个缓冲而丢失。
+
 `tool_choice` 的处理规则：
 
 - `"none"`：完全禁用工具调用（请求中不会编译任何工具协议文案）。
@@ -382,7 +387,7 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 本项目包含完整的单元测试与端到端测试套件，涵盖协议转换、引用清洗、三阶段状态机、KV 轮换淘汰与流式差分：
 
 ```bash
-# 运行全部 333 项测试用例 (基于 Vitest)
+# 运行全部 332 项测试用例 (基于 Vitest)
 pnpm test
 
 # 严格 TypeScript 类型检查

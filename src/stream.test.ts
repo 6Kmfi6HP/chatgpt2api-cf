@@ -5,7 +5,7 @@ import {
   aggregateNonStream,
   aggregateNonStreamWithSignals,
  } from './stream';
-import type { ChatCompletionRequest } from './types';
+import type { ChatCompletionRequest, ChatCompletionChunk } from './types';
 import {
   PUA_ANNOTATION_START,
   PUA_ANNOTATION_SEP,
@@ -375,6 +375,74 @@ describe('StreamProcessor', () => {
     expect(finalChunks).toHaveLength(1);
     expect(finalChunks[0].choices[0].finish_reason).toBe('stop');
   });
+
+  // A tools request turns the tool-call detector on for every snapshot. The
+  // detector must buffer while the text could still resolve into the tool-call
+  // JSON convention — but a plain JSON reply (leading "{", no tool_calls) never
+  // resolves, and the old code never drained the buffer, so the whole reply was
+  // dropped while still answering 200 + finish_reason "stop".
+  describe('tools request whose reply is plain JSON text', () => {
+    const toolsReq = (): ChatCompletionRequest => ({
+      model: 'gpt-4o',
+      stream: true,
+      messages: [{ role: 'user', content: 'Reply with exactly {"answer": 42}' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'get_weather', description: 'Get weather', parameters: { type: 'object' } },
+        },
+      ],
+    });
+
+    const joinContent = (chunks: ChatCompletionChunk[]): string =>
+      chunks
+        .map((c) => c.choices?.[0]?.delta?.content ?? '')
+        .join('');
+
+    it('flushes a whole JSON object reply as content instead of dropping it', () => {
+      const sp = new StreamProcessor('gpt-4o', toolsReq());
+      sp.processEvent(mkAssistantEvent('{"answer": 42, "unit": "apple"}'));
+      const finalChunks = sp.flush();
+      expect(joinContent(finalChunks)).toBe('{"answer": 42, "unit": "apple"}');
+      expect(finalChunks.some((c) => c.choices[0]?.finish_reason === 'stop')).toBe(true);
+    });
+
+    it('flushes a JSON object that arrived in cumulative snapshots', () => {
+      const sp = new StreamProcessor('gpt-4o', toolsReq());
+      const first = sp.processEvent(mkAssistantEvent('{"answer"'));
+      expect(joinContent(first)).toBe('');
+      const second = sp.processEvent(mkAssistantEvent('{"answer": 42}'));
+      expect(joinContent(second)).toBe('');
+      expect(joinContent(sp.flush())).toBe('{"answer": 42}');
+    });
+
+    it('flushes a ```json fenced reply that parses as no tool call', () => {
+      const sp = new StreamProcessor('gpt-4o', toolsReq());
+      sp.processEvent(mkAssistantEvent('```json\n{"x":1}\n```'));
+      expect(joinContent(sp.flush())).toBe('```json\n{"x":1}\n```');
+    });
+
+    it('still converts a real tool-call reply and never leaks the JSON', () => {
+      const sp = new StreamProcessor('gpt-4o', toolsReq());
+      const chunks = sp.processEvent(
+        mkAssistantEvent('{"tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}')
+      );
+      expect(chunks.some((c) => c.choices?.[0]?.delta?.tool_calls)).toBe(true);
+      const tail = sp.flush();
+      expect(joinContent(tail)).toBe('');
+      expect(tail.some((c) => c.choices[0]?.finish_reason === 'tool_calls')).toBe(true);
+    });
+
+    it('does not duplicate text that already streamed once the detector flushed', () => {
+      const sp = new StreamProcessor('gpt-4o', toolsReq());
+      const first = sp.processEvent(mkAssistantEvent('Sure, here is the JSON: '));
+      // Plain prose flushes immediately; later snapshots keep streaming deltas.
+      expect(joinContent(first)).toBe('Sure, here is the JSON: ');
+      const second = sp.processEvent(mkAssistantEvent('Sure, here is the JSON: {"a":1}'));
+      expect(joinContent(second)).toBe('{"a":1}');
+      expect(joinContent(sp.flush())).toBe('');
+    });
+  });
 });
 
 describe('pipeOpenAIStream', () => {
@@ -392,6 +460,44 @@ describe('pipeOpenAIStream', () => {
     });
   }
 
+  it('streams a plain JSON reply as content when the request carries tools', async () => {
+    const ssePayloads = [
+      `data: ${JSON.stringify(mkAssistantEvent('{"answer": 42, "unit": "apple"}'))}\n\n`,
+      'data: [DONE]\n\n',
+    ];
+
+    const resp = createSseResponse(ssePayloads);
+    const written: string[] = [];
+    const writer = {
+      writeSSE: async (msg: { data: string }) => {
+        written.push(msg.data);
+      },
+    };
+
+    const toolsReq: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      stream: true,
+      messages: [{ role: 'user', content: 'Reply with exactly {"answer": 42}' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'get_weather', description: 'Get weather', parameters: { type: 'object' } },
+        },
+      ],
+    };
+    await pipeOpenAIStream(resp, writer, 'gpt-4o', toolsReq);
+
+    const content = written
+      .filter((d) => d !== '[DONE]')
+      .map((d) => JSON.parse(d) as ChatCompletionChunk)
+      .map((c) => c.choices?.[0]?.delta?.content ?? '')
+      .join('');
+    // Without the fix the whole reply is swallowed by the tool-call buffer.
+    expect(content).toBe('{"answer": 42, "unit": "apple"}');
+    const stopChunk = JSON.parse(written[written.length - 2]) as ChatCompletionChunk;
+    expect(stopChunk.choices[0].finish_reason).toBe('stop');
+  });
+
   it('pipes OpenAI chunks and writes [DONE] at stream end', async () => {
     const ssePayloads = [
       ': ping\n\n',
@@ -399,7 +505,6 @@ describe('pipeOpenAIStream', () => {
       `data: ${JSON.stringify(mkAssistantEvent('Hello world!'))}\n\n`,
       'data: [DONE]\n\n',
     ];
-
     const resp = createSseResponse(ssePayloads);
     const written: string[] = [];
     const writer = {

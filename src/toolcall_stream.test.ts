@@ -119,3 +119,55 @@ describe('ToolCallStreamState', () => {
     expect(chunks[0].delta!.tool_calls![0].function.name).toBe('get_weather');
   });
 });
+
+describe('ToolCallStreamDetector.finalize', () => {
+  it('releases a buffer that never resolved into a tool call', () => {
+    const d = new ToolCallStreamDetector();
+    expect(d.feed('{"answer": 42}').decision).toBe('buffer');
+    expect(d.finalize()).toEqual({ decision: 'flush', text: '{"answer": 42}' });
+  });
+
+  it('returns nothing after a tool call was emitted', () => {
+    const d = new ToolCallStreamDetector();
+    expect(d.feed(singleToolCall).decision).toBe('emit_tool_calls');
+    expect(d.finalize()).toEqual({ decision: 'flush', text: '' });
+  });
+
+  it('returns nothing after the detector already flushed plain text', () => {
+    const d = new ToolCallStreamDetector();
+    expect(d.feed('Hello there').decision).toBe('flush');
+    expect(d.finalize()).toEqual({ decision: 'flush', text: '' });
+  });
+
+  it('keeps only the latest snapshot when the buffer grew', () => {
+    const d = new ToolCallStreamDetector();
+    d.feed('{"a":');
+    d.feed('{"a": 1}');
+    expect(d.finalize().text).toBe('{"a": 1}');
+  });
+});
+
+describe('ToolCallStreamState.finalize', () => {
+  it('emits the withheld plain JSON reply as content', () => {
+    const st = new ToolCallStreamState();
+    expect(st.feed('{"answer": 42}')).toEqual([]);
+    const drained = st.finalize();
+    expect(drained).toEqual([{ delta: { content: '{"answer": 42}' } }]);
+    expect(st.finishReason()).toBe('stop');
+  });
+
+  it('has nothing left to drain after plain text already streamed', () => {
+    const st = new ToolCallStreamState();
+    st.feed('Plain prose answer');
+    st.feed('Plain prose answer, longer');
+    // Plain text flushes on the first snapshot; nothing is left withheld.
+    expect(st.finalize()).toEqual([]);
+  });
+
+  it('never leaks the tool-call JSON through finalize', () => {
+    const st = new ToolCallStreamState();
+    st.feed(singleToolCall);
+    expect(st.finalize()).toEqual([]);
+    expect(st.finishReason()).toBe('tool_calls');
+  });
+});
