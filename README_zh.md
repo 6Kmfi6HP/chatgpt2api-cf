@@ -346,6 +346,14 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 - `{"type": "function", "function": {"name": "X"}}`：同上，并且要求回复必须调用**该**工具 ——
   调用其它工具同样视为违约并触发重试。
 
+`parallel_tool_calls` 的处理规则（默认 `true`）：
+
+- `true` 或不传：返回解析出的全部工具调用（行为不变）。
+- `false`：调用方每轮只能执行一个调用，因此协议会要求模型只给一个调用，网关也只会保留一个 ——
+  命名 `tool_choice` 点名的那个优先，否则取第一个。流式只发一帧 `delta.tool_calls`（`index: 0`）；
+  非流式返回只含一个元素的 `tool_calls` 数组。两者都保持 `finish_reason: "tool_calls"`。
+- 非布尔值会返回 HTTP 400 `invalid_request_error`（`param: "parallel_tool_calls"`）。
+
 ### 5. 常见客户端配置（NextChat、Chatbox、Cursor、Cline 等）
 
 - **接口地址 (Base URL / API Host)**: `https://<your-worker>.workers.dev/v1`

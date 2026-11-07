@@ -6,8 +6,11 @@ import {
   buildToolResultMessage,
   toOpenAIToolCalls,
   stripGenuiMarkers,
+  selectSingleToolCall,
+  toolChoiceName,
   TOOL_CALL_REPLY_FORMAT,
   type ToolDefinition,
+  type ParsedToolCall,
 } from './toolcall';
 
 const weatherTool: ToolDefinition = {
@@ -342,5 +345,68 @@ describe('stripGenuiMarkers', () => {
 
   it('handles multiple fragments in one string', () => {
     expect(stripGenuiMarkers('\ue200a\ue201mid\ue200b\ue201end')).toBe('midend');
+  });
+});
+
+describe('selectSingleToolCall', () => {
+  const three: ParsedToolCall[] = [
+    { name: 'get_temp', arguments: '{"city":"Paris"}' },
+    { name: 'get_wind', arguments: '{"city":"Paris"}' },
+    { name: 'get_humidity', arguments: '{"city":"Paris"}' },
+  ];
+
+  it('keeps the first call when no tool is demanded', () => {
+    expect(selectSingleToolCall(three, null)).toEqual([three[0]]);
+  });
+
+  it('keeps the demanded call even when it is not first', () => {
+    expect(selectSingleToolCall(three, 'get_humidity')).toEqual([three[2]]);
+  });
+
+  it('falls back to the first call when the demanded name was not called', () => {
+    expect(selectSingleToolCall(three, 'ghost_tool')).toEqual([three[0]]);
+  });
+
+  it('returns zero and one-call arrays unchanged', () => {
+    expect(selectSingleToolCall([], 'get_temp')).toEqual([]);
+    expect(selectSingleToolCall([three[1]], null)).toEqual([three[1]]);
+  });
+});
+
+describe('toolChoiceName', () => {
+  it('reads the name from a named tool_choice', () => {
+    expect(toolChoiceName({ type: 'function', function: { name: 'get_temp' } })).toBe('get_temp');
+  });
+
+  it('returns null for the string choices and for malformed objects', () => {
+    expect(toolChoiceName('required')).toBeNull();
+    expect(toolChoiceName('auto')).toBeNull();
+    expect(toolChoiceName(undefined)).toBeNull();
+    expect(toolChoiceName({ function: { name: '' } })).toBeNull();
+    expect(toolChoiceName({ function: {} })).toBeNull();
+  });
+});
+
+describe('buildToolProtocolSystemMessage single-call directive', () => {
+  it('is absent by default and when singleCall is false', () => {
+    const plain = buildToolProtocolSystemMessage([weatherTool, searchTool]);
+    expect(plain).not.toContain('exactly ONE tool call');
+    expect(
+      buildToolProtocolSystemMessage([weatherTool, searchTool], undefined, { singleCall: false })
+    ).toBe(plain);
+  });
+
+  it('appends the one-call directive and keeps the tool list', () => {
+    const msg = buildToolProtocolSystemMessage([weatherTool, searchTool], undefined, { singleCall: true });
+    expect(msg).toContain('SINGLE TOOL CALL (this request):');
+    expect(msg).toContain('exactly ONE tool call');
+    expect(msg).toContain('- get_weather(');
+    expect(msg).toContain('- web_search(');
+  });
+
+  it('stacks with the mandatory clause under tool_choice "required"', () => {
+    const msg = buildToolProtocolSystemMessage([weatherTool], 'required', { singleCall: true });
+    expect(msg).toContain('You MUST reply with a tool call.');
+    expect(msg).toContain('exactly ONE tool call');
   });
 });

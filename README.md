@@ -350,6 +350,16 @@ Streaming emits `delta.tool_calls` frames and `finish_reason: "tool_calls"`.
 - `{"type": "function", "function": {"name": "X"}}` is the same, plus the reply must call **that**
   tool — calling a different tool counts as a violation and is retried.
 
+`parallel_tool_calls` handling (default `true`):
+
+- `true` or absent: every parsed call is returned, as before.
+- `false`: the caller can execute exactly one call per turn, so the protocol asks the model for a
+  single call and the gateway keeps only one from whatever comes back — the call named by a named
+  `tool_choice` when there is one, otherwise the first. Streaming emits one `delta.tool_calls` frame
+  with `index: 0`; non-streaming returns a one-entry `tool_calls` array. Both keep
+  `finish_reason: "tool_calls"`.
+- Non-boolean values are rejected with HTTP 400 `invalid_request_error` (`param: "parallel_tool_calls"`).
+
 ### 5. Third-Party Clients (NextChat, Chatbox, Cursor, etc.)
 
 - **Base URL / Endpoint**: `https://<your-worker>.workers.dev/v1`

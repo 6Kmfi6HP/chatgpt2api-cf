@@ -11,11 +11,12 @@
 import {
   buildToolProtocolSystemMessage,
   buildUpstreamMessages,
+  selectSingleToolCall,
   stripGenuiMarkers,
   toOpenAIToolCalls,
   tryParseToolCall,
 } from './toolcall';
-import type { GenericMessage, ToolDefinition, UpstreamMessage } from './toolcall';
+import type { GenericMessage, SingleCallOptions, ToolDefinition, UpstreamMessage } from './toolcall';
 import { buildAnonRequest } from './translate';
 
 /** OpenAI chat-completions request extended with the tool-calling fields. */
@@ -50,6 +51,13 @@ export interface WireToolCallRequest {
     parameters?: Record<string, any>;
   }>;
   tool_choice?: any;
+  /**
+   * OpenAI `parallel_tool_calls`. Default true (the model may return several
+   * calls). `false` means the caller executes exactly one call this turn: the
+   * protocol asks for one, and the gateway truncates any extra calls instead
+   * of handing the client work it cannot run.
+   */
+  parallel_tool_calls?: boolean;
 }
 
 /**
@@ -134,13 +142,18 @@ function toGenericMessages(messages: any[]): GenericMessage[] {
 /** Build the tool protocol system message as an upstream frame. */
 function toolProtocolFrame(
   tools: ToolDefinition[],
-  toolChoice?: WireToolCallRequest['tool_choice']
+  toolChoice?: WireToolCallRequest['tool_choice'],
+  parallelToolCalls?: boolean
 ): UpstreamMessage {
   return {
     author: { role: 'system' },
     content: {
       content_type: 'text',
-      parts: [buildToolProtocolSystemMessage(tools, toolChoice)],
+      parts: [
+        buildToolProtocolSystemMessage(tools, toolChoice, {
+          singleCall: parallelToolCalls === false,
+        }),
+      ],
     },
   };
 }
@@ -188,7 +201,7 @@ export function buildAnonRequestBodyWithTools(
   // is prepended (mirrors the handler's hasTools gate and StreamProcessor's
   // toolCallState gate).
   if (tools.length > 0 && req.tool_choice !== 'none') {
-    messages = [toolProtocolFrame(tools, req.tool_choice), ...messages];
+    messages = [toolProtocolFrame(tools, req.tool_choice, req.parallel_tool_calls), ...messages];
   }
 
   if (opts.messageContent && typeof opts.messageContent === 'object') {
@@ -218,7 +231,8 @@ export function isToolCallResponseText(text: string): boolean {
  * plain text.
  */
 export function buildToolCallsChatMessage(
-  text: string
+  text: string,
+  opts?: SingleCallOptions
 ): {
   role: 'assistant';
   content: string | null;
@@ -226,7 +240,8 @@ export function buildToolCallsChatMessage(
 } | null {
   const parsed = tryParseToolCall(stripGenuiMarkers(text));
   if (!parsed) return null;
-  return { role: 'assistant', content: null, tool_calls: toOpenAIToolCalls(parsed) };
+  const calls = opts?.singleCall ? selectSingleToolCall(parsed, opts.preferredName) : parsed;
+  return { role: 'assistant', content: null, tool_calls: toOpenAIToolCalls(calls) };
 }
 
 /** Extract the tool name from an upstream message frame (role=tool only). */

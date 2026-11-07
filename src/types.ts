@@ -100,6 +100,13 @@ export interface ChatCompletionRequest {
     | 'none'
     | 'required'
     | { type: 'function'; function: { name: string } };
+  /**
+   * OpenAI `parallel_tool_calls`. Default true. Set to `false` when the
+   * caller executes exactly one tool call per turn: the gateway asks the
+   * model for one call and truncates any extra calls it returns anyway, so
+   * the client never receives work it cannot run.
+   */
+  parallel_tool_calls?: boolean;
 }
 
 export interface ChatCompletionChoice {

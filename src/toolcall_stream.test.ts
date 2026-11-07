@@ -119,3 +119,44 @@ describe('ToolCallStreamState', () => {
     expect(chunks[0].delta!.tool_calls![0].function.name).toBe('get_weather');
   });
 });
+
+describe('ToolCallStreamState single-call mode', () => {
+  const threeCalls =
+    '{"tool_calls":[{"name":"a","arguments":{"x":1}},{"name":"b","arguments":{"y":2}},{"name":"c","arguments":{"z":3}}]}';
+
+  it('emits every call when singleCall is off (default)', () => {
+    const st = new ToolCallStreamState();
+    expect(st.feed(threeCalls).length).toBe(3);
+  });
+
+  it('emits exactly one delta in single-call mode', () => {
+    const st = new ToolCallStreamState({ singleCall: true });
+    const chunks = st.feed(threeCalls);
+    expect(chunks.length).toBe(1);
+    expect(chunks[0].delta!.tool_calls!.length).toBe(1);
+    expect(chunks[0].delta!.tool_calls![0].index).toBe(0);
+    expect(chunks[0].delta!.tool_calls![0].function.name).toBe('a');
+    expect(st.finishReason()).toBe('tool_calls');
+  });
+
+  it('keeps the preferred call in single-call mode', () => {
+    const st = new ToolCallStreamState({ singleCall: true, preferredName: 'c' });
+    const chunks = st.feed(threeCalls);
+    expect(chunks.length).toBe(1);
+    expect(chunks[0].delta!.tool_calls![0].function.name).toBe('c');
+    // Index stays 0: one call means one index on the wire.
+    expect(chunks[0].delta!.tool_calls![0].index).toBe(0);
+  });
+
+  it('falls back to the first call when the preferred name is absent', () => {
+    const st = new ToolCallStreamState({ singleCall: true, preferredName: 'ghost' });
+    expect(st.feed(threeCalls)[0].delta!.tool_calls![0].function.name).toBe('a');
+  });
+
+  it('leaves single-call replies untouched', () => {
+    const st = new ToolCallStreamState({ singleCall: true, preferredName: 'get_weather' });
+    const chunks = st.feed(singleToolCall);
+    expect(chunks.length).toBe(1);
+    expect(chunks[0].delta!.tool_calls![0].function.name).toBe('get_weather');
+  });
+});

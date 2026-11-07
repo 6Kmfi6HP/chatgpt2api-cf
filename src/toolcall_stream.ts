@@ -1,4 +1,4 @@
-import { tryParseToolCall, stripGenuiMarkers, type ParsedToolCall } from './toolcall';
+import { tryParseToolCall, stripGenuiMarkers, selectSingleToolCall, type ParsedToolCall } from './toolcall';
 
 /**
  * Streaming tool-call detection for the OpenAI-compatible gateway.
@@ -105,9 +105,13 @@ export class ToolCallStreamState {
   public flushing = false;
   public lastEmittedLen = 0;
   private detector: ToolCallStreamDetector;
+  private readonly singleCall: boolean;
+  private readonly preferredName: string | null;
 
-  constructor(options?: { maxBuffer?: number }) {
+  constructor(options?: { maxBuffer?: number; singleCall?: boolean; preferredName?: string | null }) {
     this.detector = new ToolCallStreamDetector(options);
+    this.singleCall = options?.singleCall === true;
+    this.preferredName = options?.preferredName ?? null;
   }
 
   feed(accumulated: string): StreamEmit[] {
@@ -141,7 +145,10 @@ export class ToolCallStreamState {
     const out: StreamEmit[] = [];
     // The accumulated text IS the tool-call JSON — never leak it as content.
     // (Any stray leading prose would have triggered 'flush' earlier.)
-    const calls = decision.toolCalls ?? [];
+    // parallel_tool_calls:false keeps one call; indexes restart at 0 so the
+    // client sees a single, contiguous call rather than a gap.
+    const parsed = decision.toolCalls ?? [];
+    const calls = this.singleCall ? selectSingleToolCall(parsed, this.preferredName) : parsed;
     calls.forEach((c, i) => {
       out.push({
         delta: {

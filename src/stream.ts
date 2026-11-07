@@ -16,6 +16,7 @@ import {
 } from './citations';
 import { ToolCallStreamState } from './toolcall_stream';
 import { buildToolCallsChatMessage } from './toolcall_wire';
+import { toolChoiceName } from './toolcall';
 import {
   buildOpenAIChunk,
   buildFinalChunk,
@@ -86,7 +87,10 @@ export class StreamProcessor {
     this.created = created || Math.floor(Date.now() / 1000);
     const anyReq = originalReq as any;
     if (anyReq && Array.isArray(anyReq.tools) && anyReq.tools.length > 0 && anyReq.tool_choice !== 'none') {
-      this.toolCallState = new ToolCallStreamState();
+      this.toolCallState = new ToolCallStreamState({
+        singleCall: originalReq?.parallel_tool_calls === false,
+        preferredName: toolChoiceName(originalReq?.tool_choice),
+      });
     }
   }
 
@@ -611,7 +615,10 @@ export async function aggregateNonStreamWithSignals(
   // Tool-call conversion: when the reply matches the tool-call convention,
   // return an assistant message carrying tool_calls (content=null) and
   // finish_reason "tool_calls".
-  const toolMsg = buildToolCallsChatMessage(finalText);
+  const toolMsg = buildToolCallsChatMessage(finalText, {
+    singleCall: originalReq?.parallel_tool_calls === false,
+    preferredName: toolChoiceName(originalReq?.tool_choice),
+  });
   if (toolMsg) {
     const result = {
       id: genID('chatcmpl-'),
