@@ -774,3 +774,87 @@ describe('aggregateNonStream', () => {
     expect(result.choices[0].finish_reason).toBe('stop');
   });
 });
+
+describe('reply text ending in a colon is preserved', () => {
+  function createSseResponse(events: string[]): Response {
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const ev of events) {
+          controller.enqueue(new TextEncoder().encode(ev));
+        }
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+  }
+
+  // A colon run only opens a genui fence at the start of a line, so a colon
+  // that ends ordinary prose must reach the client verbatim. Withholding it
+  // as a possible fence prefix deleted the reply's last character.
+  it.each([
+    { name: 'single colon', text: 'Summary:' },
+    { name: 'double colon', text: 'Example::' },
+    { name: 'colon after a URL', text: 'see http://a.b/c:' },
+    { name: 'colon in the middle of a reply, last line', text: 'Steps:\n1. one\n2. two\nKey details:' },
+    { name: 'CJK fullwidth colon', text: '普通一句话：' },
+  ])('streams "$name" verbatim', async ({ text }) => {
+    // Cumulative snapshots: the second one extends the first.
+    const resp = createSseResponse([
+      `data: ${JSON.stringify(mkAssistantEvent(text.slice(0, -1)))}\n\n`,
+      `data: ${JSON.stringify(mkAssistantEvent(text))}\n\n`,
+      'data: [DONE]\n\n',
+    ]);
+    const written: string[] = [];
+    const writer = {
+      writeSSE: async (msg: { data: string }) => {
+        written.push(msg.data);
+      },
+    };
+
+    await pipeOpenAIStream(resp, writer, 'gpt-4o');
+
+    const streamed = written
+      .filter((d) => d !== '[DONE]')
+      .map((d) => JSON.parse(d))
+      .flatMap((d) => d.choices ?? [])
+      .map((c: any) => c.delta?.content ?? '')
+      .join('');
+    expect(streamed).toBe(text);
+  });
+
+  it.each([
+    { name: 'single colon', text: 'Summary:' },
+    { name: 'double colon', text: 'Example::' },
+    { name: 'colon after a URL', text: 'see http://a.b/c:' },
+  ])('aggregates "$name" verbatim', async ({ text }) => {
+    const resp = createSseResponse([
+      `data: ${JSON.stringify(mkAssistantEvent(text.slice(0, -1)))}\n\n`,
+      `data: ${JSON.stringify(mkAssistantEvent(text))}\n\n`,
+      'data: [DONE]\n\n',
+    ]);
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'Reply with exactly that text' }],
+    };
+
+    const result = await aggregateNonStream(resp, 'gpt-4o', req);
+    expect(result.choices[0].message.content).toBe(text);
+  });
+
+  it('still withholds a colon run that starts a line and could become a fence', () => {
+    const sp = new StreamProcessor('gpt-4o');
+    const chunks = sp.processEvent(mkAssistantEvent('正文\n::'));
+    const streamed = chunks
+      .map((c) => (c.choices[0].delta as any)?.content ?? '')
+      .join('');
+    expect(streamed).toBe('正文\n');
+    // The fragment never grows into a fence, so flush resolves it to nothing.
+    const flushed = sp
+      .flush()
+      .map((c) => (c.choices[0].delta as any)?.content ?? '')
+      .join('');
+    expect(flushed).toBe('');
+  });
+});

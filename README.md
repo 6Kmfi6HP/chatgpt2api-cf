@@ -377,11 +377,16 @@ HTTP 400 `invalid_request_error` with `param: "messages"` and the offending path
 `Invalid parameter: messages[0].content must be a string, an array of content parts, or null.`
 The same applies to a body that is JSON `null` or a non-object value.
 
+A trailing colon is part of the reply text, not markup. Only a colon run at the START of a line can
+grow into a bare genui fence (`^:::`), so `Key details:` ends with its colon in both stream and
+non-stream responses; a line-initial `::` is still withheld until it either completes a fence or is
+dropped at flush.
+
 ---
 
 ## 🧪 Testing
 
-The test suite contains **328 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
+The test suite contains **333 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
 
 ```bash
 # Run Vitest test suite

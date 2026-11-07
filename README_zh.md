@@ -371,6 +371,10 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 `Invalid parameter: messages[0].content must be a string, an array of content parts, or null.`
 请求体本身是 JSON `null` 或非对象值时同样返回 400。
 
+回复末尾的冒号属于正文，不属于标记。只有**行首**的冒号串才可能长成裸 genui 围栏（`^:::`），
+因此 `Key details:` 在流式与非流式中都会保留末尾冒号；行首的 `::` 仍会被暂扣，直到它补全成
+围栏或在 flush 时被丢弃。
+
 ---
 
 ## 🧪 自动化测试与质量检验
@@ -378,7 +382,7 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 本项目包含完整的单元测试与端到端测试套件，涵盖协议转换、引用清洗、三阶段状态机、KV 轮换淘汰与流式差分：
 
 ```bash
-# 运行全部 328 项测试用例 (基于 Vitest)
+# 运行全部 333 项测试用例 (基于 Vitest)
 pnpm test
 
 # 严格 TypeScript 类型检查

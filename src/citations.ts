@@ -277,10 +277,13 @@ export function splitGenuiContainerTail(text: string): { keep: string; tail: str
     return { keep: text.slice(0, cut), tail: genuiTailMatch[1] };
   }
 
-  // No ":::" yet: a trailing ":" / "::" (wherever it starts on the line)
-  // may still grow into a fence. Withhold only that suffix.
+  // No ":::" yet: a trailing ":" / "::" may still grow into a fence, but ONLY
+  // at the start of a line — stripGenuiContainers recognises an opener as
+  // `^:::`, so a colon run that follows real prose can never become one.
+  // Withholding it anyway deleted the final character of ordinary replies
+  // ("Key details:" reached the client as "Key details").
   const trailing = lastLine.match(/(:{1,2})$/);
-  if (trailing) {
+  if (trailing && /^[ \t]*$/.test(lastLine.slice(0, lastLine.length - trailing[1].length))) {
     const cut = text.length - trailing[1].length;
     return { keep: text.slice(0, cut), tail: trailing[1] };
   }
