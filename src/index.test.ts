@@ -729,6 +729,72 @@ describe('Hono Application (src/index.ts)', () => {
       expect(bodyText).toContain('data: [DONE]');
     });
 
+    it('streaming retry preserves finish_reason length from the aggregated retry result', async () => {
+      const tool = {
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          description: 'Get weather',
+          parameters: {
+            type: 'object',
+            properties: { city: { type: 'string' } },
+            required: ['city'],
+          },
+        },
+      };
+      let callCount = 0;
+      mockClient.conversationHandler = async () => {
+        callCount++;
+        if (callCount === 1) {
+          // Attempt 1: refusal prose, no tool_call JSON.
+          return createSseResponse([
+            `data: ${JSON.stringify(
+              mkAssistantEvent("I'm unable to access the weather tool from here.")
+            )}\n\n`,
+          ]);
+        }
+        // Attempt 2: long plain prose; the aggregated retry cuts it at max_tokens.
+        return createSseResponse([
+          `data: ${JSON.stringify(mkAssistantEvent('a'.repeat(200)))}\n\n`,
+        ]);
+      };
+
+      const reqPayload = {
+        model: 'auto',
+        stream: true,
+        search: false,
+        tools: [tool],
+        // 6 tokens admits 27 ASCII chars (floor(27/4)=6): the refusal keeps
+        // its "unable to access" shape (still recognized, retried), while
+        // the 200-char retry text is capped at 27.
+        max_tokens: 6,
+        messages: [{ role: 'user', content: 'hi' }],
+      };
+
+      const res = await app.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        },
+        mockEnv
+      );
+
+      expect(res.status).toBe(200);
+      const bodyText = await res.text();
+      // Upstream consulted twice: refusal attempt + retried aggregate.
+      expect(callCount).toBe(2);
+      // The refusal prose itself never leaked into the stream.
+      expect(bodyText).not.toContain('unable to access');
+      // The retried aggregate was capped, and the synthesized stream must
+      // report the SAME binding constraint, not degrade it to "stop".
+      expect(bodyText).toContain('"finish_reason":"length"');
+      expect(bodyText).not.toContain('"finish_reason":"stop"');
+      expect(bodyText).not.toContain('a'.repeat(28));
+      expect(bodyText).toContain('data: [DONE]');
+    });
+
     it('streaming refusal retries are exhausted: the last refusal streams as-is', async () => {
       const tool = {
         type: 'function',
@@ -2067,5 +2133,83 @@ describe('parallel_tool_calls:false', () => {
     const data: any = await res.json();
     expect(data.error.type).toBe('invalid_request_error');
     expect(data.error.param).toBe('parallel_tool_calls');
+  });
+});
+
+describe('sampling parameters (max_tokens / stop)', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5-5', messages: [{ role: 'user', content: 'hi' }], ...payload }),
+      },
+      mockEnv
+    );
+  }
+
+
+  it('rejects max_tokens below 1 with 400', async () => {
+    const res = await post({ max_tokens: 0 });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; message: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('max_tokens');
+    expect(data.error.message).toContain('positive integer');
+  });
+
+  it('rejects a non-string stop with 400', async () => {
+    const res = await post({ stop: 123 });
+    expect(res.status).toBe(400);
+    const data: { error: { param: string } } = await res.json();
+    expect(data.error.param).toBe('stop');
+  });
+
+  it('rejects more than four stop sequences with 400', async () => {
+    const res = await post({ stop: ['a', 'b', 'c', 'd', 'e'] });
+    expect(res.status).toBe(400);
+  });
+
+  it('truncates a non-streaming reply at the stop sequence', async () => {
+    client.conversationHandler = async () =>
+      createSseResponse([
+        `data: ${JSON.stringify(mkAssistantEvent('Counting '))}\n\n`,
+        `data: ${JSON.stringify(mkAssistantEvent('Counting 1, 2, 3 STOP after'))}\n\n`,
+      ]);
+
+    const res = await post({ stream: false, stop: 'STOP' });
+    expect(res.status).toBe(200);
+    const data: {
+      choices: Array<{ message: { content: string }; finish_reason: string }>;
+    } = await res.json();
+    expect(data.choices[0].message.content).toBe('Counting 1, 2, 3 ');
+    expect(data.choices[0].finish_reason).toBe('stop');
+  });
+
+  it('caps a streaming reply at max_tokens with finish_reason length', async () => {
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('a'.repeat(200)))}\n\n`]);
+
+    const res = await post({ stream: true, max_tokens: 3 });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('"finish_reason":"length"');
+    expect(body).toContain('data: [DONE]');
   });
 });

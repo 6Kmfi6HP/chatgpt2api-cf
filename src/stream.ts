@@ -17,6 +17,7 @@ import {
 import { ToolCallStreamState } from './toolcall_stream';
 import { buildToolCallsChatMessage } from './toolcall_wire';
 import { toolChoiceName } from './toolcall';
+import { SamplingLimiter, resolveSampling, stopPrefixSuffix } from './sampling';
 import {
   buildOpenAIChunk,
   buildFinalChunk,
@@ -56,6 +57,16 @@ export class StreamProcessor {
   public withheld = '';
   /** Bare genui fence fragment withheld from emission (may still grow). */
   public withheldGenui = '';
+  /**
+   * Trailing fragment that could still complete into a stop sequence. Emitted
+   * by flush() when the reply ends before the sequence completes.
+   */
+  public withheldStop = '';
+  /**
+   * Stop-sequence / completion-token cap enforcement. Upstream honours
+   * neither, so the gateway cuts the text it replays (see src/sampling.ts).
+   */
+  readonly sampling: SamplingLimiter;
   public toolCallState?: ToolCallStreamState;
   /**
    * Message id of the live assistant reply being streamed. Upstream
@@ -85,6 +96,7 @@ export class StreamProcessor {
     this.originalReq = originalReq;
     this.messageId = messageId || genID('chatcmpl-');
     this.created = created || Math.floor(Date.now() / 1000);
+    this.sampling = new SamplingLimiter(resolveSampling(originalReq));
     const anyReq = originalReq as any;
     if (anyReq && Array.isArray(anyReq.tools) && anyReq.tools.length > 0 && anyReq.tool_choice !== 'none') {
       this.toolCallState = new ToolCallStreamState({
@@ -143,6 +155,10 @@ export class StreamProcessor {
       this.prevText = '';
       this.withheld = '';
       this.withheldGenui = '';
+      this.withheldStop = '';
+      // A latched cut belonged to the previous live message; slicing the new
+      // reply at the old position would drop its start and misreport finish.
+      this.sampling.reset();
     }
 
     // The live message reached its terminal frame: the turn is over, so no
@@ -177,12 +193,28 @@ export class StreamProcessor {
     // are stripped AFTER citations so a link inside a container survives,
     // while its fence lines are removed.
     const stripped = stripGenuiContainers(formatted);
-    const { keep: citationClean, tail } = splitCitationTail(stripped);
+    // Enforce stop sequences and the completion-token cap on the full cleaned
+    // text, before it is split into emittable text and withheld fragments: a
+    // stop sequence must not survive inside a buffered tail and then leak.
+    const limited = this.sampling.limit(stripped);
+    const { keep: citationClean, tail } = splitCitationTail(limited);
     // A bare ":::" fence fragment at the very end may still grow into a full
     // opener/closer line on the next snapshot; withhold it like a citation
     // fragment so partial marker text never reaches the client.
-    const { keep: fullClean, tail: genuiTail } = splitGenuiContainerTail(citationClean);
+    const { keep: genuiKeep, tail: genuiTail } = splitGenuiContainerTail(citationClean);
+    // A trailing fragment that is only a prefix of a stop sequence could still
+    // become one on the next snapshot; hold it back (flush releases it if the
+    // reply ends first). No hold once a limit already ended the reply.
+    const stopHold =
+      this.sampling.limitFinish() === null
+        ? stopPrefixSuffix(genuiKeep, this.sampling.stops)
+        : '';
+    const fullClean = stopHold
+      ? genuiKeep.slice(0, genuiKeep.length - stopHold.length)
+      : genuiKeep;
+    this.withheldStop = stopHold;
     this.withheldGenui = genuiTail;
+    this.withheld = tail;
     this.lastFullText = fullClean;
 
     // Tool-call stream detection: when enabled, the detector may decide to
@@ -220,6 +252,29 @@ export class StreamProcessor {
           );
         }
       }
+      // A fired limit ends the reply while the detector may still be buffering
+      // text that could have become a tool-call JSON. Upstream will send no
+      // further snapshots to flush it, so release it as content now rather
+      // than losing the whole reply.
+      if (this.sampling.limitFinish() !== null && !this.toolCallState.emittedToolCalls) {
+        const pending = fullClean.slice(this.toolCallState.lastEmittedLen);
+        if (pending) {
+          if (!this.emittedRole) {
+            this.emittedRole = true;
+            out.push(
+              buildOpenAIChunk(this.messageId, this.created, this.model, {
+                role: 'assistant',
+              })
+            );
+          }
+          out.push(
+            buildOpenAIChunk(this.messageId, this.created, this.model, {
+              content: pending,
+            })
+          );
+          this.toolCallState.lastEmittedLen = fullClean.length;
+        }
+      }
       this.prevText = fullClean;
       return out;
     }
@@ -229,7 +284,6 @@ export class StreamProcessor {
       delta = fullClean.slice(this.prevText.length);
     }
     this.prevText = fullClean;
-    this.withheld = tail;
 
     const out: ChatCompletionChunk[] = [];
     if (!this.emittedRole) {
@@ -257,8 +311,9 @@ export class StreamProcessor {
 
   /**
    * Flushes stream tail and emits terminal chunks:
-   * 1. Any resolved withheld citation fragment (if any)
-   * 2. Final chunk with finish_reason ("stop"/"tool_calls"), never carrying usage
+   * 1. Any resolved withheld citation fragment and the held stop-prefix (if any)
+   * 2. Final chunk with finish_reason ("stop"/"length"/"tool_calls"), never
+   *    carrying usage
    * 3. When stream_options.include_usage was requested: exactly one usage chunk
    *    (choices: []) — the only usage-bearing frame of the stream
    */
@@ -286,10 +341,20 @@ export class StreamProcessor {
         );
       }
     }
-    if (this.withheld || this.withheldGenui) {
-      const fragment = resolveWithheld(this.withheldGenui) + resolveWithheld(this.withheld);
+    const emittedToolCalls = this.toolCallState?.emittedToolCalls === true;
+    if (this.withheld || this.withheldGenui || this.withheldStop) {
+      // After tool calls the accumulated text is the call JSON; a withheld
+      // text fragment would leak it as content.
+      const fragment = emittedToolCalls
+        ? ''
+        : // Source order: the held stop-prefix sat at the end of genuiKeep,
+          // BEFORE the genui and citation tails — reassemble it that way.
+          this.withheldStop +
+          resolveWithheld(this.withheldGenui) +
+          resolveWithheld(this.withheld);
       this.withheld = '';
       this.withheldGenui = '';
+      this.withheldStop = '';
       if (fragment) {
         if (!this.emittedRole) {
           this.emittedRole = true;
@@ -319,7 +384,7 @@ export class StreamProcessor {
         this.messageId,
         this.created,
         this.model,
-        this.toolCallState ? this.toolCallState.finishReason() : 'stop'
+        emittedToolCalls ? 'tool_calls' : this.sampling.limitFinish() ?? 'stop'
       )
     );
 
@@ -626,8 +691,13 @@ export async function aggregateNonStreamWithSignals(
     }
   }
 
-  const finalText =
-    emitted + resolveWithheld(withheldGenui) + resolveWithheld(withheld);
+  // Stop sequences and the completion-token cap are enforced on the assembled
+  // reply: upstream honours neither parameter, so the gateway cuts the text and
+  // reports the matching finish_reason.
+  const limiter = new SamplingLimiter(resolveSampling(originalReq));
+  const finalText = limiter.limit(
+    emitted + resolveWithheld(withheldGenui) + resolveWithheld(withheld)
+  );
   const promptText = originalReq.messages
     ? flattenMessages(originalReq.messages)
     : '';
@@ -669,7 +739,8 @@ export async function aggregateNonStreamWithSignals(
     model,
     finalText,
     promptTokens,
-    completionTokens
+    completionTokens,
+    limiter.limitFinish() ?? 'stop'
   );
   return { result, usedWebSearch };
 }
