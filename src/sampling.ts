@@ -162,25 +162,35 @@ export class SamplingLimiter {
 
   constructor(private readonly limits: SamplingLimits) {}
 
-  /** Truncate the cumulative reply text to the latched cut, if any. */
+  /**
+   * Truncate the cumulative reply text to the latched cut, if any.
+   *
+   * Whichever bound comes FIRST wins: a stop sequence that occurs after the
+   * cap position must not rescue text the token budget already disallowed.
+   * Cut at min(stop position, cap prefix) and report the finish reason of
+   * the binding constraint (stop and cap meeting at the same position count
+   * as a stop — the sequence was generated, the budget merely ran out).
+   */
   limit(text: string): string {
     if (this.cutAt !== Infinity) return text.slice(0, this.cutAt);
 
     const stopAt = this.stopIndex(text);
-    if (stopAt >= 0) {
+    const cap = this.limits.maxTokens;
+    let capAt = -1;
+    if (cap !== null) {
+      const len = tokenBudgetPrefixLength(text, cap);
+      if (len < text.length) capAt = len;
+    }
+
+    if (stopAt >= 0 && (capAt < 0 || stopAt <= capAt)) {
       this.cutAt = stopAt;
       this.finish = 'stop';
       return text.slice(0, stopAt);
     }
-
-    const cap = this.limits.maxTokens;
-    if (cap !== null) {
-      const len = tokenBudgetPrefixLength(text, cap);
-      if (len < text.length) {
-        this.cutAt = len;
-        this.finish = 'length';
-        return text.slice(0, len);
-      }
+    if (capAt >= 0) {
+      this.cutAt = capAt;
+      this.finish = 'length';
+      return text.slice(0, capAt);
     }
     return text;
   }
@@ -188,6 +198,22 @@ export class SamplingLimiter {
   /** Finish reason forced by a fired limit, or null while the reply is live. */
   limitFinish(): 'stop' | 'length' | null {
     return this.finish;
+  }
+
+  /** Forget a latched cut: a new live message starts a fresh reply. */
+  reset(): void {
+    this.cutAt = Infinity;
+    this.finish = null;
+  }
+
+  /**
+   * Adopt a finish reason computed elsewhere (an aggregated non-stream
+   * result replayed as a stream): the text arrives already truncated, so
+   * this limiter's own scan cannot see that the cap fired. cutAt stays
+   * untouched — nothing further needs cutting.
+   */
+  latchFinish(reason: 'stop' | 'length'): void {
+    this.finish = reason;
   }
 
   get stops(): string[] {

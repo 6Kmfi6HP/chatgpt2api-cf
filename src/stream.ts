@@ -152,6 +152,9 @@ export class StreamProcessor {
       this.withheld = '';
       this.withheldGenui = '';
       this.withheldStop = '';
+      // A latched cut belonged to the previous live message; slicing the new
+      // reply at the old position would drop its start and misreport finish.
+      this.sampling.reset();
     }
 
     // The live message reached its terminal frame: the turn is over, so no
@@ -318,10 +321,11 @@ export class StreamProcessor {
       // text fragment would leak it as content.
       const fragment = emittedToolCalls
         ? ''
-        : resolveWithheld(this.withheldGenui) +
-          resolveWithheld(this.withheld) +
-          // The held stop-prefix never completed, so it is real content.
-          this.withheldStop;
+        : // Source order: the held stop-prefix sat at the end of genuiKeep,
+          // BEFORE the genui and citation tails — reassemble it that way.
+          this.withheldStop +
+          resolveWithheld(this.withheldGenui) +
+          resolveWithheld(this.withheld);
       this.withheld = '';
       this.withheldGenui = '';
       this.withheldStop = '';

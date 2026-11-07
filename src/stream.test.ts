@@ -375,6 +375,40 @@ describe('StreamProcessor', () => {
     expect(finalChunks).toHaveLength(1);
     expect(finalChunks[0].choices[0].finish_reason).toBe('stop');
   });
+
+  it('flushes the held stop-prefix before the citation and genui tails', () => {
+    const sp = new StreamProcessor('gpt-4o');
+    sp.withheldStop = 'ST';
+    sp.withheldGenui = 'GEN';
+    sp.withheld = ' tur';
+    const flushed = sp.flush();
+    const content = flushed.map((c) => c.choices[0].delta.content ?? '').join('');
+    // Source order: the stop-prefix sat before the genui and citation tails.
+    expect(content).toBe('STGEN tur');
+  });
+
+  it('clears a latched sampling cut when a new live message starts', () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 3,
+    };
+    const sp = new StreamProcessor('gpt-4o', req);
+    const first = sp.processEvent(mkAssistantEvent('a'.repeat(100)));
+    expect(first.map((c) => c.choices[0].delta.content ?? '').join('')).toBe('a'.repeat(15));
+
+    // A NEW live message id: the previous message's cut must not bind here.
+    const ev = mkAssistantEvent('b'.repeat(4));
+    ev.message.id = 'msg-live-2';
+    const second = sp.processEvent(ev);
+    expect(second.map((c) => c.choices[0].delta.content ?? '').join('')).toBe('bbbb');
+
+    // The new reply fits the budget, so the stale "length" must be gone.
+    const flushed = sp.flush();
+    expect(flushed.map((c) => c.choices[0].finish_reason).filter((r) => r !== null)).toEqual([
+      'stop',
+    ]);
+  });
 });
 
 describe('pipeOpenAIStream', () => {

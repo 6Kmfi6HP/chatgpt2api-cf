@@ -563,6 +563,72 @@ describe('Hono Application (src/index.ts)', () => {
       expect(bodyText).toContain('data: [DONE]');
     });
 
+    it('streaming retry preserves finish_reason length from the aggregated retry result', async () => {
+      const tool = {
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          description: 'Get weather',
+          parameters: {
+            type: 'object',
+            properties: { city: { type: 'string' } },
+            required: ['city'],
+          },
+        },
+      };
+      let callCount = 0;
+      mockClient.conversationHandler = async () => {
+        callCount++;
+        if (callCount === 1) {
+          // Attempt 1: refusal prose, no tool_call JSON.
+          return createSseResponse([
+            `data: ${JSON.stringify(
+              mkAssistantEvent("I'm unable to access the weather tool from here.")
+            )}\n\n`,
+          ]);
+        }
+        // Attempt 2: long plain prose; the aggregated retry cuts it at max_tokens.
+        return createSseResponse([
+          `data: ${JSON.stringify(mkAssistantEvent('a'.repeat(200)))}\n\n`,
+        ]);
+      };
+
+      const reqPayload = {
+        model: 'auto',
+        stream: true,
+        search: false,
+        tools: [tool],
+        // 6 tokens admits 27 ASCII chars (floor(27/4)=6): the refusal keeps
+        // its "unable to access" shape (still recognized, retried), while
+        // the 200-char retry text is capped at 27.
+        max_tokens: 6,
+        messages: [{ role: 'user', content: 'hi' }],
+      };
+
+      const res = await app.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        },
+        mockEnv
+      );
+
+      expect(res.status).toBe(200);
+      const bodyText = await res.text();
+      // Upstream consulted twice: refusal attempt + retried aggregate.
+      expect(callCount).toBe(2);
+      // The refusal prose itself never leaked into the stream.
+      expect(bodyText).not.toContain('unable to access');
+      // The retried aggregate was capped, and the synthesized stream must
+      // report the SAME binding constraint, not degrade it to "stop".
+      expect(bodyText).toContain('"finish_reason":"length"');
+      expect(bodyText).not.toContain('"finish_reason":"stop"');
+      expect(bodyText).not.toContain('a'.repeat(28));
+      expect(bodyText).toContain('data: [DONE]');
+    });
+
     it('streaming refusal retries are exhausted: the last refusal streams as-is', async () => {
       const tool = {
         type: 'function',

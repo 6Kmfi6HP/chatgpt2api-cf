@@ -463,6 +463,12 @@ async function emitAggregatedAsStream(
       await emitSSE(writer, chunk);
     }
   }
+  // The aggregated result was already truncated by its own limiter, so the
+  // fresh processor re-scanning the pre-cut text cannot see that the cap
+  // fired — its flush would degrade finish_reason "length" to "stop".
+  if (result.choices?.[0]?.finish_reason === 'length') {
+    sp.sampling.latchFinish('length');
+  }
   for (const chunk of sp.flush()) {
     await emitSSE(writer, chunk);
   }

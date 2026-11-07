@@ -137,4 +137,35 @@ describe('SamplingLimiter', () => {
     expect(limiter.limit('abX' + 'c'.repeat(100))).toBe('ab');
     expect(limiter.limitFinish()).toBe('stop');
   });
+
+  it('cuts at the cap even when a stop sequence occurs after the cap position', () => {
+    // max_tokens 1 admits 7 ASCII chars (floor(7/4)=1); the stop at offset
+    // 100 must not rescue the 93 chars the budget already disallowed.
+    const limiter = new SamplingLimiter({ stops: ['X'], maxTokens: 1 });
+    expect(limiter.limit('a'.repeat(100) + 'X tail')).toBe('a'.repeat(7));
+    expect(limiter.limitFinish()).toBe('length');
+  });
+
+  it('counts a stop and cap meeting at the same position as a stop', () => {
+    const limiter = new SamplingLimiter({ stops: ['X'], maxTokens: 3 });
+    expect(limiter.limit('a'.repeat(15) + 'X rest')).toBe('a'.repeat(15));
+    expect(limiter.limitFinish()).toBe('stop');
+  });
+
+  it('reset() forgets a latched cut for the next live message', () => {
+    const limiter = new SamplingLimiter({ stops: [], maxTokens: 3 });
+    expect(limiter.limit('a'.repeat(100))).toBe('a'.repeat(15));
+    expect(limiter.limitFinish()).toBe('length');
+    limiter.reset();
+    expect(limiter.limitFinish()).toBeNull();
+    expect(limiter.limit('short text')).toBe('short text');
+  });
+
+  it('latchFinish() adopts a finish reason without latching a cut', () => {
+    const limiter = new SamplingLimiter({ stops: [], maxTokens: null });
+    limiter.latchFinish('length');
+    expect(limiter.limitFinish()).toBe('length');
+    // No cut was latched: the text passes through untouched.
+    expect(limiter.limit('already truncated')).toBe('already truncated');
+  });
 });
