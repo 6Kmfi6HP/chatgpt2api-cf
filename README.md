@@ -381,7 +381,7 @@ pnpm exec tsc --noEmit
 
 ## 📋 Honest Limitations
 
-- **Model Pass-through**: No name mapping or validation. A missing/empty `model` becomes `"auto"`; any other slug — including slugs the anonymous catalog does not contain, e.g. `gpt-4o` — is forwarded upstream verbatim and echoed back verbatim in the response `model` field. Read `GET /v1/models` for the real catalog.
+- **Model Pass-through**: No name mapping. `model` is required: a missing, blank or non-string value is rejected with `400 invalid_request_error` (`param: "model"`) before any upstream call. Any supplied slug — including slugs the anonymous catalog does not contain, e.g. `gpt-4o` — is forwarded upstream verbatim and echoed back verbatim in the response `model` field. Read `GET /v1/models` for the real catalog.
 - **Web Search ON by default**: requests send `forceUseSearch: true`; reply citations are auto-formatted as Markdown links. Per-request opt-out: `"search": false`.
 - **Sampling Knobs**: Knobs like `temperature`, `top_p`, `seed` are accepted for client compatibility, but ignored by upstream.
 - **Multimodal**: Image parts are supported (re-uploaded to the anonymous file pipeline, ~10 uploads/day per pooled device, pooled automatically). Audio and other attachment types are stripped. Image upload throttling upstream is per-device; the device pool rotates on 429 automatically.

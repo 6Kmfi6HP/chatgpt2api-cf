@@ -847,8 +847,26 @@ export function createApp(options?: AppOptions) {
       }
     }
 
+    // `model` is required by the OpenAI contract. Rewriting a missing/blank
+    // value to "auto" hides a request-assembly bug on the client (for example a
+    // model nested inside metadata), and "auto" is not necessarily in
+    // /v1/models. Reject before any upstream work starts.
+    if (typeof req.model !== 'string' || req.model.trim() === '') {
+      return c.json(
+        {
+          error: {
+            message: 'you must provide a model parameter',
+            type: 'invalid_request_error',
+            param: 'model',
+            code: null,
+          },
+        },
+        400
+      );
+    }
+
     // No name mapping: the requested model slug is passed through verbatim.
-    const model = (typeof req.model === 'string' && req.model.trim()) || 'auto';
+    const model = req.model;
     const prompt = flattenMessages(req.messages);
 
     // Collect image references (order preserved). With tools enabled only
