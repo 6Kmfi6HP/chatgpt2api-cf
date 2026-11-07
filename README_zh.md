@@ -364,6 +364,13 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 网关会直接返回 HTTP 400 `invalid_request_error`（与 OpenAI 行为一致），而不是给它一个 200 的
 普通聊天回复 —— 静默接受这种孤立消息会把工具结果当作用户意图喂给模型，从而掩盖客户端的 bug。
 
+每条消息的形态都会在发起任何上游请求之前校验，畸形请求体不会再流到 DTO 构造层（那里会读取
+`message.role` 并遍历 `content`）。消息不是对象、`role` 不是字符串、或 `content` 既不是字符串、
+也不是内容片段数组、也不是 `null`，一律返回 HTTP 400 `invalid_request_error`（`param: "messages"`）
+并指出出错路径，例如
+`Invalid parameter: messages[0].content must be a string, an array of content parts, or null.`
+请求体本身是 JSON `null` 或非对象值时同样返回 400。
+
 ---
 
 ## 🧪 自动化测试与质量检验
@@ -371,7 +378,7 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 本项目包含完整的单元测试与端到端测试套件，涵盖协议转换、引用清洗、三阶段状态机、KV 轮换淘汰与流式差分：
 
 ```bash
-# 运行全部 319 项测试用例 (基于 Vitest)
+# 运行全部 328 项测试用例 (基于 Vitest)
 pnpm test
 
 # 严格 TypeScript 类型检查
