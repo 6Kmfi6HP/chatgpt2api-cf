@@ -96,10 +96,12 @@ export function mustAnswerFromToolResult(req: ChatCompletionRequest): boolean {
 /**
  * True when a completion breaks the request's tool contract: the model neither
  * called a tool nor produced an acceptable plain answer. A refusal-looking
- * reply always qualifies; under a mandatory tool_choice any tool-less reply
- * qualifies, even fluent prose — and a named tool_choice additionally requires
- * the model to have called THAT tool. A plain answer that ran its own web
- * search instead of using the supplied tool result qualifies too.
+ * reply always qualifies; so does a reply with no visible text at all, which
+ * is what upstream returns when its own web search yields nothing. Under a
+ * mandatory tool_choice any tool-less reply qualifies, even fluent prose — and
+ * a named tool_choice additionally requires the model to have called THAT
+ * tool. A plain answer that ran its own web search instead of using the
+ * supplied tool result qualifies too.
  */
 export function violatesToolContract(
   req: ChatCompletionRequest,
@@ -116,7 +118,14 @@ export function violatesToolContract(
     if (demanded && !calls.some((c) => c.function?.name === demanded)) return true;
     return false;
   }
-  if (looksLikeRefusal(choice.message?.content ?? '')) return true;
+  const content = choice.message?.content ?? '';
+  // An empty reply is not an answer. Upstream closes the turn with no text
+  // when its own web search comes back with zero results, and the caller
+  // cannot tell that apart from a deliberate empty answer — an agent loop
+  // simply ends with no output and no error. Retrying on a fresh device is
+  // the only recovery; the retry budget stays bounded as before.
+  if (content.trim() === '') return true;
+  if (looksLikeRefusal(content)) return true;
   if (usedWebSearch && mustAnswerFromToolResult(req)) return true;
   return requiresToolCall(req);
 }

@@ -1239,6 +1239,105 @@ describe('Tool results vs upstream web search', () => {
   });
 });
 
+describe('Empty replies on tool requests', () => {
+  const weatherTool = {
+    type: 'function',
+    function: { name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } },
+  };
+
+  // The observed failure: the model ran its own web search, the search
+  // returned no results, and upstream closed the turn with an empty text
+  // part. Nothing about that frame is an error, so the gateway used to
+  // forward it verbatim as an empty assistant message.
+  const emptyAnswer = () =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        message: {
+          id: 'm-empty',
+          author: { role: 'assistant', metadata: { real_author: 'tool:web' } },
+          content: { content_type: 'text', parts: [''] },
+          status: 'finished_successfully',
+          end_turn: true,
+          metadata: {
+            finish_details: { type: 'stop' },
+            is_complete: true,
+            search_result_groups: [],
+            message_type: 'next',
+          },
+          channel: 'final',
+        },
+      })}\n\n`,
+    ]);
+  const toolCallReply = () =>
+    createSseResponse([
+      `data: ${JSON.stringify(
+        mkAssistantEvent('{"tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}')
+      )}\n\n`,
+    ]);
+
+  function setup(handler: (call: number) => Response) {
+    const client = new MockUpstreamClient();
+    const testApp = createApp({ client, deviceManager: new DeviceManager() });
+    const env = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    let calls = 0;
+    client.conversationHandler = async () => handler(++calls);
+    const post = (payload: object) =>
+      testApp.request('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }, env);
+    return { post, calls: () => calls };
+  }
+
+  it('retries a non-stream tools request that returned neither content nor tool_calls', async () => {
+    const t = setup((n) => (n === 1 ? emptyAnswer() : toolCallReply()));
+    const res = await t.post({
+      model: 'auto', stream: false, tools: [weatherTool],
+      messages: [{ role: 'user', content: 'What is the weather in Paris?' }],
+    });
+    const data: any = await res.json();
+    expect(t.calls()).toBe(2);
+    expect(data.choices[0].finish_reason).toBe('tool_calls');
+    expect(data.choices[0].message.tool_calls?.[0].function.name).toBe('get_weather');
+  });
+
+  it('retries a streaming tools request that returned neither content nor tool_calls', async () => {
+    const t = setup((n) => (n === 1 ? emptyAnswer() : toolCallReply()));
+    const res = await t.post({
+      model: 'auto', stream: true, tools: [weatherTool],
+      messages: [{ role: 'user', content: 'What is the weather in Paris?' }],
+    });
+    const body = await res.text();
+    expect(t.calls()).toBe(2);
+    expect(body).toContain('get_weather');
+    expect(body).toContain('"tool_calls"');
+  });
+
+  it('gives up after the bounded retry budget when every attempt is empty', async () => {
+    const t = setup(() => emptyAnswer());
+    const res = await t.post({
+      model: 'auto', stream: false, tools: [weatherTool],
+      messages: [{ role: 'user', content: 'What is the weather in Paris?' }],
+    });
+    const data: any = await res.json();
+    // One initial attempt plus the 4 bounded retries in retryToolTurn.
+    expect(t.calls()).toBe(5);
+    expect(res.status).toBe(200);
+    expect(data.choices[0].message.content).toBe('');
+  });
+
+  it('does not retry an empty reply when the request carries no tools', async () => {
+    const t = setup(() => emptyAnswer());
+    const res = await t.post({
+      model: 'auto', stream: false, messages: [{ role: 'user', content: 'hi' }],
+    });
+    const data: any = await res.json();
+    expect(t.calls()).toBe(1);
+    expect(data.choices[0].message.content).toBe('');
+  });
+});
+
 describe('Streaming incrementality with tools (typing effect)', () => {
   it('streams tool-request prose incrementally instead of one buffered burst', async () => {
     const client = new MockUpstreamClient();
