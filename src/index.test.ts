@@ -1973,3 +1973,99 @@ describe('Transport behavior (heartbeat / keepalive)', () => {
     expect(parsed.choices[0].message.content).toBe('Slow final answer.');
   });
 });
+
+describe('parallel_tool_calls:false', () => {
+  const threeCalls =
+    '{"tool_calls":[{"name":"get_temp","arguments":{"city":"Paris"}},{"name":"get_wind","arguments":{"city":"Paris"}},{"name":"get_humidity","arguments":{"city":"Paris"}}]}';
+  const tools = [
+    { type: 'function' as const, function: { name: 'get_temp', description: 't', parameters: { type: 'object', properties: {} } } },
+    { type: 'function' as const, function: { name: 'get_wind', description: 'w', parameters: { type: 'object', properties: {} } } },
+    { type: 'function' as const, function: { name: 'get_humidity', description: 'h', parameters: { type: 'object', properties: {} } } },
+  ];
+
+  function makeApp() {
+    const client = new MockUpstreamClient();
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent(threeCalls))}\n\n`]);
+    const mockEnv = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    return { client, mockEnv, app: createApp({ client, deviceManager: new DeviceManager() }) };
+  }
+
+  async function post(app: ReturnType<typeof createApp>, mockEnv: Env, extra: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'weather, wind, humidity in Paris' }],
+          tools,
+          ...extra,
+        }),
+      },
+      mockEnv
+    );
+  }
+
+  it('returns one tool call for a non-streaming request', async () => {
+    const { app, mockEnv } = makeApp();
+    const res = await post(app, mockEnv, { parallel_tool_calls: false });
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.choices[0].finish_reason).toBe('tool_calls');
+    expect(data.choices[0].message.tool_calls).toHaveLength(1);
+    expect(data.choices[0].message.tool_calls[0].function.name).toBe('get_temp');
+  });
+
+  it('returns every tool call when parallel_tool_calls is absent', async () => {
+    const { app, mockEnv } = makeApp();
+    const data: any = await (await post(app, mockEnv, {})).json();
+    expect(data.choices[0].message.tool_calls).toHaveLength(3);
+  });
+
+  it('returns every tool call when parallel_tool_calls is true', async () => {
+    const { app, mockEnv } = makeApp();
+    const data: any = await (await post(app, mockEnv, { parallel_tool_calls: true })).json();
+    expect(data.choices[0].message.tool_calls).toHaveLength(3);
+  });
+
+  it('streams exactly one tool_calls delta with index 0', async () => {
+    const { app, mockEnv } = makeApp();
+    const res = await post(app, mockEnv, { parallel_tool_calls: false, stream: true });
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+    const deltas: any[] = [];
+    for (const line of raw.split('\n')) {
+      if (!line.startsWith('data: ') || line.slice(6) === '[DONE]') continue;
+      const chunk = JSON.parse(line.slice(6));
+      for (const c of chunk.choices ?? []) {
+        for (const tc of c.delta?.tool_calls ?? []) deltas.push(tc);
+      }
+    }
+    expect(deltas).toHaveLength(1);
+    expect(deltas[0].index).toBe(0);
+    expect(deltas[0].function.name).toBe('get_temp');
+    expect(raw).toContain('"finish_reason":"tool_calls"');
+  });
+
+  it('keeps the named tool when tool_choice demands it', async () => {
+    const { app, mockEnv } = makeApp();
+    const res = await post(app, mockEnv, {
+      parallel_tool_calls: false,
+      tool_choice: { type: 'function', function: { name: 'get_humidity' } },
+    });
+    const data: any = await res.json();
+    expect(data.choices[0].message.tool_calls).toHaveLength(1);
+    expect(data.choices[0].message.tool_calls[0].function.name).toBe('get_humidity');
+  });
+
+  it('rejects a non-boolean parallel_tool_calls with 400', async () => {
+    const { app, mockEnv } = makeApp();
+    const res = await post(app, mockEnv, { parallel_tool_calls: 'no' });
+    expect(res.status).toBe(400);
+    const data: any = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('parallel_tool_calls');
+  });
+});

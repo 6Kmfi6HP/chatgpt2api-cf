@@ -46,6 +46,47 @@ export interface UpstreamMessage {
 export const TOOL_CALL_REPLY_FORMAT = '{"tool_calls":[{"name":"<tool>","arguments":{}}]}';
 
 /**
+ * Per-request tool-call cardinality. `parallel_tool_calls: false` means the
+ * caller can only execute ONE call per turn, so the gateway must expose at
+ * most one (see {@link selectSingleToolCall}) — dropping the extra calls
+ * after the model already committed to them is lossy either way, hence the
+ * matching protocol directive that asks for a single call up front.
+ */
+export interface SingleCallOptions {
+  singleCall?: boolean;
+  /** Tool name demanded by tool_choice; preferred over "first call wins". */
+  preferredName?: string | null;
+}
+
+/**
+ * Reduce parsed tool calls to the single call the caller can execute.
+ *
+ * `preferredName` (a named tool_choice) wins so the retained call still
+ * satisfies the named contract; otherwise the model's first call is kept.
+ * Returns the input untouched when there is nothing to cut.
+ */
+export function selectSingleToolCall(
+  calls: ParsedToolCall[],
+  preferredName?: string | null
+): ParsedToolCall[] {
+  if (calls.length <= 1) return calls;
+  if (preferredName) {
+    const hit = calls.find((c) => c.name === preferredName);
+    if (hit) return [hit];
+  }
+  return [calls[0]];
+}
+
+/** Tool name from a named tool_choice, or null for string choices. */
+export function toolChoiceName(choice: unknown): string | null {
+  if (!choice || typeof choice !== 'object') return null;
+  if (!('function' in choice)) return null;
+  const fn = choice.function;
+  if (!fn || typeof fn !== 'object' || !('name' in fn)) return null;
+  return typeof fn.name === 'string' && fn.name !== '' ? fn.name : null;
+}
+
+/**
  * Build the system message that teaches the model the tool protocol.
  *
  * Empirically (2026-09-15, anonymous backend replicas), adherence depends on
@@ -60,10 +101,16 @@ export const TOOL_CALL_REPLY_FORMAT = '{"tool_calls":[{"name":"<tool>","argument
  * tool-choice knob, so "required" and a named function only strengthen the
  * protocol wording (the tool list stays complete); they are not guarantees.
  * "auto" and undefined leave the wording byte-identical.
+ *
+ * `opts.singleCall` mirrors OpenAI's `parallel_tool_calls: false`: the caller
+ * can execute only one call this turn. The gateway also truncates whatever
+ * the model returns ({@link selectSingleToolCall}), but asking first is what
+ * keeps the model from spending the turn on calls that will be dropped.
  */
 export function buildToolProtocolSystemMessage(
   tools: ToolDefinition[],
-  toolChoice?: 'auto' | 'required' | { type: 'function'; function: { name: string } }
+  toolChoice?: 'auto' | 'required' | { type: 'function'; function: { name: string } },
+  opts?: SingleCallOptions
 ): string {
   const toolLines: string[] = [];
   for (const t of tools) {
@@ -113,6 +160,15 @@ export function buildToolProtocolSystemMessage(
         `You MUST call the tool "${name}". No other tool and no plain-text answer is acceptable.`
       );
     }
+  }
+
+  // parallel_tool_calls:false — the caller executes exactly one call.
+  if (opts?.singleCall) {
+    lines.push(
+      '',
+      'SINGLE TOOL CALL (this request):',
+      'Reply with exactly ONE tool call. Do not combine several calls in one reply: the caller executes only the first and discards the rest.'
+    );
   }
 
   return lines.join('\n');

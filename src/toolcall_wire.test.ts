@@ -347,3 +347,62 @@ describe('extractToolNameFromUpstreamMessage', () => {
     expect(extractToolNameFromUpstreamMessage({ author: 'not-an-object' })).toBeNull();
   });
 });
+
+describe('buildToolCallsChatMessage single-call mode', () => {
+  const threeCalls =
+    '{"tool_calls":[{"name":"a","arguments":{"x":1}},{"name":"b","arguments":{"y":2}},{"name":"c","arguments":{"z":3}}]}';
+
+  it('keeps every call when singleCall is off (default)', () => {
+    expect(buildToolCallsChatMessage(threeCalls)!.tool_calls.map((t) => t.function.name)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('keeps only the first call when singleCall is on', () => {
+    const msg = buildToolCallsChatMessage(threeCalls, { singleCall: true });
+    expect(msg!.tool_calls).toHaveLength(1);
+    expect(msg!.tool_calls[0].function.name).toBe('a');
+  });
+
+  it('keeps the preferred call when singleCall is on', () => {
+    const msg = buildToolCallsChatMessage(threeCalls, { singleCall: true, preferredName: 'b' });
+    expect(msg!.tool_calls).toHaveLength(1);
+    expect(msg!.tool_calls[0].function.name).toBe('b');
+  });
+});
+
+describe('buildAnonRequestBodyWithTools parallel_tool_calls', () => {
+  it('adds no single-call directive by default or when true', () => {
+    const base = baseReq({
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ type: 'function', function: { name: 'get_weather' } }],
+    });
+    const plain = buildAnonRequestBodyWithTools(base, { prompt: 'p' }).messages[0].content.parts.join('\n');
+    const enabled = buildAnonRequestBodyWithTools(
+      { ...base, parallel_tool_calls: true },
+      { prompt: 'p' }
+    ).messages[0].content.parts.join('\n');
+    expect(plain).not.toContain('exactly ONE tool call');
+    expect(enabled).toBe(plain);
+  });
+
+  it('adds the single-call directive when parallel_tool_calls is false', () => {
+    const req = baseReq({
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ type: 'function', function: { name: 'get_weather' } }],
+      parallel_tool_calls: false,
+    });
+    const proto = buildAnonRequestBodyWithTools(req, { prompt: 'p' }).messages[0].content.parts.join('\n');
+    expect(proto).toContain('exactly ONE tool call');
+  });
+
+  it('ignores parallel_tool_calls when there are no tools', () => {
+    const req = baseReq({
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'hi' },
+      ],
+      parallel_tool_calls: false,
+    });
+    const dto = buildAnonRequestBodyWithTools(req, { prompt: 'p' });
+    expect(dto.messages.map((m: any) => m.author.role)).toEqual(['system', 'user']);
+  });
+});

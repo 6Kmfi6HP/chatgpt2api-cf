@@ -932,6 +932,23 @@ export function createApp(options?: AppOptions) {
       );
     }
 
+    // parallel_tool_calls is a boolean gate on how many tool calls the caller
+    // can execute. A truthy string would be silently read as "parallel", so a
+    // non-boolean value is a client bug worth surfacing.
+    if (req.parallel_tool_calls !== undefined && typeof req.parallel_tool_calls !== 'boolean') {
+      return c.json(
+        {
+          error: {
+            message: "Invalid parameter: 'parallel_tool_calls' must be a boolean.",
+            type: 'invalid_request_error',
+            param: 'parallel_tool_calls',
+            code: 'invalid_request_error',
+          },
+        },
+        400
+      );
+    }
+
     // A "tool" message must answer a tool_calls id declared by a preceding
     // assistant message. OpenAI rejects orphans with 400; answering them with a
     // normal chat reply silently hides a client bug (the tool payload gets
