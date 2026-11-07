@@ -6,7 +6,7 @@ import type { Env, ChatCompletionRequest, ChatCompletionResponse } from './types
 import { UpstreamClient, StatusError } from './client';
 import { deviceManager as defaultDeviceManager, DeviceManager } from './device';
 import { flattenMessages, lastUserMessageText } from './translate';
-import { buildAnonRequestBodyWithTools } from './toolcall_wire';
+import { buildAnonRequestBodyWithTools, normalizeToolDefinitions } from './toolcall_wire';
 import { getModelCatalog } from './catalog';
 import { pipeOpenAIStream, aggregateNonStreamWithSignals, StreamProcessor, STREAM_TAIL_GRACE_MS, READ_TIMEOUT } from './stream';
 import { createParser } from 'eventsource-parser';
@@ -91,6 +91,44 @@ export function requiredToolName(req: ChatCompletionRequest): string | null {
 export function mustAnswerFromToolResult(req: ChatCompletionRequest): boolean {
   const msgs = req?.messages;
   return Array.isArray(msgs) && msgs.length > 0 && msgs[msgs.length - 1]?.role === 'tool' && req.search !== true;
+}
+
+/**
+ * Validates `tool_choice` against the tools the request declares, returning an
+ * OpenAI-shaped error message or null when the choice is legal.
+ *
+ * An unsatisfiable choice is the caller's bug. The upstream has no native
+ * tool-choice knob, so "call the tool X" is compiled into protocol wording:
+ * naming a function the request never declared produces an instruction the
+ * model can never satisfy, so every reply is judged a contract violation and
+ * the turn burns four upstream retries before degrading to a plain-text 200.
+ * Rejecting up front is both cheaper and honest.
+ */
+export function toolChoiceError(req: ChatCompletionRequest): string | null {
+  const choice = req?.tool_choice;
+  if (choice === undefined || choice === null || choice === 'auto' || choice === 'none') {
+    return null;
+  }
+  const declared = new Set(
+    normalizeToolDefinitions({ model: '', messages: [], tools: req.tools }).map(
+      (t) => t.function.name
+    )
+  );
+  if (choice === 'required') {
+    return declared.size > 0
+      ? null
+      : 'Invalid parameter: "tool_choice" is "required", but no named tools were provided in "tools".';
+  }
+  const name =
+    typeof choice === 'object' && !Array.isArray(choice) && choice.type === 'function'
+      ? choice.function?.name
+      : undefined;
+  if (typeof name !== 'string' || name === '') {
+    return 'Invalid parameter: "tool_choice" must be "auto", "none", "required", or {"type":"function","function":{"name":"..."}}.';
+  }
+  return declared.has(name)
+    ? null
+    : `Invalid parameter: "tool_choice" names the function "${name}", which is not defined in "tools".`;
 }
 
 /**
@@ -877,6 +915,25 @@ export function createApp(options?: AppOptions) {
             type: 'invalid_request_error',
             param: 'model',
             code: null,
+          },
+        },
+        400
+      );
+    }
+
+    // `tool_choice` must name something the request declares. An unsatisfiable
+    // choice cannot be honoured by the upstream, so it would be compiled into
+    // an impossible mandate, judged a violation on every reply, and retried
+    // four times before degrading to a plain-text 200. Reject it up front.
+    const toolChoiceProblem = toolChoiceError(req);
+    if (toolChoiceProblem) {
+      return c.json(
+        {
+          error: {
+            message: toolChoiceProblem,
+            type: 'invalid_request_error',
+            param: 'tool_choice',
+            code: 'invalid_request_error',
           },
         },
         400
