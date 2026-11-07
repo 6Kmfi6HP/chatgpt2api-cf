@@ -402,7 +402,7 @@ dropped at flush.
 
 ## 🧪 Testing
 
-The test suite contains **406 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
+The test suite contains **445 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
 
 ```bash
 # Run Vitest test suite
