@@ -62,6 +62,7 @@ class MockUpstreamClient extends UpstreamClient {
   public prepareCalls: any[] = [];
   public conversationCalls: any[] = [];
   public conversationHandler?: () => Promise<Response>;
+  public prepareHandler?: () => Promise<string>;
   public modelsCalls: number = 0;
   public modelsHandler?: () => Promise<string[]>;
 
@@ -87,6 +88,9 @@ class MockUpstreamClient extends UpstreamClient {
 
   async prepare(deviceId: string, sentinelToken: string, anonBody: any): Promise<string> {
     this.prepareCalls.push({ deviceId, sentinelToken, anonBody });
+    if (this.prepareHandler) {
+      return await this.prepareHandler();
+    }
     return `conduit-token-${deviceId}`;
   }
 
@@ -218,6 +222,55 @@ describe('Hono Application (src/index.ts)', () => {
       const res = await postChat(chatBody({ search: false }));
       expect(res.status).toBe(200);
       expect(mockClient.prepareCalls[0].anonBody.forceUseSearch).toBe(false);
+    });
+  });
+
+  describe('POST /v1/chat/completions - unknown model maps to 400', () => {
+    const postChat = async (body: string) =>
+      app.request(
+        '/v1/chat/completions',
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body },
+        mockEnv
+      );
+
+    it('returns 400 when every device reports an empty conduit_token', async () => {
+      mockClient.prepareHandler = async () => {
+        throw new Error('chatgpt-anon prepare: empty conduit_token (status="ok")');
+      };
+      const res = await postChat(
+        JSON.stringify({ model: 'no-such-model-xyz', messages: [{ role: 'user', content: 'hi' }] })
+      );
+      expect(res.status).toBe(400);
+      const data: any = await res.json();
+      expect(data.error.type).toBe('invalid_request_error');
+      expect(data.error.param).toBe('model');
+    });
+
+    it('keeps 500 for an empty conduit_token with a non-ok upstream status', async () => {
+      mockClient.prepareHandler = async () => {
+        throw new Error('chatgpt-anon prepare: empty conduit_token (status="error")');
+      };
+      const res = await postChat(
+        JSON.stringify({ model: 'gpt-5-6', messages: [{ role: 'user', content: 'hi' }] })
+      );
+      expect(res.status).toBe(500);
+    });
+
+    it('still returns 500 for a transient non-empty-conduit error', async () => {
+      mockClient.prepareHandler = async () => {
+        throw new Error('chatgpt-anon prepare: network exploded');
+      };
+      const res = await postChat(
+        JSON.stringify({ model: 'gpt-5-6', messages: [{ role: 'user', content: 'hi' }] })
+      );
+      expect(res.status).toBe(500);
+    });
+
+    it('propagates a non-empty conduit_token normally (control)', async () => {
+      const res = await postChat(
+        JSON.stringify({ model: 'gpt-5-6', messages: [{ role: 'user', content: 'hi' }] })
+      );
+      expect(res.status).toBe(200);
     });
   });
 
