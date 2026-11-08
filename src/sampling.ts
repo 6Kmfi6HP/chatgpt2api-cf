@@ -8,18 +8,32 @@ import { countRoughTokens } from './translate';
 export const MAX_STOP_SEQUENCES = 4;
 
 /**
- * The sampling parameters read as `unknown`: the decoded request body is
- * untrusted JSON, so a caller can send any type for them. Narrowing happens
- * below instead of trusting the interface.
+ * The parameters read as `unknown`: the decoded request body is untrusted
+ * JSON, so a caller can send any type for them. Narrowing happens below
+ * instead of trusting the interface.
  */
-interface RawSamplingParams {
+interface RawRequestParams {
   max_tokens?: unknown;
   max_completion_tokens?: unknown;
   stop?: unknown;
+  n?: unknown;
+  logprobs?: unknown;
+  top_logprobs?: unknown;
 }
 
-function rawSamplingParams(req: ChatCompletionRequest | undefined): RawSamplingParams {
-  return (req ?? {}) as RawSamplingParams;
+function rawRequestParams(req: ChatCompletionRequest | undefined): RawRequestParams {
+  return (req ?? {}) as RawRequestParams;
+}
+
+/**
+ * The OpenAI-shaped 400 the gateway answers with. `code` defaults to
+ * `invalid_request_error`; an honourable-but-unimplementable field uses
+ * `unsupported_parameter` so clients can tell a typo apart from a gap.
+ */
+export interface ParamError {
+  message: string;
+  param: string;
+  code?: string;
 }
 
 /** Sampling controls the gateway enforces itself (upstream has no equivalent). */
@@ -44,8 +58,8 @@ function isPositiveInteger(value: unknown): value is number {
  */
 export function samplingParamError(
   req: ChatCompletionRequest | undefined
-): { message: string; param: string } | null {
-  const raw = rawSamplingParams(req);
+): ParamError | null {
+  const raw = rawRequestParams(req);
   const params: Array<[string, unknown]> = [
     ['max_tokens', raw.max_tokens],
     ['max_completion_tokens', raw.max_completion_tokens],
@@ -84,13 +98,79 @@ export function samplingParamError(
 }
 
 /**
+ * Request validation for the response-shape parameters, which the gateway
+ * cannot honour and must therefore reject.
+ *
+ * These differ from the sampling knobs in README's "accepted but ignored"
+ * list: `temperature`/`top_p`/`seed` only bend the text, so forwarding a value
+ * the upstream drops leaves a slightly different but well-typed reply. `n` and
+ * `logprobs` change the *structure* of the reply — a client parsing
+ * `choices[n-1]` or `choices[0].logprobs.content` reads `undefined` or runs off
+ * the array end when the gateway answers one plain choice. Answering 400 is the
+ * only honest option for a single-session anonymous upstream, and it matches
+ * how `max_tokens`/`stop` are handled next door.
+ *
+ * Validation happens before any upstream work so a rejected request costs
+ * nothing.
+ */
+export function responseShapeParamError(
+  req: ChatCompletionRequest | undefined
+): ParamError | null {
+  const raw = rawRequestParams(req);
+  const n = raw.n;
+  if (n !== undefined && n !== null) {
+    // Only `1` is honourable: one conversation yields one reply. Any other
+    // value is either unsatisfiable (n > 1) or illegal (n <= 0, non-integer,
+    // non-number) — both answered with 400, and the message says which.
+    if (!isPositiveInteger(n)) {
+      return { message: "Invalid 'n': expected a positive integer", param: 'n' };
+    }
+    if (n !== 1) {
+      return {
+        message: `Unsupported parameter: 'n' > 1 is not supported by this gateway`,
+        param: 'n',
+        code: 'unsupported_parameter',
+      };
+    }
+  }
+
+  const logprobs = raw.logprobs;
+  const topLogprobs = raw.top_logprobs;
+  if (logprobs !== undefined && logprobs !== null && typeof logprobs !== 'boolean') {
+    return { message: "Invalid 'logprobs': expected a boolean", param: 'logprobs' };
+  }
+  if (logprobs === true) {
+    // The upstream SSE carries no token-level probabilities, so there is no
+    // value the field could honestly hold.
+    return {
+      message: `Unsupported parameter: 'logprobs' is not supported by this gateway`,
+      param: 'logprobs',
+      code: 'unsupported_parameter',
+    };
+  }
+  if (topLogprobs !== undefined && topLogprobs !== null) {
+    // `top_logprobs` is a companion of `logprobs`; without it the request asks
+    // for nothing the upstream can return, and accepting it silently is the
+    // same trap one level down.
+    if (logprobs !== false) {
+      return {
+        message: `Unsupported parameter: 'top_logprobs' requires 'logprobs' to be useful, and 'logprobs' is not supported by this gateway`,
+        param: 'top_logprobs',
+        code: 'unsupported_parameter',
+      };
+    }
+  }
+  return null;
+}
+
+/**
  * resolveSampling extracts the enforceable limits from a request. Values that
  * failed `samplingParamError` are treated as absent (the caller answered 400).
  * Empty stop strings are dropped: they match at index 0 and would truncate
  * every reply to nothing.
  */
 export function resolveSampling(req?: ChatCompletionRequest): SamplingLimits {
-  const raw = rawSamplingParams(req);
+  const raw = rawRequestParams(req);
   const stops: string[] = [];
   if (typeof raw.stop === 'string') {
     if (raw.stop !== '') stops.push(raw.stop);

@@ -402,7 +402,7 @@ dropped at flush.
 
 ## 🧪 Testing
 
-The test suite contains **445 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
+The test suite contains **458 tests** covering citations, translations, client protocol, device pooling, SSE streaming, and Hono routing:
 
 ```bash
 # Run Vitest test suite
@@ -419,6 +419,7 @@ pnpm exec tsc --noEmit
 - **Model Pass-through**: No name mapping. `model` is required: a missing, blank or non-string value is rejected with `400 invalid_request_error` (`param: "model"`) before any upstream call. Any supplied slug — including slugs the anonymous catalog does not contain, e.g. `gpt-4o` — is forwarded upstream verbatim and echoed back verbatim in the response `model` field. Read `GET /v1/models` for the real catalog.
 - **Web Search ON by default**: requests send `forceUseSearch: true`; reply citations are auto-formatted as Markdown links. Per-request opt-out: `"search": false`.
 - **Sampling Knobs**: Knobs like `temperature`, `top_p`, `seed` are accepted for client compatibility, but ignored by upstream.
+- **Response-shape parameters are rejected, not ignored**: `n` and `logprobs` change the *structure* of the reply, so the single-session anonymous upstream cannot fake them. `n: 1` (or omission) is accepted; `n > 1` returns `400` with `param: "n"`, `code: "unsupported_parameter"`, and an illegal `n` (`0`, negative, fractional, non-number) returns `400` with `param: "n"`, `code: "invalid_request_error"`. `logprobs: true` returns `400` with `param: "logprobs"`, `code: "unsupported_parameter"`; a non-boolean `logprobs` is `400 invalid_request_error`; `top_logprobs` without `logprobs: false` is `400`. All rejections happen before any upstream call, on both the streaming and non-streaming paths.
 - **Multimodal**: Image parts are supported (re-uploaded to the anonymous file pipeline, ~10 uploads/day per pooled device, pooled automatically). Audio and other attachment types are stripped. Image upload throttling upstream is per-device; the device pool rotates on 429 automatically.
 - **Tool calling**: implemented via a compiled system protocol (the anonymous upstream has no native tools API). On refusal-text replies the gateway transparently retries the turn on fresh devices (up to 3 attempts) for BOTH non-stream and stream requests — behavior is identical, and streaming clients no longer see degraded adherence. A reply that carries neither text nor a tool call is retried the same way: upstream ends the turn empty when its own web search returns nothing, and an empty 200 would end an agent loop with no output and no error. Requests with tools default `search` off (the upstream web tool can hijack tool-call turns); set `"search": true` to override. `tool_choice: "none"` disables tool-calling. When the last message is a `role: "tool"` result and `search` is not `true`, a reply that ran `web.run` is a contract violation and is retried the same way. On every other turn `"search": false` is still only advisory: upstream may search on its own.
 - **Regional Restrictions**: Requests originating from Cloudflare edge locations in unsupported countries (e.g. Hong Kong, China) may trigger OpenAI's regional 403 blocks. Deploying with location hints or Smart Placement resolves this.

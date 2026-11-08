@@ -17,7 +17,7 @@ import {
   type ResolvedImage,
 } from './image_parts';
 import { uploadImage, sniffImageMime, defaultExtensionForMime } from './upload';
-import { samplingParamError } from './sampling';
+import { responseShapeParamError, samplingParamError } from './sampling';
 
 export interface AppOptions {
   client?: UpstreamClient;
@@ -968,6 +968,26 @@ export function createApp(options?: AppOptions) {
             type: 'invalid_request_error',
             param: samplingErr.param,
             code: 'invalid_request_error',
+          },
+        },
+        400
+      );
+    }
+
+    // `n` and `logprobs` change the SHAPE of the reply, not just its wording:
+    // a client indexing `choices[n-1]` or reading `choices[0].logprobs` breaks
+    // when the gateway silently answers one plain choice. The anonymous
+    // upstream is a single conversation, so neither can be honoured; reject
+    // before any upstream work starts (stream and non-stream alike).
+    const shapeErr = responseShapeParamError(req);
+    if (shapeErr) {
+      return c.json(
+        {
+          error: {
+            message: shapeErr.message,
+            type: 'invalid_request_error',
+            param: shapeErr.param,
+            code: shapeErr.code ?? 'invalid_request_error',
           },
         },
         400
