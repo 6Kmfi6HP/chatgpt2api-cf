@@ -128,6 +128,24 @@ export interface ChatCompletionRequest {
    */
   n?: number;
   /**
+   * OpenAI `response_format`. Only the default `{"type":"text"}` is
+   * honourable: the anonymous upstream has no JSON mode, so a `json_object`
+   * or `json_schema` request answered with plain prose fails the client's own
+   * `JSON.parse`. Rejected with 400 instead of silently ignored.
+   */
+  response_format?:
+    | { type: 'text' }
+    | { type: 'json_object' }
+    | {
+        type: 'json_schema';
+        json_schema?: {
+          name?: string;
+          description?: string;
+          strict?: boolean;
+          schema?: Record<string, unknown>;
+        };
+      };
+  /**
    * OpenAI `logprobs` / `top_logprobs`. The upstream SSE carries no
    * token-level probabilities, so a `logprobs` request is rejected with 400
    * rather than answered without the field the caller asked for.
@@ -135,6 +153,16 @@ export interface ChatCompletionRequest {
   logprobs?: boolean;
   /** Companion of `logprobs`; rejected when sent without it. */
   top_logprobs?: number;
+  /**
+   * OpenAI `modalities`. Text only: the upstream produces no audio, so a list
+   * containing `"audio"` is rejected instead of answered without the field.
+   */
+  modalities?: Array<'text' | 'audio'>;
+  /**
+   * OpenAI `audio` output config (`voice` / `format`). Meaningless without
+   * audio output, which this gateway cannot produce; any presence is rejected.
+   */
+  audio?: { voice?: string; format?: string };
 }
 
 export interface ChatCompletionChoice {

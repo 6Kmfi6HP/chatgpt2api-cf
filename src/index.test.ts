@@ -2309,3 +2309,86 @@ describe('unsupported response-shape parameters (n / logprobs)', () => {
     expect(res.status).toBe(200);
   });
 });
+
+// Guards [audit:response-format-ignored]: `response_format` / `modalities` /
+// `audio` must be answered with 400 before any upstream work. A 200 with prose
+// breaks structured-output clients at their own JSON.parse step, where the
+// gateway log cannot show it; the honest answer is the same 400 shape #29 uses
+// for n/logprobs. Streaming and non-streaming share the entry point, so both
+// are covered here and neither may spend a device call.
+describe('unsupported reply-shape parameters (response_format / modalities / audio)', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5-5', messages: [{ role: 'user', content: 'hi' }], ...payload }),
+      },
+      mockEnv
+    );
+  }
+
+  it('rejects response_format json_object with 400 param "response_format"', async () => {
+    const res = await post({ response_format: { type: 'json_object' } });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; code: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('response_format');
+    expect(data.error.code).toBe('unsupported_parameter');
+    expect(client.prepareCalls.length).toBe(0);
+    expect(client.conversationCalls.length).toBe(0);
+  });
+
+  it('rejects json_schema on a streaming request before opening SSE', async () => {
+    const res = await post({
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'x', strict: true, schema: { type: 'object', properties: {} } },
+      },
+      stream: true,
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type') || '').toContain('application/json');
+    expect(client.conversationCalls.length).toBe(0);
+  });
+
+  it('rejects audio modalities and an audio field', async () => {
+    const audioModality = await post({ modalities: ['text', 'audio'], audio: { voice: 'alloy', format: 'wav' } });
+    expect(audioModality.status).toBe(400);
+    const audioModalityData: { error: { param: string; code: string } } = await audioModality.json();
+    expect(audioModalityData.error.param).toBe('modalities');
+    expect(audioModalityData.error.code).toBe('unsupported_parameter');
+
+    const audioOnly = await post({ audio: { voice: 'alloy', format: 'wav' } });
+    expect(audioOnly.status).toBe(400);
+    const audioOnlyData: { error: { param: string } } = await audioOnly.json();
+    expect(audioOnlyData.error.param).toBe('audio');
+  });
+
+  it('still accepts text-only shapes and an omitted audio section', async () => {
+    for (const payload of [
+      {},
+      { response_format: { type: 'text' } },
+      { modalities: ['text'] },
+    ]) {
+      const res = await post(payload);
+      expect(res.status).toBe(200);
+    }
+  });
+});
