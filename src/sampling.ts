@@ -19,6 +19,9 @@ interface RawRequestParams {
   n?: unknown;
   logprobs?: unknown;
   top_logprobs?: unknown;
+  response_format?: unknown;
+  modalities?: unknown;
+  audio?: unknown;
 }
 
 function rawRequestParams(req: ChatCompletionRequest | undefined): RawRequestParams {
@@ -160,6 +163,84 @@ export function responseShapeParamError(
       };
     }
   }
+
+  const { response_format: responseFormat, modalities, audio } = raw;
+
+  // `response_format`: the upstream answers free text, with no JSON mode. A
+  // `json_object`/`json_schema` request honoured only by a prompt hint would
+  // sometimes emit a JSON document and sometimes prose — a coin flip the
+  // client cannot detect before its own JSON.parse throws. `text` is the
+  // default and therefore honourable; everything else is a rejection.
+  if (responseFormat !== undefined && responseFormat !== null) {
+    if (typeof responseFormat !== 'object' || Array.isArray(responseFormat)) {
+      return {
+        message:
+          "Invalid 'response_format': expected an object with a 'type' of \"text\", \"json_object\", or \"json_schema\"",
+        param: 'response_format',
+      };
+    }
+    let type: unknown;
+    if ('type' in responseFormat) {
+      type = responseFormat.type;
+    }
+    if (type === 'json_object' || type === 'json_schema') {
+      return {
+        message: `Unsupported parameter: 'response_format' type "${type}" is not supported by this gateway, which cannot guarantee a JSON document`,
+        param: 'response_format',
+        code: 'unsupported_parameter',
+      };
+    }
+    // `text` is the OpenAI default, so it asks for nothing the gateway cannot
+    // do. Any other value (including a missing one) names a shape it cannot
+    // produce, and a typo must not read as a silent acceptance.
+    if (type !== 'text') {
+      return {
+        message:
+          "Invalid 'response_format': expected an object with a 'type' of \"text\", \"json_object\", or \"json_schema\"",
+        param: 'response_format',
+      };
+    }
+  }
+
+  // `modalities`: only `text` is producible. Any list naming `audio` would be
+  // answered without `choices[0].message.audio`, which a caller reading that
+  // field sees as `undefined` — silent failure, so reject.
+  if (modalities !== undefined && modalities !== null) {
+    if (
+      !Array.isArray(modalities) ||
+      modalities.length === 0 ||
+      modalities.some((m) => m !== 'text' && m !== 'audio')
+    ) {
+      return {
+        message: "Invalid 'modalities': expected a non-empty array containing only \"text\" or \"audio\"",
+        param: 'modalities',
+      };
+    }
+    if (modalities.includes('audio')) {
+      return {
+        message: `Unsupported parameter: 'modalities' entry "audio" is not supported by this gateway`,
+        param: 'modalities',
+        code: 'unsupported_parameter',
+      };
+    }
+  }
+
+  // `audio` output config is meaningless without audio output; its presence
+  // means the caller expects `choices[0].message.audio` back.
+  if (audio !== undefined && audio !== null) {
+    if (typeof audio !== 'object' || Array.isArray(audio)) {
+      return {
+        message: "Invalid 'audio': expected an object with 'voice' and 'format'",
+        param: 'audio',
+      };
+    }
+    return {
+      message: "Unsupported parameter: 'audio' output is not supported by this gateway",
+      param: 'audio',
+      code: 'unsupported_parameter',
+    };
+  }
+
   return null;
 }
 

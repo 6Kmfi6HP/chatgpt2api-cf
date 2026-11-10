@@ -219,3 +219,65 @@ describe('responseShapeParamError', () => {
     );
   });
 });
+
+// Guards [audit:response-format-ignored]: `response_format` / `modalities` /
+// `audio` change the SHAPE of the reply (a JSON document, an audio payload),
+// not its wording. The anonymous upstream has no JSON mode and returns text
+// only, so a 200 answer sends structured-output clients a string their
+// JSON.parse rejects — the failure lands in the client, while the gateway log
+// says 200. Rejected with 400 instead, matching n/logprobs above.
+describe('responseShapeParamError — response_format / modalities / audio', () => {
+  it('accepts an absent response_format and the explicit type "text"', () => {
+    expect(responseShapeParamError(req({}))).toBeNull();
+    expect(responseShapeParamError(req({ response_format: { type: 'text' } }))).toBeNull();
+  });
+
+  it('rejects json_object and json_schema as unsupported', () => {
+    for (const format of [
+      { type: 'json_object' },
+      { type: 'json_schema', json_schema: { name: 'x', schema: { type: 'object' } } },
+    ]) {
+      const err = responseShapeParamError(req({ response_format: format }));
+      expect(err?.param).toBe('response_format');
+      expect(err?.code).toBe('unsupported_parameter');
+    }
+  });
+
+  it('rejects a malformed response_format as invalid, not as unsupported', () => {
+    for (const value of ['json', 7, [], {}, { type: 'nonsense' }, { type: 5 }]) {
+      const err = responseShapeParamError(req({ response_format: value }));
+      expect(err?.param).toBe('response_format');
+      expect(err?.code).toBeUndefined();
+      expect(err?.message).toContain('response_format');
+    }
+  });
+
+  it('accepts modalities ["text"] and rejects any list containing "audio"', () => {
+    expect(responseShapeParamError(req({ modalities: ['text'] }))).toBeNull();
+    for (const modalities of [['text', 'audio'], ['audio']]) {
+      const err = responseShapeParamError(req({ modalities }));
+      expect(err?.param).toBe('modalities');
+      expect(err?.code).toBe('unsupported_parameter');
+    }
+  });
+
+  it('rejects a malformed modalities list as invalid', () => {
+    for (const value of ['text', [7], [], {}]) {
+      const err = responseShapeParamError(req({ modalities: value }));
+      expect(err?.param).toBe('modalities');
+      expect(err?.code).toBeUndefined();
+    }
+  });
+
+  it('rejects any audio request as unsupported and a malformed one as invalid', () => {
+    const unsupported = responseShapeParamError(req({ audio: { voice: 'alloy', format: 'wav' } }));
+    expect(unsupported?.param).toBe('audio');
+    expect(unsupported?.code).toBe('unsupported_parameter');
+
+    for (const value of ['wav', 7]) {
+      const err = responseShapeParamError(req({ audio: value }));
+      expect(err?.param).toBe('audio');
+      expect(err?.code).toBeUndefined();
+    }
+  });
+});
