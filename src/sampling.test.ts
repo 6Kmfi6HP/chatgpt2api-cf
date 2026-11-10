@@ -108,6 +108,22 @@ describe('tokenBudgetPrefixLength', () => {
     expect(countRoughTokens(text.slice(0, len))).toBeLessThanOrEqual(6);
     expect(len).toBeLessThan(text.length);
   });
+
+  // Guards [audit:surrogate-split-on-token-cap]: the longest fitting prefix can
+  // end between the two UTF-16 code units of an astral character (emoji). A
+  // lone high surrogate survives JSON serialisation as `\ud83d` but breaks any
+  // strict UTF-8 consumer of the decoded string, so the cut must back off to
+  // the pair boundary instead of emitting half a character.
+  it('never cuts inside a surrogate pair', () => {
+    const text = '😀'.repeat(4); // 8 code units, 4 code points
+    const len = tokenBudgetPrefixLength(text, 1);
+    expect(len).toBeLessThan(text.length);
+    expect(countRoughTokens(text.slice(0, len))).toBeLessThanOrEqual(1);
+    expect(/[\uD800-\uDBFF]$/.test(text.slice(0, len))).toBe(false);
+    expect([...text.slice(0, len)].every((ch) => ch.length === 2 || ch.codePointAt(0)! < 0xd800)).toBe(
+      true
+    );
+  });
 });
 
 describe('SamplingLimiter', () => {
@@ -168,6 +184,20 @@ describe('SamplingLimiter', () => {
     expect(limiter.limitFinish()).toBe('length');
     // No cut was latched: the text passes through untouched.
     expect(limiter.limit('already truncated')).toBe('already truncated');
+  });
+
+  // Guards [audit:surrogate-split-on-token-cap] on the class the stream and
+  // non-stream paths share: the latched cut must land on a code-point boundary
+  // so neither the live snapshots nor the aggregated body carry half an emoji.
+  it('latches a cap cut that does not split an emoji', () => {
+    const limiter = new SamplingLimiter({ stops: [], maxTokens: 1 });
+    const out = limiter.limit('😀 😀 😀 😀');
+    expect(limiter.limitFinish()).toBe('length');
+    expect(out).not.toMatch(/[\uD800-\uDBFF]$/);
+    expect(out).not.toMatch(/^[\uDC00-\uDFFF]/);
+    expect(countRoughTokens(out)).toBeLessThanOrEqual(1);
+    // Upstream keeps re-sending longer snapshots: the same cut still applies.
+    expect(limiter.limit('😀 😀 😀 😀 and more')).toBe(out);
   });
 });
 

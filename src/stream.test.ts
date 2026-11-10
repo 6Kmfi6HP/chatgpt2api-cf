@@ -1170,4 +1170,57 @@ describe('sampling limits (stop / max_tokens)', () => {
     expect(result.choices[0].finish_reason).toBe('length');
     expect(result.usage?.completion_tokens).toBe(3);
   });
+
+  // Guards [audit:surrogate-split-on-token-cap] on the live path: the cap cut
+  // is applied to every cumulative snapshot, so a split pair would ship a lone
+  // high surrogate in a content delta. Concatenated deltas must decode as
+  // whole code points.
+  it('caps a streamed emoji reply without splitting a surrogate pair', async () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'emoji' }],
+      max_tokens: 1,
+    };
+    const resp = createSseResponse([
+      `data: ${JSON.stringify(mkAssistantEvent('😀 😀 😀 😀'))}\n\n`,
+      `data: ${JSON.stringify(mkAssistantEvent('😀 😀 😀 😀 😀 😀'))}\n\n`,
+    ]);
+    const written: string[] = [];
+    await pipeOpenAIStream(
+      resp,
+      { writeSSE: async (msg: { data: string }) => void written.push(msg.data) },
+      'gpt-4o',
+      req
+    );
+
+    const { content, finishes } = collect(written);
+    expect(finishes).toEqual(['length']);
+    // Well-formedness oracle: a lone surrogate is replaced by U+FFFD when the
+    // string is UTF-8 encoded, so an identity round-trip proves every astral
+    // character survived as an intact pair.
+    expect(new TextDecoder().decode(new TextEncoder().encode(content))).toBe(content);
+    expect(() => encodeURIComponent(content)).not.toThrow();
+  });
+
+  // Guards [audit:surrogate-split-on-token-cap] on the aggregated path used by
+  // non-streaming requests: the returned JSON body must not carry an unpaired
+  // surrogate, which strict UTF-8 consumers reject even though JSON escapes it.
+  it('caps an aggregated emoji reply without splitting a surrogate pair', async () => {
+    const req: ChatCompletionRequest = {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'emoji' }],
+      max_tokens: 1,
+    };
+    const resp = createSseResponse([
+      `data: ${JSON.stringify(mkAssistantEvent('😀 😀 😀 😀'))}\n\n`,
+    ]);
+
+    const result = await aggregateNonStream(resp, 'gpt-4o', req);
+    const content = result.choices[0].message.content ?? '';
+    expect(result.choices[0].finish_reason).toBe('length');
+    // Same well-formedness oracle as the streaming case: the JSON body must
+    // decode to a string that a strict UTF-8 encoder can re-encode losslessly.
+    expect(new TextDecoder().decode(new TextEncoder().encode(content))).toBe(content);
+    expect(() => encodeURIComponent(content)).not.toThrow();
+  });
 });

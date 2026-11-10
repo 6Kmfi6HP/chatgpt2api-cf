@@ -292,6 +292,13 @@ export function stopPrefixSuffix(text: string, stops: string[]): string {
  * tokenBudgetPrefixLength returns the longest prefix of `text` whose rough
  * token count stays within `maxTokens`. countRoughTokens is monotonic
  * non-decreasing over prefixes, so a binary search finds that prefix exactly.
+ *
+ * The result is a UTF-16 code-unit offset, so the longest fitting prefix can
+ * end between the two units of one astral character. That prefix is backed off
+ * to the pair boundary: `text.slice()` of half a pair yields a lone surrogate,
+ * which serialises as a legal `\ud83d` escape but decodes to a string no strict
+ * UTF-8 encoder accepts. Shortening the prefix only lowers the token count, so
+ * the budget still holds.
  */
 export function tokenBudgetPrefixLength(text: string, maxTokens: number): number {
   if (countRoughTokens(text) <= maxTokens) return text.length;
@@ -305,7 +312,21 @@ export function tokenBudgetPrefixLength(text: string, maxTokens: number): number
       hi = mid - 1;
     }
   }
-  return lo;
+  return backOffSurrogateSplit(text, lo);
+}
+
+/**
+ * backOffSurrogateSplit moves a cut that lands between the two code units of
+ * one surrogate pair back by one unit, so the retained prefix ends on a code
+ * point boundary. A cut anywhere else is returned unchanged: a lone surrogate
+ * already inside `text` is upstream's bytes, not something slicing created.
+ */
+function backOffSurrogateSplit(text: string, cut: number): number {
+  if (cut <= 0 || cut >= text.length) return cut;
+  const high = text.charCodeAt(cut - 1);
+  const low = text.charCodeAt(cut);
+  const splitsPair = high >= 0xd800 && high <= 0xdbff && low >= 0xdc00 && low <= 0xdfff;
+  return splitsPair ? cut - 1 : cut;
 }
 
 /**
