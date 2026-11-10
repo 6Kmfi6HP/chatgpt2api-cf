@@ -3,6 +3,7 @@ import {
   MAX_STOP_SEQUENCES,
   SamplingLimiter,
   resolveSampling,
+  responseShapeParamError,
   samplingParamError,
   stopPrefixSuffix,
   tokenBudgetPrefixLength,
@@ -167,5 +168,54 @@ describe('SamplingLimiter', () => {
     expect(limiter.limitFinish()).toBe('length');
     // No cut was latched: the text passes through untouched.
     expect(limiter.limit('already truncated')).toBe('already truncated');
+  });
+});
+
+// Guards [audit:silent-unsupported-params]: `n` and `logprobs` are rejected
+// rather than silently dropped. They are structurally different from the
+// "accepted but ignored" sampling knobs — a client that asks for 3 choices
+// parses choices[0..2] and a client that asks for logprobs reads
+// choices[0].logprobs.content; answering one plain choice breaks both at parse
+// time instead of degrading the text.
+describe('responseShapeParamError', () => {
+  it('accepts a request without n or logprobs', () => {
+    expect(responseShapeParamError(req({}))).toBeNull();
+    expect(responseShapeParamError(undefined)).toBeNull();
+  });
+
+  it('accepts n equal to 1 and an explicit logprobs:false', () => {
+    expect(responseShapeParamError(req({ n: 1 }))).toBeNull();
+    expect(responseShapeParamError(req({ logprobs: false }))).toBeNull();
+    expect(responseShapeParamError(req({ logprobs: false, top_logprobs: 2 }))).toBeNull();
+  });
+
+  it('rejects n greater than 1 as an unsupported parameter', () => {
+    for (const value of [2, 3, 100]) {
+      const err = responseShapeParamError(req({ n: value }));
+      expect(err?.param).toBe('n');
+      expect(err?.code).toBe('unsupported_parameter');
+    }
+  });
+
+  it('rejects an illegal n as an invalid parameter, not as unsupported', () => {
+    for (const value of [0, -1, 1.5, '2', true]) {
+      const err = responseShapeParamError(req({ n: value }));
+      expect(err?.param).toBe('n');
+      expect(err?.code).toBeUndefined();
+      expect(err?.message).toContain('positive integer');
+    }
+  });
+
+  it('rejects logprobs:true as unsupported and a non-boolean logprobs as invalid', () => {
+    expect(responseShapeParamError(req({ logprobs: true }))?.code).toBe('unsupported_parameter');
+    expect(responseShapeParamError(req({ logprobs: 'yes' }))?.message).toContain('boolean');
+  });
+
+  it('rejects top_logprobs sent without logprobs:false', () => {
+    const err = responseShapeParamError(req({ top_logprobs: 2 }));
+    expect(err?.param).toBe('top_logprobs');
+    expect(responseShapeParamError(req({ logprobs: true, top_logprobs: 2 }))?.param).toBe(
+      'logprobs'
+    );
   });
 });

@@ -120,6 +120,21 @@ export interface ChatCompletionRequest {
    * the client never receives work it cannot run.
    */
   parallel_tool_calls?: boolean;
+  /**
+   * OpenAI `n`. Decoded as `unknown` upstream of the validator: only `1`
+   * (and omission) is honourable, because the anonymous upstream is a single
+   * conversation and therefore produces exactly one reply. Anything else is
+   * rejected with 400 instead of silently returning one choice.
+   */
+  n?: number;
+  /**
+   * OpenAI `logprobs` / `top_logprobs`. The upstream SSE carries no
+   * token-level probabilities, so a `logprobs` request is rejected with 400
+   * rather than answered without the field the caller asked for.
+   */
+  logprobs?: boolean;
+  /** Companion of `logprobs`; rejected when sent without it. */
+  top_logprobs?: number;
 }
 
 export interface ChatCompletionChoice {

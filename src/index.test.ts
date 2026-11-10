@@ -2213,3 +2213,99 @@ describe('sampling parameters (max_tokens / stop)', () => {
     expect(body).toContain('data: [DONE]');
   });
 });
+
+// Guards [audit:silent-unsupported-params]: `n` and `logprobs` change the
+// RESPONSE STRUCTURE (`choices.length`, `choices[0].logprobs.content`), so the
+// anonymous single-session upstream cannot honour them. Accepting them and
+// answering a single choice without logprobs makes parsing clients read
+// undefined or run off the array end. Both the streaming and the non-streaming
+// path must reject them before any upstream call is spent.
+describe('unsupported response-shape parameters (n / logprobs)', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5-5', messages: [{ role: 'user', content: 'hi' }], ...payload }),
+      },
+      mockEnv
+    );
+  }
+
+  it('rejects n greater than 1 with 400 param "n" and spends no upstream call', async () => {
+    const res = await post({ n: 3 });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; code: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('n');
+    expect(data.error.code).toBe('unsupported_parameter');
+    expect(client.prepareCalls.length).toBe(0);
+    expect(client.conversationCalls.length).toBe(0);
+  });
+
+  it('rejects a streaming request with n greater than 1 before opening SSE', async () => {
+    const res = await post({ n: 2, stream: true });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type') || '').toContain('application/json');
+  });
+
+  it('rejects an illegal n (0, negative, fractional, non-numeric) with 400 param "n"', async () => {
+    for (const value of [0, -1, 1.5, '2', true]) {
+      const res = await post({ n: value });
+      expect(res.status).toBe(400);
+      const data: { error: { param: string } } = await res.json();
+      expect(data.error.param).toBe('n');
+    }
+  });
+
+  it('still accepts n omitted and n equal to 1', async () => {
+    for (const payload of [{}, { n: 1 }]) {
+      const res = await post(payload);
+      expect(res.status).toBe(200);
+      const data: { choices: unknown[] } = await res.json();
+      expect(data.choices.length).toBe(1);
+    }
+  });
+
+  it('rejects logprobs:true with 400 param "logprobs"', async () => {
+    const res = await post({ logprobs: true });
+    expect(res.status).toBe(400);
+    const data: { error: { param: string; code: string } } = await res.json();
+    expect(data.error.param).toBe('logprobs');
+    expect(data.error.code).toBe('unsupported_parameter');
+    expect(client.conversationCalls.length).toBe(0);
+  });
+
+  it('rejects a non-boolean logprobs and a top_logprobs without logprobs', async () => {
+    const nonBoolean = await post({ logprobs: 'yes' });
+    expect(nonBoolean.status).toBe(400);
+    const nonBooleanData: { error: { param: string } } = await nonBoolean.json();
+    expect(nonBooleanData.error.param).toBe('logprobs');
+
+    const orphanTopLogprobs = await post({ top_logprobs: 2 });
+    expect(orphanTopLogprobs.status).toBe(400);
+    const orphanData: { error: { param: string } } = await orphanTopLogprobs.json();
+    expect(orphanData.error.param).toBe('top_logprobs');
+  });
+
+  it('accepts logprobs:false as an explicit opt-out', async () => {
+    const res = await post({ logprobs: false });
+    expect(res.status).toBe(200);
+  });
+});
