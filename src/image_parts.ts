@@ -58,6 +58,19 @@ function extractImageUrl(part: { type: string; [k: string]: any }): string | nul
   return null;
 }
 
+/**
+ * True when an image part carries a URL the upload path can actually fetch.
+ * `collectImageRefs` is the resolver, so a part it would skip contributes
+ * nothing to the request — a caller that sent one has lost its image.
+ */
+export function isUsableImagePart(part: Record<string, unknown>): boolean {
+  if (part.type !== 'image_url' && part.type !== 'input_image') {
+    return false;
+  }
+  const refs = collectImageRefs([part as unknown as OpenAIContentParts[number]]);
+  return refs.length > 0;
+}
+
 /** True for data: URLs (data:[mediatype][;base64],<data>). */
 function isDataUrl(s: string): boolean {
   return /^data:/i.test(s);

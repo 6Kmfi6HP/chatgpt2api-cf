@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createApp, toolChoiceError } from './index';
+import { createApp, toolChoiceError, contentPartError } from './index';
 import { clearCatalogCache } from './catalog';
 import { UpstreamClient, StatusError } from './client';
 import { DeviceManager } from './device';
@@ -2390,5 +2390,211 @@ describe('unsupported reply-shape parameters (response_format / modalities / aud
       const res = await post(payload);
       expect(res.status).toBe(200);
     }
+  });
+});
+
+// Issue #35: an input part the gateway cannot forward must fail loudly. Before
+// this suite, `input_audio` / `file` / unknown part types were dropped while
+// building the prompt, so the request reached the upstream with an empty prompt
+// and came back HTTP 200 with an answer to nothing — `usage.prompt_tokens: 0`
+// was the only hint that the caller's content never arrived.
+describe('unsupported input content parts and empty message content', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5-5', ...payload }),
+      },
+      mockEnv
+    );
+  }
+
+  it.each([
+    {
+      name: 'input_audio',
+      part: { type: 'input_audio', input_audio: { data: 'UklGRiQAAABXQVZFZm10', format: 'wav' } },
+    },
+    { name: 'file', part: { type: 'file', file: { file_id: 'file-1', filename: 'a.pdf' } } },
+    { name: 'unknown video_url', part: { type: 'video_url', video_url: { url: 'https://e.co/v.mp4' } } },
+  ])('rejects a $name part with 400 unsupported_parameter naming the type', async ({ part }) => {
+    const res = await post({ messages: [{ role: 'user', content: [part] }] });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; code: string; message: string } } =
+      await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('messages');
+    expect(data.error.code).toBe('unsupported_parameter');
+    expect(data.error.message).toContain(part.type);
+    // Rejected before any upstream work: no device, no conversation, no upload.
+    expect(client.prepareCalls).toHaveLength(0);
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // A stopped client that loses its first frame must not have already spent an
+  // upstream conversation: the rejection is a JSON 400, never an SSE error frame.
+  it('rejects an input_audio part on a streaming request before opening SSE', async () => {
+    const res = await post({
+      stream: true,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'transcribe this' },
+            { type: 'input_audio', input_audio: { data: 'UklGRiQ=', format: 'wav' } },
+          ],
+        },
+      ],
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type') || '').toContain('application/json');
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  it.each([
+    { name: 'empty content array', content: [] as unknown[] },
+    { name: 'text part without a text field', content: [{ type: 'text' }] },
+    { name: 'text part with a blank string', content: [{ type: 'text', text: '   ' }] },
+    { name: 'text part with a non-string text', content: [{ type: 'text', text: 42 }] },
+  ])('rejects $name with 400 invalid_request_error', async ({ content }) => {
+    const res = await post({ messages: [{ role: 'user', content }] });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; code: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('messages');
+    expect(data.error.code).toBe('invalid_request_error');
+    expect(client.prepareCalls).toHaveLength(0);
+  });
+
+  // `content: ""` is the string form of the same data loss: the prompt is empty
+  // and the upstream answers a question it never saw.
+  it('rejects a request whose prompt text is empty with 400 invalid_request_error', async () => {
+    const res = await post({ messages: [{ role: 'user', content: '' }] });
+    expect(res.status).toBe(400);
+    const data: { error: { param: string; message: string } } = await res.json();
+    expect(data.error.param).toBe('messages');
+    expect(client.prepareCalls).toHaveLength(0);
+  });
+
+  // A vision request legitimately carries an image and no prompt text: an
+  // empty prompt must only be rejected when there is no attachment either.
+  it('accepts an image-only message with no text', async () => {
+    const res = await post({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: {
+                url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+              },
+            },
+          ],
+        },
+      ],
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('still accepts text, input_text and tool_calls-only assistant frames', async () => {
+    const textParts = await post({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'look at ' },
+            { type: 'input_text', text: 'this' },
+          ],
+        },
+      ],
+    });
+    expect(textParts.status).toBe(200);
+
+    const toolHistory = await post({
+      messages: [
+        { role: 'user', content: 'what is the weather' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'f', arguments: '{}' } }],
+        },
+        { role: 'tool', tool_call_id: 'call_1', content: 'sunny' },
+      ],
+    });
+    expect(toolHistory.status).toBe(200);
+  });
+});
+
+// The part whitelist is the single source of truth: `collectImageRefs` accepts
+// exactly the image shapes the upload path can resolve, so validation reuses it
+// instead of re-deriving "is this a usable image".
+describe('contentPartError', () => {
+  it('accepts the four forwardable part types', () => {
+    expect(
+      contentPartError([
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'hi' },
+            { type: 'input_text', text: 'there' },
+            { type: 'image_url', image_url: { url: 'https://e.co/a.png' } },
+            { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
+          ],
+        },
+      ])
+    ).toBeNull();
+  });
+
+  it('treats a non-forwardable part as ok only when its image url is usable', () => {
+    const malformed = contentPartError([
+      { role: 'user', content: [{ type: 'image_url', image_url: {} }] },
+    ]);
+    expect(malformed?.param).toBe('messages');
+    expect(malformed?.code).toBeUndefined(); // handler defaults it to invalid_request_error
+    expect(malformed?.message).toContain('messages[0].content[0]');
+
+    // ftp:// is not a URL the upload path can fetch, so the image would vanish.
+    const unfetchable = contentPartError([
+      { role: 'user', content: [{ type: 'image_url', image_url: { url: 'ftp://e.co/a.png' } }] },
+    ]);
+    expect(unfetchable?.message).toContain('messages[0].content[0]');
+  });
+
+  it('rejects a part whose type is missing or not a string', () => {
+    expect(contentPartError([{ role: 'user', content: [{}] }])?.message).toContain('.type');
+    expect(contentPartError([{ role: 'user', content: [{ type: 7 }] }])?.message).toContain('.type');
+  });
+
+  it('ignores string, null and undefined content', () => {
+    expect(contentPartError([{ role: 'user', content: 'hi' }, { role: 'assistant', content: null }])).toBeNull();
+  });
+
+  it('allows an empty content array when the frame carries tool calls', () => {
+    expect(
+      contentPartError([
+        {
+          role: 'assistant',
+          content: [],
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'f', arguments: '{}' } }],
+        },
+      ])
+    ).toBeNull();
   });
 });

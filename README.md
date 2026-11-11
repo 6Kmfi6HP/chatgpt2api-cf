@@ -393,6 +393,17 @@ HTTP 400 `invalid_request_error` with `param: "messages"` and the offending path
 `Invalid parameter: messages[0].content must be a string, an array of content parts, or null.`
 The same applies to a body that is JSON `null` or a non-object value.
 
+Input content parts the gateway cannot forward are rejected, never dropped. Only `text`/`input_text`
+(becoming prompt text) and `image_url`/`input_image` (becoming uploaded attachments) have an upstream
+representation; an `input_audio`, `file`, `video_url` or unknown part type returns HTTP 400
+`invalid_request_error` with `param: "messages"` and `code: "unsupported_parameter"`, naming the type.
+Before this rule the part was discarded while the request continued, so the upstream answered an empty
+prompt and the caller got a 200 greeting with `usage.prompt_tokens: 0`. A supported part that carries
+nothing usable — an `image_url` without a `data:`/`http(s)` URL, a `text` part without a string `text` —
+returns 400 with `code: "invalid_request_error"`. A request whose assembled prompt is empty (`content: ""`,
+`content: []`, or a history with no user text) returns 400 `invalid_request_error` instead of an answer
+to nothing. Streaming requests are rejected as JSON before any SSE frame is opened.
+
 A trailing colon is part of the reply text, not markup. Only a colon run at the START of a line can
 grow into a bare genui fence (`^:::`), so `Key details:` ends with its colon in both stream and
 non-stream responses; a line-initial `::` is still withheld until it either completes a fence or is
