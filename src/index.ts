@@ -216,6 +216,91 @@ export function mustAnswerFromToolResult(req: ChatCompletionRequest): boolean {
 }
 
 /**
+ * Validates the request's `tools` array, returning the OpenAI-shaped error or
+ * null when every entry can be compiled into the upstream tool protocol.
+ *
+ * Why this exists: `normalizeToolDefinitions` skips entries it cannot name, and
+ * an empty result switches the whole tool path off (`hasTools` false, no
+ * protocol system message). A caller that mistyped one entry — a bare
+ * `{"type":"function"}` with no nested `function`, a `null` in the list, or a
+ * `tools` value that is not an array at all — therefore got an ordinary
+ * plain-chat 200 with no `tool_calls` and no error, which an agent loop cannot
+ * tell apart from "the model chose not to call a tool". Capability silently
+ * disappeared.
+ *
+ * Two rules, matching `contentPartError` next door:
+ *  - a shape the gateway cannot represent at all (non-array `tools`, a
+ *    non-`function` type, an unnameable entry) → `invalid_request_error`,
+ *    naming the offending index so the client can fix its payload;
+ *  - `parameters` may be absent or null (a tool with no arguments), but a
+ *    non-object schema would be dropped from the protocol text → 400 as well.
+ *
+ * A well-formed list is left untouched: this only rejects, it never rewrites.
+ */
+export function toolsParamError(tools: unknown): ParamError | null {
+  if (tools === undefined || tools === null) return null;
+  if (!Array.isArray(tools)) {
+    return {
+      message: "Invalid parameter: 'tools' must be an array of tool definitions.",
+      param: 'tools',
+    };
+  }
+  for (let i = 0; i < tools.length; i++) {
+    const entry: unknown = tools[i];
+    const path = `tools[${i}]`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return {
+        message: `Invalid parameter: ${path} must be an object.`,
+        param: 'tools',
+      };
+    }
+    // Proven an object by the guard above; the cast only gives the unvalidated
+    // fields a typed home instead of `any` at each read.
+    const tool = entry as Record<string, unknown>;
+    // Only `function` tools have an upstream representation: the protocol is a
+    // JSON convention for named functions, so anything else could never be
+    // called. An absent `type` is tolerated for clients that omit it.
+    if (tool.type !== undefined && tool.type !== 'function') {
+      return {
+        message: `Invalid parameter: ${path}.type must be "function".`,
+        param: 'tools',
+      };
+    }
+    const fn = tool.function;
+    if (fn !== undefined && (fn === null || typeof fn !== 'object' || Array.isArray(fn))) {
+      return {
+        message: `Invalid parameter: ${path}.function must be an object.`,
+        param: 'tools',
+      };
+    }
+    const fnObj = (fn ?? {}) as Record<string, unknown>;
+    // Standard form reads the name from `function.name`, shorthand form from
+    // the entry itself; either is accepted, an empty/absent one is not.
+    const name = fnObj.name !== undefined ? fnObj.name : tool.name;
+    if (typeof name !== 'string' || name === '') {
+      return {
+        message: `Invalid parameter: ${path} must carry a non-empty function name in 'function.name' (or 'name').`,
+        param: 'tools',
+      };
+    }
+    // A schema that is not an object is dropped by normalizeToolDefinitions, so
+    // the model would be handed a tool with no argument contract at all.
+    const parameters = fnObj.parameters !== undefined ? fnObj.parameters : tool.parameters;
+    if (
+      parameters !== undefined &&
+      parameters !== null &&
+      (typeof parameters !== 'object' || Array.isArray(parameters))
+    ) {
+      return {
+        message: `Invalid parameter: ${path}.function.parameters must be a JSON Schema object.`,
+        param: 'tools',
+      };
+    }
+  }
+  return null;
+}
+
+/**
  * Validates `tool_choice` against the tools the request declares, returning an
  * OpenAI-shaped error message or null when the choice is legal.
  *
@@ -1141,6 +1226,26 @@ export function createApp(options?: AppOptions) {
             type: 'invalid_request_error',
             param: 'model',
             code: null,
+          },
+        },
+        400
+      );
+    }
+
+    // A `tools` entry the gateway cannot compile is dropped by
+    // normalizeToolDefinitions, which turns the whole tool path off and answers
+    // the caller with plain prose: the request declared tools and got no tool
+    // channel, with no error to detect it. Reject the payload shape instead of
+    // silently running without the tools the caller asked for.
+    const toolsErr = toolsParamError(req.tools);
+    if (toolsErr) {
+      return c.json(
+        {
+          error: {
+            message: toolsErr.message,
+            type: 'invalid_request_error',
+            param: toolsErr.param,
+            code: toolsErr.code ?? 'invalid_request_error',
           },
         },
         400

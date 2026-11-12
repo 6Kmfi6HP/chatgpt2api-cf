@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createApp, toolChoiceError, contentPartError } from './index';
+import { createApp, toolChoiceError, contentPartError, toolsParamError } from './index';
 import { clearCatalogCache } from './catalog';
 import { UpstreamClient, StatusError } from './client';
 import { DeviceManager } from './device';
@@ -2596,5 +2596,164 @@ describe('contentPartError', () => {
         },
       ])
     ).toBeNull();
+  });
+});
+
+// Issue #39: a `tools` entry the gateway cannot compile into the upstream
+// protocol was skipped silently by normalizeToolDefinitions, so the whole tool
+// path (hasTools, the protocol system message) switched off and the caller got
+// a plain-chat 200 for a request that declared tools. Silent capability loss is
+// the same failure family as #35's dropped content parts: reject with 400.
+describe('toolsParamError', () => {
+  const goodTool = {
+    type: 'function',
+    function: { name: 'send_email', description: 'Send an email', parameters: { type: 'object' } },
+  };
+
+  it('accepts the standard form, the shorthand form and an absent/empty list', () => {
+    expect(toolsParamError(undefined)).toBeNull();
+    expect(toolsParamError([])).toBeNull();
+    expect(toolsParamError([goodTool])).toBeNull();
+    // Top-level shorthand: name/parameters live on the entry itself.
+    expect(
+      toolsParamError([{ type: 'function', name: 'calc', parameters: { type: 'object' } }] as never)
+    ).toBeNull();
+    // `parameters` may be omitted or null: a tool with no arguments is legal.
+    expect(
+      toolsParamError([{ type: 'function', function: { name: 'ping' } }] as never)
+    ).toBeNull();
+    expect(
+      toolsParamError([{ type: 'function', function: { name: 'ping', parameters: null } }] as never)
+    ).toBeNull();
+  });
+
+  it('rejects a non-array tools value instead of ignoring the tools', () => {
+    for (const value of ['abc', goodTool, 7, {}] as never[]) {
+      const err = toolsParamError(value);
+      expect(err?.param).toBe('tools');
+      expect(err?.message).toContain('tools');
+    }
+  });
+
+  it.each([
+    { label: 'empty object', entry: {} },
+    { label: 'type only', entry: { type: 'function' } },
+    { label: 'blank name', entry: { type: 'function', function: { name: '' } } },
+    { label: 'non-string name', entry: { type: 'function', function: { name: 7 } } },
+    { label: 'null entry', entry: null },
+    { label: 'string entry', entry: 'send_email' },
+    { label: 'array entry', entry: [] },
+  ])('rejects an unnameable $label with 400 naming its index', ({ entry }) => {
+    const err = toolsParamError([goodTool, entry] as never);
+    expect(err).not.toBeNull();
+    expect(err?.param).toBe('tools');
+    expect(err?.message).toContain('tools[1]');
+  });
+
+  it('rejects a non-object parameters value, which would be dropped silently', () => {
+    const err = toolsParamError([
+      { type: 'function', function: { name: 'send_email', parameters: 'not-a-schema' } },
+    ] as never);
+    expect(err?.param).toBe('tools');
+    expect(err?.message).toContain('tools[0].function.parameters');
+  });
+
+  it('rejects a non-function type, which the protocol cannot express', () => {
+    const err = toolsParamError([{ type: 'web_search' }] as never);
+    expect(err?.param).toBe('tools');
+    expect(err?.message).toContain('tools[0].type');
+  });
+});
+
+// End-to-end: the rejection must happen before any upstream work, on both the
+// streaming and the non-streaming path. Before the fix these requests reached
+// the upstream and came back 200 with prose and no tool_calls.
+describe('malformed tools entries on the HTTP path', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  const toolCallReply = '{"tool_calls":[{"name":"send_email","arguments":{"to":"ops@example.com"}}]}';
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent(toolCallReply))}\n\n`]);
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'email ops@example.com that deploy is green' }],
+          ...payload,
+        }),
+      },
+      mockEnv
+    );
+  }
+
+  it.each([
+    { label: 'empty object', tools: [{}] },
+    { label: 'type only', tools: [{ type: 'function' }] },
+    { label: 'blank name', tools: [{ type: 'function', function: { name: '' } }] },
+    { label: 'partially broken list', tools: [{ type: 'function', function: { name: 'send_email' } }, { type: 'function' }] },
+    { label: 'non-array', tools: 'abc' },
+    { label: 'single object', tools: { type: 'function', function: { name: 'send_email' } } },
+  ])('returns 400 for $label tools on the non-streaming path', async ({ tools }) => {
+    const res = await post({ tools });
+    expect(res.status).toBe(400);
+    const data: any = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('tools');
+    // Rejected before any upstream work: no device, no prepare, no conversation.
+    expect(client.prepareCalls).toHaveLength(0);
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  it('returns a JSON 400 (not an SSE error frame) for a streaming request', async () => {
+    const res = await post({ tools: [{}], stream: true });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    const data: any = await res.json();
+    expect(data.error.param).toBe('tools');
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // A well-formed tools list must keep working end to end: the 400 above is a
+  // payload-shape rejection, not a blanket refusal of tool calling.
+  it('still honours a well-formed tools list', async () => {
+    const res = await post({
+      tools: [
+        { type: 'function', function: { name: 'send_email', description: 'Send an email', parameters: { type: 'object' } } },
+      ],
+    });
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.choices[0].finish_reason).toBe('tool_calls');
+    expect(data.choices[0].message.tool_calls[0].function.name).toBe('send_email');
+    expect(client.conversationCalls).toHaveLength(1);
+  });
+
+  // tools:[] means "no tools": the request must stay a plain chat completion.
+  it('keeps tools:[] a working plain chat request', async () => {
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('Deploy is green.'))}\n\n`]);
+    const res = await post({ tools: [] });
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.choices[0].message.content).toBe('Deploy is green.');
+    expect(data.choices[0].message.tool_calls).toBeUndefined();
   });
 });
