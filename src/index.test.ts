@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createApp, toolChoiceError, contentPartError, toolsParamError } from './index';
 import { clearCatalogCache } from './catalog';
 import { UpstreamClient, StatusError } from './client';
@@ -2755,5 +2755,86 @@ describe('malformed tools entries on the HTTP path', () => {
     const data: any = await res.json();
     expect(data.choices[0].message.content).toBe('Deploy is green.');
     expect(data.choices[0].message.tool_calls).toBeUndefined();
+  });
+});
+
+// An unreachable image host used to escape as 500 api_error: workerd rejects the
+// fetch with "Network connection lost." / a DNS failure, the raw text matched
+// none of the handler's caller-fault substrings, and the request surfaced as a
+// gateway fault. The status must be 400 with no upstream work spent, and a
+// client abort must not be rewritten into a 400.
+describe('image fetch failures are caller faults, not gateway faults', () => {
+  function setup() {
+    const client = new MockUpstreamClient();
+    const testApp = createApp({ client, deviceManager: new DeviceManager() });
+    const env = { CHATGPT_KV: new MockKVNamespace() } as unknown as Env;
+    const post = (payload: object) =>
+      testApp.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        },
+        env
+      );
+    return { post, client };
+  }
+
+  const imagePayload = (url: string, extra: object = {}) => ({
+    model: 'auto',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'What is in this image?' },
+          { type: 'image_url', image_url: { url } },
+        ],
+      },
+    ],
+    ...extra,
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    { name: 'connection refused', rejection: new TypeError('Network connection lost.') },
+    { name: 'DNS failure', rejection: new Error('failed: DNS lookup failed.') },
+  ])('answers 400 invalid_request_error on a $name', async ({ rejection }) => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(rejection));
+    const { post, client } = setup();
+    const res = await post(imagePayload('http://127.0.0.1:9/x.png'));
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; message: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.message).toContain('Failed to fetch image http://127.0.0.1:9/x.png');
+    // Rejected before any upstream work: no device, no conversation.
+    expect(client.prepareCalls).toHaveLength(0);
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // Same rule under the tool path, which resolves images through its own copy
+  // of the upload block (retryToolTurn) rather than the main retry loop.
+  it('answers 400 on the tool path too', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Network connection lost.')));
+    const { post, client } = setup();
+    const res = await post(
+      imagePayload('http://127.0.0.1:9/x.png', {
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'get_weather', description: 'weather', parameters: { type: 'object' } },
+          },
+        ],
+        tool_choice: 'required',
+      })
+    );
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; message: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.message).toContain('Failed to fetch image');
+    expect(client.conversationCalls).toHaveLength(0);
   });
 });
