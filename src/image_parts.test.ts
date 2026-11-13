@@ -345,6 +345,36 @@ describe('resolveImage', () => {
     ).rejects.toThrow('HTTP 404');
   });
 
+  // A caller-supplied URL whose host cannot be reached rejects at the transport
+  // layer (workerd: "Network connection lost." / DNS "failed"). That rejection
+  // is the caller's payload fault, so it must carry the same
+  // "Failed to fetch image <url>" wording the HTTP-status branch uses: the
+  // handler classifies caller faults by that prefix, and an unstructured
+  // rejection escaped as 500 api_error.
+  it('wraps a transport-level fetch rejection in the caller-fault wording', async () => {
+    const fetcher = vi.fn().mockRejectedValue(new Error('Network connection lost.'));
+    await expect(
+      resolveImage(
+        { kind: 'url', source: 'http://127.0.0.1:9/x.png', partIndex: 0 },
+        fetcher as unknown as typeof fetch
+      )
+    ).rejects.toThrow('Failed to fetch image http://127.0.0.1:9/x.png: Network connection lost.');
+  });
+
+  // A client abort is not a payload fault: it must keep propagating verbatim so
+  // the handler does not turn a cancelled request into a 400.
+  it('rethrows an abort rejection untouched', async () => {
+    const abort = new Error('Request aborted by client');
+    abort.name = 'AbortError';
+    const fetcher = vi.fn().mockRejectedValue(abort);
+    await expect(
+      resolveImage(
+        { kind: 'url', source: 'https://example.com/slow.png', partIndex: 0 },
+        fetcher as unknown as typeof fetch
+      )
+    ).rejects.toBe(abort);
+  });
+
   it('rejects data URLs with non-image mime types after decoding', async () => {
     const dataUrl = 'data:text/html;base64,PGh0bWw+PC9odG1sPg==';
     await expect(

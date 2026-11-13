@@ -289,6 +289,10 @@ response = client.chat.completions.create(
 - 支持单条消息多图（按顺序附带）。
 - 上传使用每设备匿名配额（每池化设备每日约 10 次）；触发 429 时设备池自动轮换。
 - 图片 URL 由 Worker 抓取 —— 内网/私有地址不可达。
+- Worker 取不到的图片 URL 属于调用方的错误：整个请求返回 HTTP 400 `invalid_request_error`，消息里给出
+  该 URL 与原因（`Failed to fetch image <url>: HTTP 404`、`... : Network connection lost.`、
+  `... did not return an image`）。这类失败不再是 500：DNS 解析失败与连接被拒曾以 `api_error` 出现，
+  客户端会把它当作网关故障重试。拒绝发生在上游调用之前，不消耗设备配额。
 
 ### 4. 工具调用（Function Calling）
 

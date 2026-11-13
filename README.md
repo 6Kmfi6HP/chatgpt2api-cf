@@ -292,6 +292,11 @@ Notes:
 - Multiple images per request are supported (attached in order).
 - Uploads use the per-device anonymous quota (~10/day per pooled device); the device pool rotates automatically on 429.
 - Image URLs are fetched by the Worker — private/intranet URLs are not reachable.
+- An image URL the Worker cannot retrieve is the caller's fault, so the whole request returns
+  HTTP 400 `invalid_request_error` with a message naming the URL and the reason
+  (`Failed to fetch image <url>: HTTP 404`, `... : Network connection lost.`, `... did not return an image`).
+  This is never a 500: DNS failures and refused connections used to surface as `api_error`, which clients
+  retry as a gateway fault. The rejection happens before any upstream work, so no device quota is spent.
 
 ### 4. Tool Calling (Function Calling)
 

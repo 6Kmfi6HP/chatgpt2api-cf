@@ -260,7 +260,21 @@ export async function resolveImage(
     bytes = decoded.bytes;
     mimeType = decoded.mimeType;
   } else {
-    const res = await fetcher(ref.source, { method: 'GET' });
+    // A rejected fetch (DNS failure, connection refused, TLS/proxy abort) is a
+    // property of the caller-supplied URL, not a gateway fault. Without this
+    // wrap the raw transport text ("Network connection lost.") escapes, the
+    // handler's caller-fault classifier does not recognise it, and the caller
+    // gets 500 api_error for its own bad URL. A client abort is rethrown as-is:
+    // cancelling a request is not a payload error.
+    let res: Response;
+    try {
+      res = await fetcher(ref.source, { method: 'GET' });
+    } catch (err) {
+      // AbortSignal cancellation surfaces as a DOMException named AbortError.
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to fetch image ${ref.source}: ${reason}`);
+    }
     if (!res.ok) {
       throw new Error(`Failed to fetch image ${ref.source}: HTTP ${res.status}`);
     }
