@@ -12,12 +12,13 @@ import { pipeOpenAIStream, aggregateNonStreamWithSignals, StreamProcessor, STREA
 import { createParser } from 'eventsource-parser';
 import {
   collectImageRefs,
+  isUsableImagePart,
   resolveImage,
   buildMultimodalContent,
   type ResolvedImage,
 } from './image_parts';
 import { uploadImage, sniffImageMime, defaultExtensionForMime } from './upload';
-import { responseShapeParamError, samplingParamError } from './sampling';
+import { responseShapeParamError, samplingParamError, type ParamError } from './sampling';
 
 export interface AppOptions {
   client?: UpstreamClient;
@@ -105,6 +106,85 @@ export function messageShapeError(messages: unknown[]): string | null {
       const part = content[p];
       if (!part || typeof part !== 'object' || Array.isArray(part)) {
         return `${path}.content[${p}] must be an object`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Content part types the gateway can forward upstream, and how each is turned
+ * into an upstream frame: `text`/`input_text` become prompt text,
+ * `image_url`/`input_image` become uploaded attachments. Anything else —
+ * `input_audio`, `file`, `video_url`, or a future type — has no upstream
+ * representation, so forwarding the rest of the request would answer a question
+ * the user never finished asking.
+ */
+const FORWARDABLE_PART_KIND: Record<string, 'text' | 'image'> = {
+  text: 'text',
+  input_text: 'text',
+  image_url: 'image',
+  input_image: 'image',
+};
+
+/**
+ * Validates the parts of every `messages[].content` array and rejects the two
+ * shapes that used to be dropped silently on the way to the prompt.
+ *
+ * Why this exists: `extractMessageText` keeps only parts whose type is
+ * `text`/`input_text` and `collectImageRefs` keeps only fetchable image URLs.
+ * Everything else disappears while the request continues, so an `input_audio`
+ * or `file` part reached the upstream as an empty prompt and the caller got a
+ * 200 with an unrelated greeting and `usage.prompt_tokens: 0`. Data loss with
+ * a success status is undetectable from the client side, hence a 400.
+ *
+ * Two rules, matching how `n`/`response_format` are handled next door:
+ *  - a part the gateway cannot forward → `unsupported_parameter`, naming it;
+ *  - a part it claims to support but cannot use (an `image_url` with no
+ *    fetchable URL, a `text` with no string `text`) → `invalid_request_error`,
+ *    since the caller's payload is malformed rather than merely unimplemented.
+ *
+ * Empty content that carries nothing at all is a separate failure, checked in
+ * the handler once the prompt is assembled.
+ */
+export function contentPartError(messages: unknown[]): ParamError | null {
+  for (let i = 0; i < messages.length; i++) {
+    const frame: unknown = messages[i];
+    const content = (frame as { content?: unknown } | null)?.content;
+    if (!Array.isArray(content)) {
+      continue;
+    }
+    for (let p = 0; p < content.length; p++) {
+      const raw: unknown = content[p];
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        continue; // messageShapeError already reported the non-object part
+      }
+      // Every entry of an array is an object here; Record gives the unvalidated
+      // fields a typed home instead of `any` at each read below.
+      const part = raw as Record<string, unknown>;
+      const path = `messages[${i}].content[${p}]`;
+      const { type } = part;
+      if (typeof type !== 'string' || type === '') {
+        return { message: `${path}.type must be a string`, param: 'messages' };
+      }
+      const kind = FORWARDABLE_PART_KIND[type];
+      if (!kind) {
+        return {
+          message: `Unsupported parameter: 'messages' contains a content part of type "${type}", which is not supported by this gateway`,
+          param: 'messages',
+          code: 'unsupported_parameter',
+        };
+      }
+      if (kind === 'text') {
+        if (typeof part.text !== 'string') {
+          return { message: `${path}.text must be a string`, param: 'messages' };
+        }
+        continue;
+      }
+      // Image part: the upload path only resolves data:/http(s) URLs, so a part
+      // it cannot resolve would silently contribute nothing to the request.
+      if (!isUsableImagePart({ ...part, type })) {
+        return { message: `${path}.image_url must carry a data: or http(s) URL`, param: 'messages' };
       }
     }
   }
@@ -974,6 +1054,26 @@ export function createApp(options?: AppOptions) {
       );
     }
 
+    // Input parts the gateway cannot forward must be rejected, never dropped:
+    // an `input_audio` or `file` part disappears while building the prompt, so
+    // the upstream answers an empty question and the caller gets a 200 with an
+    // unrelated greeting and `prompt_tokens: 0`. Rejecting here keeps the
+    // failure legible and spends no upstream call.
+    const partErr = contentPartError(req.messages);
+    if (partErr) {
+      return c.json(
+        {
+          error: {
+            message: partErr.message,
+            type: 'invalid_request_error',
+            param: partErr.param,
+            code: partErr.code ?? 'invalid_request_error',
+          },
+        },
+        400
+      );
+    }
+
     // `n` and `logprobs` change the SHAPE of the reply, not just its wording:
     // a client indexing `choices[n-1]` or reading `choices[0].logprobs` breaks
     // when the gateway silently answers one plain choice. The anonymous
@@ -1080,6 +1180,27 @@ export function createApp(options?: AppOptions) {
       ? req.messages.filter((m) => m.role === 'user')
       : req.messages;
     const imageRefs = refSource.flatMap((m) => collectImageRefs(m.content as any));
+
+    // A request with neither text nor an attachment carries nothing the
+    // upstream can answer: it greets the caller and the client reads a 200 it
+    // never asked for. This covers `content: ""`, an empty `content: []`, and a
+    // history whose only text-bearing frames were assistant/tool frames. An
+    // image-only message is legitimate (vision requests carry no prompt text),
+    // so images count as content.
+    if (prompt.trim() === '' && imageRefs.length === 0) {
+      return c.json(
+        {
+          error: {
+            message:
+              'Invalid parameter: the request carries no user text and no image attachment, so there is nothing to answer',
+            type: 'invalid_request_error',
+            param: 'messages',
+            code: 'invalid_request_error',
+          },
+        },
+        400
+      );
+    }
 
     const client = options?.client || new UpstreamClient();
     const dm = options?.deviceManager || defaultDeviceManager;

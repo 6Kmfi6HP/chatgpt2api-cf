@@ -384,6 +384,15 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 `Invalid parameter: messages[0].content must be a string, an array of content parts, or null.`
 请求体本身是 JSON `null` 或非对象值时同样返回 400。
 
+网关无法转发的输入内容片段一律拒绝，绝不静默丢弃。只有 `text`/`input_text`（转成 prompt 文本）与
+`image_url`/`input_image`（转成上传附件）有对应的上游表示；`input_audio`、`file`、`video_url` 或未知
+类型会返回 HTTP 400 `invalid_request_error`（`param: "messages"`、`code: "unsupported_parameter"`）并
+点名该类型。在此之前这类片段会被丢掉而请求继续执行，上游收到空 prompt，客户端拿到 200 的一句寒暄
+和 `usage.prompt_tokens: 0`。声称支持但实际不可用的情况——`image_url` 没有 `data:`/`http(s)` URL、
+`text` 片段没有字符串 `text`——返回 400（`code: "invalid_request_error"`）。组装后的 prompt 为空
+（`content: ""`、`content: []`，或整段历史没有用户文本）时返回 400 `invalid_request_error`，而不是
+回答一个空问题。流式请求在任何 SSE 帧打开之前就以 JSON 形式返回 400。
+
 回复末尾的冒号属于正文，不属于标记。只有**行首**的冒号串才可能长成裸 genui 围栏（`^:::`），
 因此 `Key details:` 在流式与非流式中都会保留末尾冒号；行首的 `::` 仍会被暂扣，直到它补全成
 围栏或在 flush 时被丢弃。
