@@ -3,6 +3,7 @@ import {
   MAX_STOP_SEQUENCES,
   SamplingLimiter,
   resolveSampling,
+  booleanControlParamError,
   responseShapeParamError,
   samplingParamError,
   stopPrefixSuffix,
@@ -308,6 +309,57 @@ describe('responseShapeParamError — response_format / modalities / audio', () 
       const err = responseShapeParamError(req({ audio: value }));
       expect(err?.param).toBe('audio');
       expect(err?.code).toBeUndefined();
+    }
+  });
+});
+
+describe('booleanControlParamError', () => {
+  // Guards: `stream`/`stream_options.include_usage`/`search` are booleans on the
+  // OpenAI wire. Reading them as JavaScript truthiness silently turns
+  // "stream":"false" into an SSE stream and include_usage:"false" into a usage
+  // frame, which clients cannot detect before their own parser throws.
+  it('accepts absent and real booleans for every control field', () => {
+    expect(booleanControlParamError(req({}))).toBeNull();
+    for (const value of [true, false]) {
+      expect(booleanControlParamError(req({ stream: value }))).toBeNull();
+      expect(booleanControlParamError(req({ search: value }))).toBeNull();
+      expect(
+        booleanControlParamError(req({ stream_options: { include_usage: value } }))
+      ).toBeNull();
+    }
+  });
+
+  it('treats null as absent so a client that sends null keeps the default', () => {
+    expect(booleanControlParamError(req({ stream: null, search: null }))).toBeNull();
+    expect(booleanControlParamError(req({ stream_options: { include_usage: null } }))).toBeNull();
+  });
+
+  it('rejects a non-boolean stream and names the param', () => {
+    for (const value of ['false', 'true', 0, 1, {}, []]) {
+      const err = booleanControlParamError(req({ stream: value }));
+      expect(err?.param).toBe('stream');
+      expect(err?.message).toContain('boolean');
+    }
+  });
+
+  it('rejects a non-boolean search', () => {
+    for (const value of ['false', 'true', 0, 1, {}]) {
+      const err = booleanControlParamError(req({ search: value }));
+      expect(err?.param).toBe('search');
+    }
+  });
+
+  it('rejects a non-boolean stream_options.include_usage', () => {
+    for (const value of ['false', 'false', 0, -1, 'no']) {
+      const err = booleanControlParamError(req({ stream_options: { include_usage: value } }));
+      expect(err?.param).toBe('stream_options.include_usage');
+    }
+  });
+
+  it('rejects a non-object stream_options instead of dropping it', () => {
+    for (const value of ['x', 7, []]) {
+      const err = booleanControlParamError(req({ stream_options: value }));
+      expect(err?.param).toBe('stream_options');
     }
   });
 });
