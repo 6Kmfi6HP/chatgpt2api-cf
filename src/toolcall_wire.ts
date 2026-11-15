@@ -15,6 +15,7 @@ import {
   stripGenuiMarkers,
   toOpenAIToolCalls,
   tryParseToolCall,
+  tryParseTruncatedToolCall,
 } from './toolcall';
 import type { GenericMessage, SingleCallOptions, ToolDefinition, UpstreamMessage } from './toolcall';
 import { buildAnonRequest } from './translate';
@@ -238,8 +239,12 @@ export function buildToolCallsChatMessage(
   content: string | null;
   tool_calls: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
 } | null {
-  const parsed = tryParseToolCall(stripGenuiMarkers(text));
-  if (!parsed) return null;
+  const cleaned = stripGenuiMarkers(text);
+  // A limit (max_tokens / stop) can cut the payload mid-JSON; the calls the
+  // model already emitted are still real, so salvage them instead of shipping
+  // the gateway's own protocol prefix as assistant content.
+  const parsed = tryParseToolCall(cleaned) ?? tryParseTruncatedToolCall(cleaned);
+  if (!parsed || parsed.length === 0) return null;
   const calls = opts?.singleCall ? selectSingleToolCall(parsed, opts.preferredName) : parsed;
   return { role: 'assistant', content: null, tool_calls: toOpenAIToolCalls(calls) };
 }

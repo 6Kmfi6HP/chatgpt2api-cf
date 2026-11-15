@@ -14,9 +14,9 @@ import {
   stripGenuiContainers,
   resolveWithheld,
 } from './citations';
-import { ToolCallStreamState } from './toolcall_stream';
+import { ToolCallStreamState, type StreamEmit } from './toolcall_stream';
 import { buildToolCallsChatMessage } from './toolcall_wire';
-import { toolChoiceName } from './toolcall';
+import { isTruncatedToolCallPrefix, toolChoiceName } from './toolcall';
 import { SamplingLimiter, resolveSampling, stopPrefixSuffix } from './sampling';
 import {
   buildOpenAIChunk,
@@ -221,59 +221,14 @@ export class StreamProcessor {
     // buffer (JSON could still be a tool call), flush (plain text — emit the
     // pending delta), or emit tool_calls deltas instead of content.
     if (this.toolCallState) {
-      const emits = this.toolCallState.feed(fullClean);
-      const out: ChatCompletionChunk[] = [];
-      for (const e of emits) {
-        if (e.delta?.tool_calls) {
-          if (!this.emittedRole) {
-            this.emittedRole = true;
-            out.push(
-              buildOpenAIChunk(this.messageId, this.created, this.model, {
-                role: 'assistant',
-              })
-            );
-          }
-          out.push(
-            buildOpenAIChunk(this.messageId, this.created, this.model, e.delta as any)
-          );
-        } else if (e.delta?.content) {
-          if (!this.emittedRole) {
-            this.emittedRole = true;
-            out.push(
-              buildOpenAIChunk(this.messageId, this.created, this.model, {
-                role: 'assistant',
-              })
-            );
-          }
-          out.push(
-            buildOpenAIChunk(this.messageId, this.created, this.model, {
-              content: e.delta.content,
-            })
-          );
-        }
-      }
-      // A fired limit ends the reply while the detector may still be buffering
-      // text that could have become a tool-call JSON. Upstream will send no
-      // further snapshots to flush it, so release it as content now rather
-      // than losing the whole reply.
-      if (this.sampling.limitFinish() !== null && !this.toolCallState.emittedToolCalls) {
-        const pending = fullClean.slice(this.toolCallState.lastEmittedLen);
-        if (pending) {
-          if (!this.emittedRole) {
-            this.emittedRole = true;
-            out.push(
-              buildOpenAIChunk(this.messageId, this.created, this.model, {
-                role: 'assistant',
-              })
-            );
-          }
-          out.push(
-            buildOpenAIChunk(this.messageId, this.created, this.model, {
-              content: pending,
-            })
-          );
-          this.toolCallState.lastEmittedLen = fullClean.length;
-        }
+      const out = this.chunksFromEmits(this.toolCallState.feed(fullClean));
+      // A fired limit ends the reply while the detector may still be holding
+      // text that could have become a tool-call payload: upstream sends no
+      // further snapshot to resolve it, so decide those bytes here — recover
+      // the calls it carried, drop our own carrier, or release a JSON answer
+      // the limit merely cut short.
+      if (this.sampling.limitFinish() !== null) {
+        out.push(...this.chunksFromEmits(this.toolCallState.releaseHeld(fullClean)));
       }
       this.prevText = fullClean;
       return out;
@@ -310,6 +265,28 @@ export class StreamProcessor {
   }
 
   /**
+   * Convert detection emits into OpenAI chunks. The assistant role frame is
+   * emitted once, before the first delta of any kind, so a reply that turns
+   * out to be tool calls still opens with a well-formed role chunk.
+   */
+  private chunksFromEmits(emits: StreamEmit[]): ChatCompletionChunk[] {
+    const out: ChatCompletionChunk[] = [];
+    for (const e of emits) {
+      if (!e.delta) continue;
+      if (!this.emittedRole) {
+        this.emittedRole = true;
+        out.push(
+          buildOpenAIChunk(this.messageId, this.created, this.model, {
+            role: 'assistant',
+          })
+        );
+      }
+      out.push(buildOpenAIChunk(this.messageId, this.created, this.model, e.delta));
+    }
+    return out;
+  }
+
+  /**
    * Flushes stream tail and emits terminal chunks:
    * 1. Any resolved withheld citation fragment and the held stop-prefix (if any)
    * 2. Final chunk with finish_reason ("stop"/"length"/"tool_calls"), never
@@ -324,22 +301,10 @@ export class StreamProcessor {
     // detector buffers it for the entire turn. Release it here — the turn is
     // over, so held text is content, not a pending tool call.
     if (this.toolCallState) {
-      for (const e of this.toolCallState.finalize()) {
-        if (!e.delta?.content) continue;
-        if (!this.emittedRole) {
-          this.emittedRole = true;
-          out.push(
-            buildOpenAIChunk(this.messageId, this.created, this.model, {
-              role: 'assistant',
-            })
-          );
-        }
-        out.push(
-          buildOpenAIChunk(this.messageId, this.created, this.model, {
-            content: e.delta.content,
-          })
-        );
-      }
+      // The detector may still be holding the whole reply: a plain JSON answer
+      // (leading "{", no tool_calls) never resolves, and a limit-truncated
+      // payload is decided the same way (see ToolCallStreamState.releaseHeld).
+      out.push(...this.chunksFromEmits(this.toolCallState.finalize()));
     }
     const emittedToolCalls = this.toolCallState?.emittedToolCalls === true;
     if (this.withheld || this.withheldGenui || this.withheldStop) {
@@ -384,7 +349,10 @@ export class StreamProcessor {
         this.messageId,
         this.created,
         this.model,
-        emittedToolCalls ? 'tool_calls' : this.sampling.limitFinish() ?? 'stop'
+        // A fired limit is the reason the reply stopped producing: OpenAI
+        // reports "length" with the partial arguments when max_tokens cuts a
+        // tool call, and "stop" when a stop sequence does.
+        this.sampling.limitFinish() ?? (emittedToolCalls ? 'tool_calls' : 'stop')
       )
     );
 
@@ -706,7 +674,10 @@ export async function aggregateNonStreamWithSignals(
 
   // Tool-call conversion: when the reply matches the tool-call convention,
   // return an assistant message carrying tool_calls (content=null) and
-  // finish_reason "tool_calls".
+  // finish_reason "tool_calls". A limit-cut payload is salvaged the same way;
+  // the fired limit stays the reported reason (OpenAI reports "length" when
+  // max_tokens cuts a call, "stop" when a stop sequence does).
+  const limitReason = limiter.limitFinish();
   const toolMsg = buildToolCallsChatMessage(finalText, {
     singleCall: originalReq?.parallel_tool_calls === false,
     preferredName: toolChoiceName(originalReq?.tool_choice),
@@ -721,7 +692,7 @@ export async function aggregateNonStreamWithSignals(
         {
           index: 0,
           message: toolMsg,
-          finish_reason: 'tool_calls',
+          finish_reason: limitReason ?? 'tool_calls',
         },
       ],
       usage: {
@@ -733,14 +704,21 @@ export async function aggregateNonStreamWithSignals(
     return { result, usedWebSearch };
   }
 
+  // A cut left nothing but the tail of our own protocol carrier (no call name
+  // survived). That text is the gateway's encoding, not an answer, so report
+  // an empty completion instead of shipping it as assistant content.
+  const leakedCarrier = limitReason !== null && isTruncatedToolCallPrefix(finalText);
+  const answer = leakedCarrier ? '' : finalText;
+  const answerTokens = leakedCarrier ? 0 : completionTokens;
+
   const result = buildOpenAICompletion(
     genID('chatcmpl-'),
     Math.floor(Date.now() / 1000),
     model,
-    finalText,
+    answer,
     promptTokens,
-    completionTokens,
-    limiter.limitFinish() ?? 'stop'
+    answerTokens,
+    limitReason ?? 'stop'
   );
   return { result, usedWebSearch };
 }
