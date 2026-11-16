@@ -1,4 +1,11 @@
-import { tryParseToolCall, stripGenuiMarkers, selectSingleToolCall, type ParsedToolCall } from './toolcall';
+import {
+  isTruncatedToolCallPrefix,
+  tryParseToolCall,
+  tryParseTruncatedToolCall,
+  stripGenuiMarkers,
+  selectSingleToolCall,
+  type ParsedToolCall,
+} from './toolcall';
 
 /**
  * Streaming tool-call detection for the OpenAI-compatible gateway.
@@ -126,6 +133,10 @@ export class ToolCallStreamState {
   public emittedToolCalls = false;
   public flushing = false;
   public lastEmittedLen = 0;
+  /** True once held protocol bytes were dropped instead of shipped as content. */
+  public suppressedProtocol = false;
+  /** True once calls were salvaged from a payload a cut left unfinished. */
+  public truncatedSalvage = false;
   private detector: ToolCallStreamDetector;
   /** Latest cumulative snapshot, so finalize() can release what feed() held. */
   private lastAccumulated = '';
@@ -151,14 +162,18 @@ export class ToolCallStreamState {
     }
 
     // emit_tool_calls
-    this.emittedToolCalls = true;
+    return this.toolCallEmits(decision.toolCalls ?? []);
+  }
+
+  /** Turn parsed calls into indexed tool_calls deltas (single-call aware). */
+  private toolCallEmits(parsed: ParsedToolCall[]): StreamEmit[] {
+    this.emittedToolCalls = parsed.length > 0;
     this.flushing = true;
     const out: StreamEmit[] = [];
     // The accumulated text IS the tool-call JSON — never leak it as content.
     // (Any stray leading prose would have triggered 'flush' earlier.)
     // parallel_tool_calls:false keeps one call; indexes restart at 0 so the
     // client sees a single, contiguous call rather than a gap.
-    const parsed = decision.toolCalls ?? [];
     const calls = this.singleCall ? selectSingleToolCall(parsed, this.preferredName) : parsed;
     calls.forEach((c, i) => {
       out.push({
@@ -178,15 +193,38 @@ export class ToolCallStreamState {
   }
 
   /**
+   * Decide what `feed` still holds once no later snapshot can resolve it: the
+   * turn ended (a limit fired, or upstream closed the stream) while the text
+   * could still have become a tool call. Recoverable calls become tool_calls
+   * deltas, an unrecoverable protocol prefix is dropped (it is the gateway's
+   * own carrier, not an answer — see [audit:truncated-tool-json-leak]), and a
+   * held plain JSON answer is content the turn merely cut short.
+   */
+  releaseHeld(accumulated: string): StreamEmit[] {
+    if (this.emittedToolCalls || this.flushing) return [];
+    this.flushing = true;
+    const held = accumulated.slice(this.lastEmittedLen);
+    this.lastEmittedLen = accumulated.length;
+    if (isTruncatedToolCallPrefix(held)) {
+      const calls = tryParseTruncatedToolCall(held) ?? [];
+      if (calls.length > 0) {
+        this.truncatedSalvage = true;
+        return this.toolCallEmits(calls);
+      }
+      this.suppressedProtocol = true;
+      return [];
+    }
+    return held ? [{ delta: { content: held } }] : [];
+  }
+
+  /**
    * Terminal drain for the turn. `feed` withholds text that might still resolve
    * into the tool-call convention; when the turn ends unresolved (a plain JSON
    * reply such as `{"answer": 42}`) that withheld text is real assistant
    * content and must be emitted, not discarded.
    */
   finalize(): StreamEmit[] {
-    const decision = this.detector.finalize();
-    if (decision.decision !== 'flush') return [];
-    return this.emitContent(this.lastAccumulated);
+    return this.releaseHeld(this.lastAccumulated);
   }
 
   /** Emit the not-yet-sent suffix of `accumulated` as one content delta. */

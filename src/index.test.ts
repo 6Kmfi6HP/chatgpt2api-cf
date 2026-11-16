@@ -795,6 +795,67 @@ describe('Hono Application (src/index.ts)', () => {
       expect(bodyText).toContain('data: [DONE]');
     });
 
+    // Guards [audit:truncated-tool-json-leak] on the streaming retry path:
+    // retryToolTurn aggregates a limit-cut tool call into finish_reason
+    // "length" with partial arguments, and emitAggregatedAsStream must replay
+    // those calls into the SSE stream instead of dropping them and sending an
+    // empty text stream (which would report no call at all to the client).
+    it('streaming retry replays a limit-cut tool call instead of dropping it', async () => {
+      let callCount = 0;
+      mockClient.conversationHandler = async () => {
+        callCount++;
+        if (callCount === 1) {
+          return createSseResponse([
+            `data: ${JSON.stringify(mkAssistantEvent("I'm unable to access that tool."))}\n\n`,
+          ]);
+        }
+        // Attempt 2 is a tool call JSON cut by max_tokens: salvage keeps the
+        // call with partial arguments and reports finish_reason "length".
+        return createSseResponse([
+          `data: ${JSON.stringify(
+            mkAssistantEvent(
+              '{"tool_calls":[{"name":"search_docs","arguments":{"query":"streaming sse usage","limit":5}}]}'
+            )
+          )}\n\n`,
+        ]);
+      };
+
+      const res = await app.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'auto',
+            stream: true,
+            search: false,
+            max_tokens: 16,
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'search_docs',
+                  description: 'Search docs',
+                  parameters: { type: 'object', properties: {} },
+                },
+              },
+            ],
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+        },
+        mockEnv
+      );
+
+      expect(res.status).toBe(200);
+      const bodyText = await res.text();
+      expect(callCount).toBe(2);
+      expect(bodyText).toContain('"name":"search_docs"');
+      expect(bodyText).toContain('"finish_reason":"length"');
+      // The unrecoverable protocol prefix never becomes assistant content.
+      expect(bodyText).not.toContain('"content":"{\\"tool_calls\\"');
+      expect(bodyText).toContain('data: [DONE]');
+    });
+
     it('streaming refusal retries are exhausted: the last refusal streams as-is', async () => {
       const tool = {
         type: 'function',
@@ -2210,6 +2271,54 @@ describe('sampling parameters (max_tokens / stop)', () => {
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain('"finish_reason":"length"');
+    expect(body).toContain('data: [DONE]');
+  });
+
+  // Guards [audit:truncated-tool-json-leak] at the HTTP surface: a max_tokens
+  // cut must reach the client as the calls the model emitted, never as the
+  // gateway's own protocol JSON pasted into message.content.
+  const truncatedPayload =
+    '{"tool_calls":[{"name":"search_docs","arguments":{"query":"streaming sse usage","limit":5}}]}';
+  const docsTool = [
+    {
+      type: 'function',
+      function: {
+        name: 'search_docs',
+        description: 'Search docs',
+        parameters: { type: 'object', properties: {} },
+      },
+    },
+  ];
+
+  it('returns salvaged tool_calls with finish_reason length on a non-stream cut', async () => {
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent(truncatedPayload))}\n\n`]);
+
+    const res = await post({ stream: false, max_tokens: 16, tools: docsTool });
+    expect(res.status).toBe(200);
+    const data: {
+      choices: Array<{
+        message: { content: string | null; tool_calls?: Array<{ function: { name: string; arguments: string } }> };
+        finish_reason: string;
+      }>;
+    } = await res.json();
+    const choice = data.choices[0];
+    expect(choice.finish_reason).toBe('length');
+    expect(choice.message.content).toBeNull();
+    expect(choice.message.tool_calls?.[0].function.name).toBe('search_docs');
+    expect(choice.message.tool_calls?.[0].function.arguments).toBe('{"query":"streamin');
+  });
+
+  it('streams salvaged tool_calls with finish_reason length and no leaked carrier', async () => {
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent(truncatedPayload))}\n\n`]);
+
+    const res = await post({ stream: true, max_tokens: 16, tools: docsTool });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('"name":"search_docs"');
+    expect(body).toContain('"finish_reason":"length"');
+    expect(body).not.toContain('"content":"{\\"tool_calls\\"');
     expect(body).toContain('data: [DONE]');
   });
 });

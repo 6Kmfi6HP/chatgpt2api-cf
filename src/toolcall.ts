@@ -251,6 +251,134 @@ export function tryParseToolCall(text: string): ParsedToolCall[] | null {
   return out;
 }
 
+/** Canonical opening of the protocol payload; prefixes of it are also artifacts. */
+const TRUNCATED_OPENER = '{"tool_calls":[';
+const TRUNCATED_TOOL_CALL_OPEN = /^\{\s*"tool_calls"\s*:\s*\[/;
+
+/**
+ * True when `text` is an interrupted tool-call protocol payload: it opens the
+ * `{"tool_calls":[` carrier but never became parseable JSON. Such text is a
+ * transport artifact, never an assistant answer (see [audit:truncated-tool-json-leak]).
+ */
+export function isTruncatedToolCallPrefix(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed === '') return false;
+  if (TRUNCATED_TOOL_CALL_OPEN.test(trimmed)) return true;
+  // A cut inside the header itself ("{"tool_calls") still carries no answer.
+  return TRUNCATED_OPENER.startsWith(trimmed.replace(/\s+/g, ''));
+}
+
+/**
+ * Split the array body into entry slices at brace depth 0. The last slice may
+ * be unterminated: the cut landed inside it (or right after its opener).
+ */
+function splitTruncatedEntries(body: string): string[] {
+  const entries: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        entries.push(body.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  if (start >= 0) entries.push(body.slice(start));
+  return entries;
+}
+
+/** The entry's tool name; also reads a name literal the cut left open. */
+function truncatedEntryName(entry: string): string | null {
+  const m =
+    /"name"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(entry) ??
+    /"name"\s*:\s*"((?:[^"\\]|\\.)*)$/.exec(entry);
+  if (!m) return null;
+  try {
+    return JSON.parse(`"${m[1]}"`);
+  } catch {
+    // An escape the cut left dangling: keep the literal bytes.
+    return m[1];
+  }
+}
+
+/** The entry's arguments text, normalized to the OpenAI wire shape. */
+function truncatedEntryArguments(entry: string): string {
+  const key = entry.search(/"arguments"\s*:/);
+  if (key < 0) return '{}';
+  return normalizeTruncatedArguments(entry.slice(entry.indexOf(':', key) + 1));
+}
+
+/** Normalize the salvaged arguments text to the OpenAI wire shape (a string). */
+function normalizeTruncatedArguments(raw: string): string {
+  if (/^[,[\]{}\s]*$/.test(raw)) return '{}';
+  let s = raw.trim();
+  // Every entry but the last carries the closers of its own object; the last
+  // one may end mid-value. Drop one trailing structural byte at a time so a
+  // complete object still round-trips, and keep the model's bytes when the
+  // text never parses (a cut argument is not valid JSON, which is what OpenAI
+  // reports too).
+  for (;;) {
+    try {
+      const value: unknown = JSON.parse(s);
+      if (typeof value !== 'string') return JSON.stringify(value);
+      try {
+        return JSON.stringify(JSON.parse(value));
+      } catch {
+        return value;
+      }
+    } catch {
+      // Not parseable yet: maybe only structural bytes are left over.
+    }
+    if (!/[,\]}\s]$/.test(s)) return s;
+    s = s.slice(0, -1).trimEnd();
+  }
+}
+
+/**
+ * Salvage tool calls from a protocol payload a limit cut mid-JSON.
+ *
+ * Returns the calls whose `"name"` survived, with the arguments text exactly
+ * as the model generated it (possibly not valid JSON, which is what OpenAI
+ * also reports when `max_tokens` cuts a call). Returns `[]` when the payload
+ * carries no recoverable call, and `null` when `text` is not a truncated
+ * protocol payload at all.
+ */
+export function tryParseTruncatedToolCall(text: string): ParsedToolCall[] | null {
+  if (text.length > MAX_PARSE_LENGTH) return [];
+  if (!isTruncatedToolCallPrefix(text)) return null;
+  const trimmed = text.trim();
+  // Complete JSON stays with the normal path: it either already converted to
+  // tool_calls or it is a genuine answer that merely mentions the key.
+  try {
+    JSON.parse(trimmed);
+    return null;
+  } catch {
+    // Truncated payload: salvage what the model emitted before the cut.
+  }
+  const out: ParsedToolCall[] = [];
+  for (const entry of splitTruncatedEntries(trimmed.slice(trimmed.indexOf('[') + 1))) {
+    const name = truncatedEntryName(entry);
+    if (name === null || name === '') continue;
+    out.push({ name, arguments: truncatedEntryArguments(entry) });
+  }
+  return out;
+}
+
 const CALL_ID_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
 /** Generate a `call_` id with 22 random [a-zA-Z0-9] chars. */

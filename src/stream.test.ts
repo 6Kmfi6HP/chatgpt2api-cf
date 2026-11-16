@@ -444,6 +444,80 @@ describe('StreamProcessor', () => {
     });
   });
 
+  // Guards [audit:truncated-tool-json-leak] on the streaming path: a limit
+  // ends the turn while the detector is still holding the protocol JSON, so
+  // upstream sends no snapshot that could resolve it. The held text must
+  // become tool_calls (recoverable) or nothing — never `content`.
+  describe('tools request truncated mid tool-call JSON', () => {
+    const toolsReq = (extra?: Partial<ChatCompletionRequest>): ChatCompletionRequest => ({
+      model: 'gpt-4o',
+      stream: true,
+      messages: [{ role: 'user', content: 'search the docs' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'search_docs', description: 'Search docs', parameters: { type: 'object' } },
+        },
+      ],
+      ...extra,
+    });
+
+    const joinContent = (chunks: ChatCompletionChunk[]): string =>
+      chunks.map((c) => c.choices?.[0]?.delta?.content ?? '').join('');
+
+    const toolDeltas = (
+      chunks: ChatCompletionChunk[]
+    ): Array<{ function: { name: string; arguments: string } }> =>
+      chunks.flatMap((c) => c.choices?.[0]?.delta?.tool_calls ?? []);
+
+    it('reports the truncated payload as tool_calls instead of content at max_tokens', () => {
+      // 83-char payload, cap 16 tokens => the cut lands inside the query value:
+      // the name survives, the argument text does not parse.
+      const sp = new StreamProcessor('gpt-4o', toolsReq({ max_tokens: 16 }));
+      const first = sp.processEvent(
+        mkAssistantEvent(
+          '{"tool_calls":[{"name":"search_docs","arguments":{"query":"streaming sse usage","limit":5}}]}'
+        )
+      );
+      const tail = sp.flush();
+      const all = [...first, ...tail];
+      expect(joinContent(all)).toBe('');
+      const calls = toolDeltas(all);
+      expect(calls.length).toBe(1);
+      expect(calls[0].function.name).toBe('search_docs');
+      expect(calls[0].function.arguments).toBe('{"query":"streamin');
+      expect(tail.some((c) => c.choices[0]?.finish_reason === 'length')).toBe(true);
+    });
+
+    it('suppresses an unrecoverable protocol prefix instead of leaking it as content', () => {
+      // The cut lands inside the carrier header, before any call name exists.
+      const sp = new StreamProcessor('gpt-4o', toolsReq({ max_tokens: 3 }));
+      const first = sp.processEvent(
+        mkAssistantEvent('{"tool_calls":[{"name":"search_docs","arguments":{"query":"q"}}]}')
+      );
+      const tail = sp.flush();
+      const all = [...first, ...tail];
+      expect(joinContent(all)).toBe('');
+      expect(toolDeltas(all)).toEqual([]);
+      expect(tail.some((c) => c.choices[0]?.finish_reason === 'length')).toBe(true);
+    });
+
+    it('reports a stop-cut payload as tool_calls with finish_reason "stop"', () => {
+      const sp = new StreamProcessor('gpt-4o', toolsReq({ stop: ['usage'] }));
+      const first = sp.processEvent(
+        mkAssistantEvent(
+          '{"tool_calls":[{"name":"search_docs","arguments":{"query":"streaming sse usage","limit":5}}]}'
+        )
+      );
+      const all = [...first, ...sp.flush()];
+      expect(joinContent(all)).toBe('');
+      const calls = toolDeltas(all);
+      expect(calls[0].function.name).toBe('search_docs');
+      expect(calls[0].function.arguments).toBe('{"query":"streaming sse');
+      expect(all.some((c) => c.choices[0]?.finish_reason === 'stop')).toBe(true);
+    });
+  });
+
   it('flushes the held stop-prefix before the citation and genui tails', () => {
     const sp = new StreamProcessor('gpt-4o');
     sp.withheldStop = 'ST';
@@ -1155,6 +1229,90 @@ describe('sampling limits (stop / max_tokens)', () => {
     const result = await aggregateNonStream(resp, 'gpt-4o', req);
     expect(result.choices[0].message.content).toBe('1, 2, ST');
     expect(result.choices[0].finish_reason).toBe('stop');
+  });
+
+  // Guards [audit:truncated-tool-json-leak] on the aggregated (non-stream)
+  // path: the limiter cuts the reply before the tool-call parser runs, so the
+  // unparseable protocol prefix used to become message.content verbatim.
+  describe('tools request truncated mid tool-call JSON', () => {
+    const req = (extra?: Partial<ChatCompletionRequest>): ChatCompletionRequest => ({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'search the docs' }],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'search_docs',
+            description: 'Search docs',
+            parameters: { type: 'object' },
+          },
+        },
+      ],
+      ...extra,
+    });
+
+    it('returns recovered tool_calls with finish_reason length at max_tokens', async () => {
+      const resp = createSseResponse([
+        `data: ${JSON.stringify(
+          mkAssistantEvent(
+            '{"tool_calls":[{"name":"search_docs","arguments":{"query":"streaming sse usage","limit":5}}]}'
+          )
+        )}\n\n`,
+      ]);
+
+      const result = await aggregateNonStream(resp, 'gpt-4o', req({ max_tokens: 16 }));
+      const choice = result.choices[0];
+      expect(choice.finish_reason).toBe('length');
+      expect(choice.message.content).toBeNull();
+      expect(choice.message.tool_calls?.length).toBe(1);
+      expect(choice.message.tool_calls?.[0].function.name).toBe('search_docs');
+      expect(choice.message.tool_calls?.[0].function.arguments).toBe('{"query":"streamin');
+    });
+
+    it('never ships an unrecoverable protocol prefix as content', async () => {
+      const resp = createSseResponse([
+        `data: ${JSON.stringify(
+          mkAssistantEvent('{"tool_calls":[{"name":"search_docs","arguments":{"query":"q"}}]}')
+        )}\n\n`,
+      ]);
+
+      const result = await aggregateNonStream(resp, 'gpt-4o', req({ max_tokens: 3 }));
+      const choice = result.choices[0];
+      expect(choice.finish_reason).toBe('length');
+      expect(choice.message.tool_calls ?? []).toEqual([]);
+      expect(choice.message.content).toBe('');
+    });
+
+    it('returns recovered tool_calls with finish_reason stop when a stop sequence cuts the JSON', async () => {
+      const resp = createSseResponse([
+        `data: ${JSON.stringify(
+          mkAssistantEvent(
+            '{"tool_calls":[{"name":"search_docs","arguments":{"query":"streaming sse usage","limit":5}}]}'
+          )
+        )}\n\n`,
+      ]);
+
+      const result = await aggregateNonStream(resp, 'gpt-4o', req({ stop: ['usage'] }));
+      const choice = result.choices[0];
+      expect(choice.finish_reason).toBe('stop');
+      expect(choice.message.content).toBeNull();
+      expect(choice.message.tool_calls?.[0].function.name).toBe('search_docs');
+      expect(choice.message.tool_calls?.[0].function.arguments).toBe('{"query":"streaming sse');
+    });
+
+    it('leaves a complete tool-call reply as finish_reason tool_calls', async () => {
+      const resp = createSseResponse([
+        `data: ${JSON.stringify(
+          mkAssistantEvent('{"tool_calls":[{"name":"search_docs","arguments":{"query":"q"}}]}')
+        )}\n\n`,
+      ]);
+
+      const result = await aggregateNonStream(resp, 'gpt-4o', req({ max_tokens: 20 }));
+      const choice = result.choices[0];
+      expect(choice.finish_reason).toBe('tool_calls');
+      expect(choice.message.content).toBeNull();
+      expect(choice.message.tool_calls?.[0].function.arguments).toBe('{"query":"q"}');
+    });
   });
 
   it('caps an aggregated reply at max_tokens and reports finish_reason length', async () => {

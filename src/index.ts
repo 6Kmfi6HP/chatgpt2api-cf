@@ -692,15 +692,25 @@ async function emitAggregatedAsStream(
 ): Promise<void> {
   const sp = new StreamProcessor(model, req);
   const text = result.choices?.[0]?.message?.content ?? '';
-  if (result.choices?.[0]?.finish_reason === 'tool_calls') {
+  const resultCalls = result.choices?.[0]?.message?.tool_calls ?? [];
+  // A limit-cut reply reports "length"/"stop" while still carrying tool_calls,
+  // so key off the calls themselves instead of the finish reason.
+  if (resultCalls.length > 0) {
     const wire = JSON.stringify({
-      tool_calls: (result.choices?.[0]?.message?.tool_calls ?? []).map((tc: any) => ({
-        name: tc.function?.name,
-        arguments:
-          typeof tc.function?.arguments === 'string'
-            ? JSON.parse(tc.function.arguments || '{}')
-            : (tc.function?.arguments ?? {}),
-      })),
+      tool_calls: resultCalls.map((tc) => {
+        // A limit-cut call carries argument text that may not be valid JSON;
+        // embedding it as a string keeps the bytes the model produced.
+        const raw = tc.function?.arguments ?? '';
+        let args: unknown = raw;
+        if (raw.trim() !== '') {
+          try {
+            args = JSON.parse(raw);
+          } catch {
+            args = raw;
+          }
+        }
+        return { name: tc.function?.name, arguments: args };
+      }),
     });
     const synth = {
       type: 'message_stream',

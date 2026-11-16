@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   buildToolProtocolSystemMessage,
   tryParseToolCall,
+  tryParseTruncatedToolCall,
+  isTruncatedToolCallPrefix,
   buildUpstreamMessages,
   buildToolResultMessage,
   toOpenAIToolCalls,
@@ -172,6 +174,69 @@ describe('tryParseToolCall', () => {
     ['over 8000 chars', `{"tool_calls":[{"name":"f"}]}${'x'.repeat(8100)}`],
   ])('rejects %s', (_label, text) => {
     expect(tryParseToolCall(text)).toBeNull();
+  });
+});
+
+// Guards [audit:truncated-tool-json-leak]: the tool-call protocol JSON is a
+// transport carrier, not an answer. When a limit (max_tokens / stop) cuts the
+// reply mid-payload, the gateway must still recover the calls the model
+// actually emitted instead of shipping the raw prefix as assistant content.
+describe('tryParseTruncatedToolCall', () => {
+  it('recovers a call whose arguments string was cut mid-value', () => {
+    expect(
+      tryParseTruncatedToolCall('{"tool_calls":[{"name":"search_docs","arguments":{"query":"streamin')
+    ).toEqual([{ name: 'search_docs', arguments: '{"query":"streamin' }]);
+  });
+
+  it('recovers a call cut before any argument bytes', () => {
+    expect(tryParseTruncatedToolCall('{"tool_calls":[{"name":"sea')).toEqual([
+      { name: 'sea', arguments: '{}' },
+    ]);
+  });
+
+  it('recovers several calls and keeps the truncated last one', () => {
+    expect(
+      tryParseTruncatedToolCall(
+        '{"tool_calls":[{"name":"a","arguments":{"x":1}},{"name":"b","arguments":{"y":'
+      )
+    ).toEqual([
+      { name: 'a', arguments: '{"x":1}' },
+      { name: 'b', arguments: '{"y":' },
+    ]);
+  });
+
+  it.each([
+    ['protocol prefix with no recoverable name', '{"tool_calls":['],
+    ['entry before any name', '{"tool_calls":[{"argu'],
+    ['plain prose', 'Here is the weather in Paris.'],
+    ['plain JSON answer', '{"answer": 42}'],
+    ['empty string', ''],
+  ])('returns nothing for %s', (_label, text) => {
+    // null = "not a truncated payload", [] = "payload but no recoverable call";
+    // both mean the same for callers: nothing becomes assistant content.
+    expect(tryParseTruncatedToolCall(text) ?? []).toEqual([]);
+  });
+
+  it('does not salvage a payload that already parses completely', () => {
+    // The complete path owns that text; salvaging it here would emit a second
+    // set of calls with different ids for one model reply. null = "not mine".
+    expect(tryParseTruncatedToolCall('{"tool_calls":[{"name":"f","arguments":{"a":1}}]}')).toBeNull();
+  });
+});
+
+describe('isTruncatedToolCallPrefix', () => {
+  it('recognizes an interrupted protocol payload', () => {
+    expect(isTruncatedToolCallPrefix('{"tool_calls":[')).toBe(true);
+    expect(isTruncatedToolCallPrefix('  {"tool_calls" : [ {"name":"se')).toBe(true);
+  });
+
+  it.each([
+    ['plain prose', 'Here is the answer.'],
+    ['plain JSON answer', '{"answer": 42}'],
+    ['fenced tool call', '```json\n{"tool_calls":[{"name":"f"}]}\n```'],
+    ['empty string', ''],
+  ])('rejects %s', (_label, text) => {
+    expect(isTruncatedToolCallPrefix(text)).toBe(false);
   });
 });
 
