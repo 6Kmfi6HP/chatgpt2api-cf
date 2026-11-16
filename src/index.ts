@@ -18,7 +18,12 @@ import {
   type ResolvedImage,
 } from './image_parts';
 import { uploadImage, sniffImageMime, defaultExtensionForMime } from './upload';
-import { responseShapeParamError, samplingParamError, type ParamError } from './sampling';
+import {
+  booleanControlParamError,
+  responseShapeParamError,
+  samplingParamError,
+  type ParamError,
+} from './sampling';
 
 export interface AppOptions {
   client?: UpstreamClient;
@@ -1098,6 +1103,26 @@ export function createApp(options?: AppOptions) {
             type: 'invalid_request_error',
             param: 'messages',
             code: 'invalid_request_error',
+          },
+        },
+        400
+      );
+    }
+
+    // Shape-affecting boolean controls: `stream` selects SSE over JSON,
+    // `stream_options.include_usage` adds the usage frame, and `search` enables
+    // the upstream web search. Reading any of them as truthiness silently
+    // answered "stream":"false" with an SSE stream, so a non-boolean is
+    // rejected here — the same contract already applied to parallel_tool_calls.
+    const flagErr = booleanControlParamError(req);
+    if (flagErr) {
+      return c.json(
+        {
+          error: {
+            message: flagErr.message,
+            type: 'invalid_request_error',
+            param: flagErr.param,
+            code: flagErr.code ?? 'invalid_request_error',
           },
         },
         400

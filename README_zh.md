@@ -202,6 +202,10 @@ curl -X POST https://<your-worker>.workers.dev/v1/chat/completions \
 - 不带 `stream_options.include_usage` 时，任何分片都不会携带 `usage`。
 - token 数为近似值（启发式估算：中日韩文字按每字约 1.5 计，其余字符按每 4 字符约 1 计），任何非空文本至少记 1。
 - 等待上游较久时，网关会发送 SSE `: ping` 注释行以保活连接。
+- `stream`、`stream_options.include_usage`、`search` 必须是**真正的布尔值**。非布尔取值
+  （`"false"`、`0`、`{}` 等）会返回 `400 invalid_request_error` 并指明字段名，不再按真值语义
+  静默转换 —— 旧行为会让 `"stream": "false"` 返回 SSE 流、让 `include_usage: "false"` 仍然发用量帧。
+  传 `null` 视为未提供，保持默认行为。
 
 #### 非流式对话 (`stream: false`):
 

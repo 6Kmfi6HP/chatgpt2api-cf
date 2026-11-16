@@ -22,6 +22,9 @@ interface RawRequestParams {
   response_format?: unknown;
   modalities?: unknown;
   audio?: unknown;
+  stream?: unknown;
+  stream_options?: unknown;
+  search?: unknown;
 }
 
 function rawRequestParams(req: ChatCompletionRequest | undefined): RawRequestParams {
@@ -241,6 +244,63 @@ export function responseShapeParamError(
     };
   }
 
+  return null;
+}
+
+/**
+ * Request validation for the boolean control fields, which switch the shape of
+ * the reply rather than its wording.
+ *
+ * `stream` picks SSE over JSON, `stream_options.include_usage` adds the one
+ * usage frame, and `search` decides whether the upstream runs its own web
+ * search. All three were read as JavaScript truthiness, so an untrusted decoded
+ * body carrying `"stream": "false"` (a string, as produced by forwarding an
+ * environment variable straight into JSON) answered `text/event-stream`, and
+ * `include_usage: "false"` still emitted usage. Neither is detectable by the
+ * caller before its own parser throws, and `"search": 0` silently enabled the
+ * web search it meant to disable. Rejecting a non-boolean is the same contract
+ * the handler already enforces for `parallel_tool_calls`.
+ *
+ * `null` is treated as absent: some clients serialise an unset flag as null and
+ * expect the default. Validation runs before any upstream work, so a rejected
+ * request costs nothing.
+ */
+export function booleanControlParamError(
+  req: ChatCompletionRequest | undefined
+): ParamError | null {
+  const raw = rawRequestParams(req);
+  const flagError = (param: string): ParamError => ({
+    message: `Invalid parameter: '${param}' must be a boolean.`,
+    param,
+  });
+
+  if (raw.stream !== undefined && raw.stream !== null && typeof raw.stream !== 'boolean') {
+    return flagError('stream');
+  }
+  if (raw.search !== undefined && raw.search !== null && typeof raw.search !== 'boolean') {
+    return flagError('search');
+  }
+
+  const streamOptions = raw.stream_options;
+  if (streamOptions === undefined || streamOptions === null) {
+    return null;
+  }
+  // A non-object here would be read as "no options", hiding the caller's typo
+  // and silently dropping the usage frame it asked for.
+  if (typeof streamOptions !== 'object' || Array.isArray(streamOptions)) {
+    return {
+      message: "Invalid parameter: 'stream_options' must be an object.",
+      param: 'stream_options',
+    };
+  }
+  const includeUsage = 'include_usage' in streamOptions ? streamOptions.include_usage : undefined;
+  if (
+    includeUsage !== undefined &&
+    includeUsage !== null &&
+    typeof includeUsage !== 'boolean'
+  ) {
+    return flagError('stream_options.include_usage');
+  }
   return null;
 }
 

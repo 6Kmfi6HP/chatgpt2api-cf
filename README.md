@@ -202,6 +202,10 @@ Notes on the SSE stream (usage is delivered exactly as the OpenAI spec prescribe
 - Without `stream_options.include_usage`, no chunk carries `usage` at all.
 - Token counts are approximate (CJK-aware chars/4 heuristic), floored at 1 for any non-empty text.
 - During long upstream waits the gateway emits SSE `: ping` comment lines to keep the connection alive.
+- `stream`, `stream_options.include_usage` and `search` must be **real booleans**. A non-boolean value
+  (`"false"`, `0`, `{}`, …) returns `400 invalid_request_error` naming the field, instead of being read
+  as truthiness — which used to answer `"stream": "false"` with an SSE stream and emit usage for
+  `include_usage: "false"`. `null` counts as absent and keeps the default.
 
 #### Non-Streaming (`stream: false`):
 

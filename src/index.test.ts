@@ -2838,3 +2838,100 @@ describe('image fetch failures are caller faults, not gateway faults', () => {
     expect(client.conversationCalls).toHaveLength(0);
   });
 });
+
+describe('boolean control fields (stream / stream_options / search)', () => {
+  // Guards: the SSE-vs-JSON switch and the usage frame are driven by these
+  // fields. Before this fix they were read as JS truthiness, so "stream":
+  // "false" answered text/event-stream and include_usage:"false" still emitted
+  // a usage chunk — a shape change no client can detect without a parser throw.
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5-5', messages: [{ role: 'user', content: 'hi' }], ...payload }),
+      },
+      mockEnv
+    );
+  }
+
+  it('rejects stream:"false" instead of answering with an SSE stream', async () => {
+    const res = await post({ stream: 'false' });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; code: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('stream');
+    expect(data.error.code).toBe('invalid_request_error');
+    // No upstream work: the rejection must precede device acquisition.
+    expect(client.prepareCalls).toHaveLength(0);
+  });
+
+  it('rejects a non-boolean search', async () => {
+    const res = await post({ search: 'false' });
+    expect(res.status).toBe(400);
+    const data: { error: { param: string } } = await res.json();
+    expect(data.error.param).toBe('search');
+  });
+
+  it('rejects a non-boolean stream_options.include_usage', async () => {
+    const res = await post({ stream: true, stream_options: { include_usage: 'false' } });
+    expect(res.status).toBe(400);
+    const data: { error: { param: string } } = await res.json();
+    expect(data.error.param).toBe('stream_options.include_usage');
+  });
+
+  it('rejects a non-object stream_options', async () => {
+    const res = await post({ stream: true, stream_options: 'x' });
+    expect(res.status).toBe(400);
+    const data: { error: { param: string } } = await res.json();
+    expect(data.error.param).toBe('stream_options');
+  });
+
+  it('keeps stream:false as JSON and stream:true as SSE', async () => {
+    const jsonRes = await post({ stream: false });
+    expect(jsonRes.status).toBe(200);
+    expect(jsonRes.headers.get('content-type')).toContain('application/json');
+
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('streamed'))}\n\n`]);
+    const sseRes = await post({ stream: true });
+    expect(sseRes.status).toBe(200);
+    expect(sseRes.headers.get('content-type')).toContain('text/event-stream');
+    expect(await sseRes.text()).toContain('data: [DONE]');
+  });
+
+  it('keeps include_usage:false free of usage frames and include_usage:true with exactly one', async () => {
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('hi'))}\n\n`]);
+
+    const off = await (await post({ stream: true, stream_options: { include_usage: false } })).text();
+    const usageChunks = (body: string) =>
+      body
+        .split('\n')
+        .filter((l) => l.startsWith('data: ') && l.slice(6) !== '[DONE]')
+        .map((l) => JSON.parse(l.slice(6)))
+        .filter((c: any) => c.usage !== undefined);
+    expect(usageChunks(off)).toHaveLength(0);
+
+    const on = await (await post({ stream: true, stream_options: { include_usage: true } })).text();
+    const chunks = usageChunks(on);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].choices).toEqual([]);
+  });
+});
