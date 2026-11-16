@@ -348,6 +348,15 @@ print(response.choices[0].message.content)  # "John Hartman works on the 7th flo
 
 Streaming emits `delta.tool_calls` frames and `finish_reason: "tool_calls"`.
 
+The deprecated `functions` / `function_call` pair is **not** supported: the gateway compiles only
+`tools` into the upstream protocol, so a request carrying a non-empty `functions` list (with
+`function_call` absent, `"auto"`, or naming a function) is rejected with
+`400 invalid_request_error` (`param: "functions"`, `code: "unsupported_parameter"`) instead of being
+answered as plain prose with `finish_reason: "stop"`. Use `tools` / `tool_choice`. Two shapes stay
+accepted because neither asks for a call: an absent/empty `functions` list, and
+`function_call: "none"` (which already means "answer as a plain chat"). A `function_call` sent
+without any `functions` is a payload error (`param: "function_call"`).
+
 A plain JSON answer is content, not a tool call: when a request carries `tools` but the model
 replies with an ordinary JSON document (leading `{`, no `tool_calls`), the stream ends by
 flushing that held text as a `delta.content` frame. Tool-call detection withholds text only

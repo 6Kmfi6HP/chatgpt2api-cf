@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createApp, toolChoiceError, contentPartError, toolsParamError } from './index';
+import type { Hono } from 'hono';
+import {
+  createApp,
+  toolChoiceError,
+  contentPartError,
+  toolsParamError,
+  legacyFunctionsParamError,
+} from './index';
 import { clearCatalogCache } from './catalog';
 import { UpstreamClient, StatusError } from './client';
 import { DeviceManager } from './device';
@@ -2864,6 +2871,146 @@ describe('malformed tools entries on the HTTP path', () => {
     const data: any = await res.json();
     expect(data.choices[0].message.content).toBe('Deploy is green.');
     expect(data.choices[0].message.tool_calls).toBeUndefined();
+  });
+});
+
+// Issue #47: the deprecated `functions`/`function_call` pair was ignored
+// outright, so an explicit function mandate (`function_call: {"name": X}`)
+// came back as 200 prose with finish_reason "stop" and no tool channel — an
+// agent loop cannot tell the tool path never existed. Same family as #39/#32:
+// an input that changes the reply SHAPE is rejected, never dropped.
+// `function_call: "none"` is honourable (the caller asked for no call), and an
+// absent/empty `functions` declares nothing, so both stay accepted.
+describe('legacy functions / function_call', () => {
+  const fn = {
+    name: 'get_weather',
+    description: 'Get current weather for a city',
+    parameters: { type: 'object', properties: { city: { type: 'string' } } },
+  };
+
+  it('accepts an absent or empty functions list', () => {
+    expect(legacyFunctionsParamError({})).toBeNull();
+    expect(legacyFunctionsParamError({ functions: [] })).toBeNull();
+    expect(legacyFunctionsParamError({ functions: null })).toBeNull();
+  });
+
+  // The one legacy shape the gateway already honours: no function may be
+  // called, which is exactly what a plain chat completion is.
+  it('accepts a non-empty functions list when function_call is "none"', () => {
+    expect(
+      legacyFunctionsParamError({ functions: [fn], function_call: 'none' })
+    ).toBeNull();
+  });
+
+  it.each([
+    { label: 'function_call absent (defaults to auto)', extra: {} },
+    { label: 'function_call "auto"', extra: { function_call: 'auto' } },
+    { label: 'function_call naming a function', extra: { function_call: { name: 'get_weather' } } },
+  ])('rejects a non-empty functions list with $label', ({ extra }) => {
+    const err = legacyFunctionsParamError({ functions: [fn], ...extra });
+    expect(err?.param).toBe('functions');
+    expect(err?.code).toBe('unsupported_parameter');
+    expect(err?.message).toContain('tools');
+  });
+
+  // A non-array is a payload typo: invalid_request_error, like every other
+  // malformed field, rather than "unsupported feature".
+  it('rejects a non-array functions value as a malformed payload', () => {
+    const values: unknown[] = ['abc', fn, 7, {}];
+    for (const value of values) {
+      const err = legacyFunctionsParamError({ functions: value });
+      expect(err?.param).toBe('functions');
+      expect(err?.code).toBeUndefined();
+    }
+  });
+
+  it('rejects function_call when no functions are declared', () => {
+    const calls: unknown[] = ['auto', 'required', { name: 'get_weather' }];
+    for (const call of calls) {
+      const err = legacyFunctionsParamError({ function_call: call });
+      expect(err?.param).toBe('function_call');
+      expect(err?.code).toBeUndefined();
+    }
+  });
+});
+
+describe('legacy functions on the HTTP path', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: Hono<{ Bindings: Env }>;
+
+  const fn = {
+    name: 'get_weather',
+    description: 'Get current weather for a city',
+    parameters: { type: 'object', properties: { city: { type: 'string' } } },
+  };
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'Use get_weather for Paris.' }],
+          ...payload,
+        }),
+      },
+      mockEnv
+    );
+  }
+
+  /** The subset of the OpenAI error body these tests assert on. */
+  const errorBody = async (res: Response) =>
+    (await res.json()) as {
+      error: { type: string; param: string; code?: string; message: string };
+    };
+
+  it('returns 400 unsupported_parameter before any upstream work', async () => {
+    const res = await post({ functions: [fn], function_call: { name: 'get_weather' } });
+    expect(res.status).toBe(400);
+    const data = await errorBody(res);
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('functions');
+    expect(data.error.code).toBe('unsupported_parameter');
+    // Rejected before any device is acquired or conversation opened.
+    expect(client.prepareCalls).toHaveLength(0);
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  it('returns a JSON 400 (not an SSE error frame) for a streaming request', async () => {
+    const res = await post({ functions: [fn], stream: true });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    const data = await errorBody(res);
+    expect(data.error.param).toBe('functions');
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // The rejection is scoped to the legacy field: `function_call: "none"` still
+  // answers as a plain chat, and the modern `tools` path is untouched.
+  it('still answers a plain chat when function_call is "none"', async () => {
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('Paris is mild.'))}\n\n`]);
+    const res = await post({ functions: [fn], function_call: 'none' });
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as {
+      choices: Array<{ message: { content?: string } }>;
+    };
+    expect(data.choices[0].message.content).toBe('Paris is mild.');
+    expect(client.conversationCalls).toHaveLength(1);
   });
 });
 

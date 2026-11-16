@@ -306,6 +306,68 @@ export function toolsParamError(tools: unknown): ParamError | null {
 }
 
 /**
+ * Validates the deprecated `functions` / `function_call` pair, which the
+ * gateway cannot compile into the upstream tool protocol (`tools` is the only
+ * input `normalizeToolDefinitions` reads).
+ *
+ * Why this exists: a request carrying `functions` + `function_call` used to be
+ * answered as an ordinary chat completion — 200 prose, `finish_reason: "stop"`,
+ * no `tool_calls` and no `function_call`. That is the same silent-shape-loss
+ * failure as #39 (`tools` entries dropped) and #32 (`response_format` ignored):
+ * an agent loop that sent an explicit `function_call: {"name": X}` mandate sees
+ * a legal reply and concludes the model simply chose not to call anything.
+ *
+ * Two honourable shapes stay accepted, because neither asks for a call:
+ *  - no/empty `functions`, and
+ *  - `function_call: "none"` (the caller explicitly forbids calling).
+ * Everything else is `unsupported_parameter` on `functions`, pointing at
+ * `tools`. `function_call` without a declared `functions` list is a payload
+ * error (`invalid_request_error`) rather than an unimplemented feature.
+ */
+export function legacyFunctionsParamError(req: unknown): ParamError | null {
+  // Read as unknown: the decoded body is untrusted JSON, so these fields can
+  // hold any type even though the interface does not declare them.
+  const raw = (req ?? {}) as { functions?: unknown; function_call?: unknown };
+  const { functions, function_call: functionCall } = raw;
+
+  let declared = false;
+  if (functions !== undefined && functions !== null) {
+    if (!Array.isArray(functions)) {
+      return {
+        message: "Invalid parameter: 'functions' must be an array of function definitions.",
+        param: 'functions',
+      };
+    }
+    declared = functions.length > 0;
+  }
+
+  if (!declared) {
+    // A `function_call` with nothing to call is a typo: the caller meant to
+    // send definitions and lost them, or reused a body from a different model.
+    if (functionCall !== undefined && functionCall !== null && functionCall !== 'none') {
+      return {
+        message:
+          "Invalid parameter: 'function_call' was provided but 'functions' declares no functions.",
+        param: 'function_call',
+      };
+    }
+    return null;
+  }
+
+  // The caller forbade calling: a plain chat completion is exactly that.
+  if (functionCall === 'none') {
+    return null;
+  }
+
+  return {
+    message:
+      "Unsupported parameter: 'functions'/'function_call' are not supported by this gateway; use 'tools'/'tool_choice' instead",
+    param: 'functions',
+    code: 'unsupported_parameter',
+  };
+}
+
+/**
  * Validates `tool_choice` against the tools the request declares, returning an
  * OpenAI-shaped error message or null when the choice is legal.
  *
@@ -1261,6 +1323,27 @@ export function createApp(options?: AppOptions) {
             type: 'invalid_request_error',
             param: 'model',
             code: null,
+          },
+        },
+        400
+      );
+    }
+
+    // The deprecated `functions`/`function_call` pair has no path into the
+    // upstream protocol: `normalizeToolDefinitions` reads only `tools`, so a
+    // request that declared functions used to be answered as plain prose with
+    // `finish_reason: "stop"` and no tool channel, and an explicit
+    // `function_call: {"name": X}` mandate silently degraded to a text reply.
+    // Reject the unimplemented field instead of dropping it.
+    const legacyFunctionsErr = legacyFunctionsParamError(req);
+    if (legacyFunctionsErr) {
+      return c.json(
+        {
+          error: {
+            message: legacyFunctionsErr.message,
+            type: 'invalid_request_error',
+            param: legacyFunctionsErr.param,
+            code: legacyFunctionsErr.code ?? 'invalid_request_error',
           },
         },
         400
