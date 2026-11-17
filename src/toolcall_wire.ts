@@ -110,10 +110,16 @@ function toGenericMessages(messages: any[]): GenericMessage[] {
   const out: GenericMessage[] = [];
   for (const m of messages) {
     if (!m || typeof m !== 'object') continue;
-    const role =
-      m.role === 'system' || m.role === 'user' || m.role === 'assistant' || m.role === 'tool'
-        ? m.role
-        : 'user';
+    // `developer` is OpenAI's replacement for `system`; the upstream has only
+    // one system channel, so it compiles to a system frame here as it does on
+    // the plain path (flattenMessages). Leaving it out of this list dropped the
+    // instruction into the user turn.
+    const role: GenericMessage['role'] =
+      m.role === 'developer'
+        ? 'system'
+        : m.role === 'system' || m.role === 'user' || m.role === 'assistant' || m.role === 'tool'
+          ? m.role
+          : 'user';
     const g: GenericMessage = { role, content: m.content ?? '' };
     if (typeof m.name === 'string') g.name = m.name;
     if (typeof m.tool_call_id === 'string') g.tool_call_id = m.tool_call_id;

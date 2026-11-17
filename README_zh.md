@@ -400,6 +400,13 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 `Invalid parameter: messages[0].content must be a string, an array of content parts, or null.`
 请求体本身是 JSON `null` 或非对象值时同样返回 400。
 
+`role` 的取值本身会被校验，且大小写敏感：只接受 `system`、`developer`、`user`、`assistant`、
+`tool`。其余取值（`Tool`、`Assistant`、`asistant`、`function`、`AI`、带尾随空格等）一律返回
+HTTP 400 `invalid_request_error`，并指出非法 role 与其下标。过去未知 role 会被降级成 `user`，
+于是只改一个字母的大小写就能绕过孤立 `tool` 护栏，把工具载荷当成用户指令回灌给模型。
+`developer` 在普通路径与工具路径上都编译成 system 帧，与 OpenAI 用 `developer` 取代 `system`
+的约定一致。
+
 网关无法转发的输入内容片段一律拒绝，绝不静默丢弃。只有 `text`/`input_text`（转成 prompt 文本）与
 `image_url`/`input_image`（转成上传附件）有对应的上游表示；`input_audio`、`file`、`video_url` 或未知
 类型会返回 HTTP 400 `invalid_request_error`（`param: "messages"`、`code: "unsupported_parameter"`）并

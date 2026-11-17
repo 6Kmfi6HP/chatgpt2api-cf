@@ -77,6 +77,19 @@ export function requiresToolCall(req: ChatCompletionRequest): boolean {
 }
 
 /**
+ * Message roles the gateway understands. `developer` is OpenAI's replacement
+ * for `system` and is compiled to a system frame, since the upstream protocol
+ * has only the one system channel.
+ */
+const KNOWN_MESSAGE_ROLES: Record<string, true> = {
+  system: true,
+  developer: true,
+  user: true,
+  assistant: true,
+  tool: true,
+};
+
+/**
  * Returns a human-readable problem with the `messages` array, or null when
  * every entry has a shape the OpenAI wire accepts.
  *
@@ -87,6 +100,14 @@ export function requiresToolCall(req: ChatCompletionRequest): boolean {
  * TypeError, which is not a StatusError, so `app.onError` reports it as a 500
  * `api_error` — a caller-side bug disguised as a gateway fault, with SDK
  * retry/alert loops and internal stack text in the response.
+ *
+ * The role VALUE is checked, not just its type. Every downstream builder
+ * coerces an unrecognised role rather than refusing it (`toGenericMessages`
+ * falls back to `user`, `buildUpstreamMessages` defaults to `user`), so a
+ * single-case-different `"Tool"` slipped past the orphan-tool guard in the
+ * handler and had its payload replayed to the model as a user instruction
+ * instead of a tool result. Rejecting here keeps the role a real trust
+ * boundary and matches OpenAI, which answers an unknown role with 400.
  */
 export function messageShapeError(messages: unknown[]): string | null {
   for (let i = 0; i < messages.length; i++) {
@@ -98,6 +119,9 @@ export function messageShapeError(messages: unknown[]): string | null {
     const { role, content } = m as { role?: unknown; content?: unknown };
     if (typeof role !== 'string') {
       return `${path}.role must be a string`;
+    }
+    if (!Object.prototype.hasOwnProperty.call(KNOWN_MESSAGE_ROLES, role)) {
+      return `${path}.role "${role}" is not a valid role; expected one of "system", "developer", "user", "assistant", or "tool"`;
     }
     // null and undefined are legal: assistant turns that only call tools carry
     // no text, and some clients omit content entirely.
