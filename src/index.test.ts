@@ -3272,3 +3272,137 @@ describe('boolean control fields (stream / stream_options / search)', () => {
     expect(chunks[0].choices).toEqual([]);
   });
 });
+
+// Issue #51: `messages[].tool_calls` was never validated. Malformed entries were
+// filtered/blanked by `toGenericMessages`, so an assistant frame that claimed a
+// tool call reached the upstream with the name or the arguments missing — and
+// the caller got HTTP 200. In an agent loop this is invisible history corruption:
+// the model answers from a trajectory that no longer contains what it was told.
+// Same contract as #39 (tools), #49 (role) and #22 (content): a payload shape the
+// gateway cannot forward is rejected with 400 before any upstream work.
+describe('malformed messages[].tool_calls on the HTTP path', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  const toolReply = '{"tool_calls":[{"name":"lookup","arguments":{"order":"ALPHA"}}]}';
+
+  // The history every case below reuses: a valid user turn, then the assistant
+  // tool-call frame under test. The trailing user turn keeps the request a
+  // plausible agent loop instead of a lone assistant message.
+  function historyWith(toolCalls: unknown) {
+    return [
+      { role: 'user', content: 'Look up order ALPHA with the lookup tool.' },
+      { role: 'assistant', content: null, tool_calls: toolCalls },
+      { role: 'user', content: 'What did the lookup return?' },
+    ];
+  }
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent(toolReply))}\n\n`]);
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'auto',
+          tools: [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }],
+          ...payload,
+        }),
+      },
+      mockEnv
+    );
+  }
+
+  it.each([
+    // arguments as an object lost the arguments entirely: the model replied
+    // "No tag was passed" even though the frame carried one.
+    { label: 'object arguments', toolCalls: [{ id: 'c1', type: 'function', function: { name: 'lookup', arguments: { order: 'ALPHA' } } }], path: 'messages[1].tool_calls[0]' },
+    { label: 'numeric arguments', toolCalls: [{ id: 'c1', type: 'function', function: { name: 'lookup', arguments: 42 } }], path: 'messages[1].tool_calls[0]' },
+    // A non-array tool_calls vanished wholesale, leaving a bare assistant turn.
+    { label: 'string tool_calls', toolCalls: 'nope', path: 'messages[1].tool_calls' },
+    { label: 'object tool_calls', toolCalls: { id: 'c1', function: { name: 'lookup' } }, path: 'messages[1].tool_calls' },
+    // A missing name produced an anonymous call that could never be answered.
+    { label: 'missing function', toolCalls: [{ id: 'c1', type: 'function' }], path: 'messages[1].tool_calls[0]' },
+    { label: 'blank name', toolCalls: [{ id: 'c1', type: 'function', function: { name: '' } }], path: 'messages[1].tool_calls[0]' },
+    { label: 'numeric name', toolCalls: [{ id: 'c1', type: 'function', function: { name: 7 } }], path: 'messages[1].tool_calls[0]' },
+    { label: 'non-object function', toolCalls: [{ id: 'c1', type: 'function', function: 'lookup' }], path: 'messages[1].tool_calls[0].function' },
+    // Only function tools exist upstream; an unknown type cannot be forwarded.
+    { label: 'unknown type', toolCalls: [{ id: 'c1', type: 'sms', function: { name: 'lookup' } }], path: 'messages[1].tool_calls[0].type' },
+    // A non-string id silently failed the orphan guard, so the matching tool
+    // message was rejected later with a misleading "orphan" error.
+    { label: 'numeric id', toolCalls: [{ id: 42, type: 'function', function: { name: 'lookup' } }], path: 'messages[1].tool_calls[0].id' },
+    { label: 'non-object entry', toolCalls: ['lookup'], path: 'messages[1].tool_calls[0]' },
+  ])('returns 400 for $label tool_calls', async ({ toolCalls, path }) => {
+    const res = await post({ messages: historyWith(toolCalls) });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; message: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('messages');
+    // The message must localise the offending entry; an agent author has to be
+    // able to fix the payload without guessing which message is wrong.
+    expect(data.error.message).toContain(path);
+    // Rejected before any upstream work: no device, no prepare, no conversation.
+    expect(client.prepareCalls).toHaveLength(0);
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // The SSE-vs-JSON switch must not be reached either: a streaming caller gets a
+  // JSON 400, never an error frame inside a 200 event stream.
+  it('returns a JSON 400 (not an SSE error frame) for a streaming request', async () => {
+    const res = await post({
+      messages: historyWith([{ id: 'c1', type: 'function', function: { name: 'lookup', arguments: { order: 'ALPHA' } } }]),
+      stream: true,
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    const data: { error: { param: string } } = await res.json();
+    expect(data.error.param).toBe('messages');
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // The 400s above are shape rejections, not a refusal of tool history: the
+  // canonical OpenAI form, the shorthand form, an absent id and a null
+  // tool_calls must all keep working, and the upstream frame must carry the
+  // arguments the caller sent.
+  it('keeps well-formed tool history working end to end', async () => {
+    const messages = [
+      { role: 'user', content: 'Look up order ALPHA with the lookup tool.' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'lookup', arguments: '{"order":"ALPHA"}' } }],
+      },
+      { role: 'tool', tool_call_id: 'call_1', name: 'lookup', content: 'ALPHA is shipped.' },
+      { role: 'user', content: 'Summarise that.' },
+    ];
+    const res = await post({ messages });
+    expect(res.status).toBe(200);
+    expect(client.conversationCalls).toHaveLength(1);
+    const parts = client.conversationCalls[0].anonBody.messages.flatMap((m: any) => m.content.parts);
+    const callFrame = parts.find((p: string) => p.startsWith('{"tool_calls"'));
+    expect(JSON.parse(callFrame)).toEqual({ tool_calls: [{ name: 'lookup', arguments: { order: 'ALPHA' } }] });
+  });
+
+  it.each([
+    { label: 'shorthand name/arguments', toolCalls: [{ name: 'lookup', arguments: '{}' }] },
+    { label: 'null tool_calls', toolCalls: null },
+    { label: 'empty tool_calls', toolCalls: [] },
+  ])('accepts $label in history', async ({ toolCalls }) => {
+    const res = await post({ messages: historyWith(toolCalls) });
+    expect(res.status).toBe(200);
+  });
+});
