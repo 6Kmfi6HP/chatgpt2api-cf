@@ -393,6 +393,16 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 网关会直接返回 HTTP 400 `invalid_request_error`（与 OpenAI 行为一致），而不是给它一个 200 的
 普通聊天回复 —— 静默接受这种孤立消息会把工具结果当作用户意图喂给模型，从而掩盖客户端的 bug。
 
+反向的同一问题同样拒绝：某个 assistant `tool_calls[].id` 在历史继续之前（下一条 assistant/user
+消息，或 `messages` 结尾）始终没有对应的 `role: "tool"` 消息作答时，返回 HTTP 400
+`invalid_request_error`（`param: "messages"`），报文指出帧位置与 id，例如
+`Invalid parameter: messages[1].tool_calls contains id "call_t1", which has no matching role "tool" message; ...`
+同一批次的每个调用都必须作答，但结果可以乱序到达。此前这种未作答的调用会被当成普通历史文本回放，
+模型于是编造自己根本没执行过的进度（"I'm checking ticket TCK-77 for its latest status."），且
+`finish_reason` 为 `"stop"`；若该调用就是最后一条消息，`content` 甚至是 `null`。agent 循环会把这个
+200 当成已完成的轮次，记录一个假答案并永远不再执行该工具。没有 `id` 的简写形式不在追踪范围内，
+因为它的结果本来就无法匹配。
+
 每条消息的形态都会在发起任何上游请求之前校验，畸形请求体不会再流到 DTO 构造层（那里会读取
 `message.role` 并遍历 `content`）。消息不是对象、`role` 不是字符串、或 `content` 既不是字符串、
 也不是内容片段数组、也不是 `null`，一律返回 HTTP 400 `invalid_request_error`（`param: "messages"`）

@@ -404,6 +404,18 @@ An orphan `role: "tool"` message whose `tool_call_id` does not match any precedi
 being answered with a 200 chat reply — a silently accepted orphan would feed the tool payload to
 the model as user intent and hide the client bug.
 
+The mirror case is rejected too: an assistant `tool_calls[].id` that no `role: "tool"` message
+answers before the history continues (another assistant/user frame, or the end of `messages`)
+returns HTTP 400 `invalid_request_error` with `param: "messages"`. The message names the frame and
+the id, e.g.
+`Invalid parameter: messages[1].tool_calls contains id "call_t1", which has no matching role "tool" message; ...`
+Every call of a batch must be answered, but the results may arrive in any order. Before this rule
+the unanswered call was replayed as an ordinary transcript line and the model invented progress it
+could not have made ("I'm checking ticket TCK-77 for its latest status.") with `finish_reason:
+"stop"` — or `content: null` when the call was the last message. An agent loop reads that 200 as a
+finished turn: it records a false answer and never runs the tool. Calls without an `id` (the
+tolerated shorthand form) are not tracked, because nothing could answer them.
+
 Malformed entries are validated before any upstream work, so a bad request body never reaches the
 DTO builders (which read `message.role` and iterate `content`). A non-object message, a non-string
 `role`, or a `content` that is neither a string, an array of content parts, nor `null` returns
