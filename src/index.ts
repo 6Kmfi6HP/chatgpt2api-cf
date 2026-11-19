@@ -90,6 +90,57 @@ const KNOWN_MESSAGE_ROLES: Record<string, true> = {
 };
 
 /**
+ * Returns a human-readable problem with one message's `tool_calls`, or null.
+ *
+ * `toGenericMessages` filters non-objects and blanks an unknown name or a
+ * non-string `arguments`, so a malformed tool-call frame used to reach the
+ * upstream with the call missing or anonymous while the caller got HTTP 200.
+ * In an agent loop that is silent history corruption: the model answers from a
+ * trajectory that no longer holds what the caller said it did. A shape the
+ * gateway cannot forward is therefore rejected, as with `tools` (#39).
+ *
+ * Absent/null/empty `tool_calls` stay legal; `id` stays optional because the
+ * wire layer links a tool result by id OR name, but a present id must be
+ * usable, and `arguments` must be the JSON string the OpenAI wire defines
+ * (the shorthand `name`/`arguments` positions are accepted as they are
+ * elsewhere in this file).
+ */
+function toolCallsShapeError(toolCalls: unknown, path: string): string | null {
+  if (toolCalls === undefined || toolCalls === null) return null;
+  if (!Array.isArray(toolCalls)) {
+    return `${path}.tool_calls must be an array of tool-call objects`;
+  }
+  for (let j = 0; j < toolCalls.length; j++) {
+    const entry: unknown = toolCalls[j];
+    const callPath = `${path}.tool_calls[${j}]`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return `${callPath} must be an object`;
+    }
+    const call = entry as Record<string, unknown>;
+    if (call.type !== undefined && call.type !== 'function') {
+      return `${callPath}.type must be "function"`;
+    }
+    if (call.id !== undefined && (typeof call.id !== 'string' || call.id === '')) {
+      return `${callPath}.id must be a non-empty string`;
+    }
+    const fn = call.function;
+    if (fn !== undefined && (fn === null || typeof fn !== 'object' || Array.isArray(fn))) {
+      return `${callPath}.function must be an object`;
+    }
+    const fnObj = (fn ?? {}) as Record<string, unknown>;
+    const name = fnObj.name !== undefined ? fnObj.name : call.name;
+    if (typeof name !== 'string' || name === '') {
+      return `${callPath} must carry a non-empty function name in 'function.name' (or 'name')`;
+    }
+    const args = fnObj.arguments !== undefined ? fnObj.arguments : call.arguments;
+    if (args !== undefined && args !== null && typeof args !== 'string') {
+      return `${callPath} must carry 'function.arguments' as a JSON string (or 'arguments')`;
+    }
+  }
+  return null;
+}
+
+/**
  * Returns a human-readable problem with the `messages` array, or null when
  * every entry has a shape the OpenAI wire accepts.
  *
@@ -108,6 +159,10 @@ const KNOWN_MESSAGE_ROLES: Record<string, true> = {
  * handler and had its payload replayed to the model as a user instruction
  * instead of a tool result. Rejecting here keeps the role a real trust
  * boundary and matches OpenAI, which answers an unknown role with 400.
+ *
+ * `tool_calls` is validated by the same argument: `toGenericMessages` silently
+ * drops or blanks a call it cannot map, which corrupts the history the model
+ * reads while the caller sees a success status.
  */
 export function messageShapeError(messages: unknown[]): string | null {
   for (let i = 0; i < messages.length; i++) {
@@ -116,12 +171,20 @@ export function messageShapeError(messages: unknown[]): string | null {
     if (!m || typeof m !== 'object' || Array.isArray(m)) {
       return `${path} must be an object`;
     }
-    const { role, content } = m as { role?: unknown; content?: unknown };
+    const { role, content, tool_calls: toolCalls } = m as {
+      role?: unknown;
+      content?: unknown;
+      tool_calls?: unknown;
+    };
     if (typeof role !== 'string') {
       return `${path}.role must be a string`;
     }
     if (!Object.prototype.hasOwnProperty.call(KNOWN_MESSAGE_ROLES, role)) {
       return `${path}.role "${role}" is not a valid role; expected one of "system", "developer", "user", "assistant", or "tool"`;
+    }
+    const toolCallsError = toolCallsShapeError(toolCalls, path);
+    if (toolCallsError) {
+      return toolCallsError;
     }
     // null and undefined are legal: assistant turns that only call tools carry
     // no text, and some clients omit content entirely.
