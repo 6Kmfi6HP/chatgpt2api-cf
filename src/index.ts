@@ -284,6 +284,76 @@ export function contentPartError(messages: unknown[]): ParamError | null {
 }
 
 /**
+ * Returns a human-readable problem with an assistant `tool_calls` entry that
+ * the history never answers, or null when every declared call is answered
+ * before the next non-tool frame.
+ *
+ * Why this is a 400 and not an answer: OpenAI rejects a turn whose tool calls
+ * are still outstanding ("An assistant message with 'tool_calls' must be
+ * followed by tool messages responding to each 'tool_call_id'"), because the
+ * model has asked for a result it never received. The upstream has no such
+ * rule, so an unanswered call was replayed as an assistant transcript frame and
+ * the model narrated progress it could not have made — "I'm checking ticket
+ * TCK-77 for its latest status." with `finish_reason: "stop"`, and `content:
+ * null` when the assistant frame was last. An agent loop reads that 200 as a
+ * finished turn: it records a false answer and stops calling the tool.
+ *
+ * The check walks the history once, collecting the ids announced by an
+ * assistant frame and dropping each one when a `tool` frame with that
+ * `tool_call_id` arrives. A call still pending when the next non-tool frame
+ * starts (or at end of history) can never be answered: upstream frames are
+ * ordered and the model reads them in order.
+ *
+ * Scope, matching what the rest of the handler already promises:
+ *  - only calls that carry a string id are tracked; an id-less entry is the
+ *    tolerated shorthand form (see toolCallsShapeError) and stays a transcript
+ *    line, because nothing could answer it anyway — the orphan guard needs an
+ *    id to match;
+ *  - the ORDER of results inside one batch is free (parallel callers may
+ *    answer out of order);
+ *  - an assistant frame may carry text and calls at once.
+ */
+export function unansweredToolCallError(messages: unknown[]): string | null {
+  const describe = (at: number, id: string): string =>
+    `messages[${at}].tool_calls contains id "${id}", which has no matching role "tool" message; an assistant tool call must be answered before the history continues, or the model is asked to answer a call whose result it never received`;
+  /** Ids announced by the most recent assistant frame that nothing answered. */
+  let pending: { at: number; ids: string[] } | null = null;
+  for (let i = 0; i < messages.length; i++) {
+    const m = (messages[i] ?? {}) as {
+      role?: unknown;
+      tool_calls?: unknown;
+      tool_call_id?: unknown;
+    };
+    if (m.role === 'tool') {
+      if (pending && typeof m.tool_call_id === 'string') {
+        pending.ids = pending.ids.filter((id) => id !== m.tool_call_id);
+      }
+      continue;
+    }
+    // Any non-tool frame closes the window in which the pending calls could be
+    // answered. Report the first one: the client has to fix that call before
+    // the rest of the history can mean anything.
+    if (pending && pending.ids.length > 0) {
+      return describe(pending.at, pending.ids[0]);
+    }
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const ids: string[] = [];
+      for (const tc of m.tool_calls) {
+        const id = (tc as { id?: unknown } | null)?.id;
+        if (typeof id === 'string' && id !== '') ids.push(id);
+      }
+      pending = ids.length > 0 ? { at: i, ids } : null;
+      continue;
+    }
+    pending = null;
+  }
+  if (pending && pending.ids.length > 0) {
+    return describe(pending.at, pending.ids[0]);
+  }
+  return null;
+}
+
+/**
  * The tool name demanded by tool_choice, or null when the choice does not name
  * a specific function.
  */
@@ -1396,6 +1466,28 @@ export function createApp(options?: AppOptions) {
           );
         }
       }
+    }
+
+    // The mirror image of the orphan guard: an assistant tool call that no
+    // `tool` message answers. OpenAI answers that shape with 400 ("An assistant
+    // message with 'tool_calls' must be followed by tool messages responding to
+    // each 'tool_call_id'"). Answering it with a 200 is worse than an error: the
+    // upstream replays the call as a transcript line and the model narrates
+    // progress it cannot have made, so an agent loop records a false answer and
+    // never runs the tool.
+    const unanswered = unansweredToolCallError(req.messages);
+    if (unanswered) {
+      return c.json(
+        {
+          error: {
+            message: `Invalid parameter: ${unanswered}.`,
+            type: 'invalid_request_error',
+            param: 'messages',
+            code: 'invalid_request_error',
+          },
+        },
+        400
+      );
     }
 
     // `model` is required by the OpenAI contract. Rewriting a missing/blank

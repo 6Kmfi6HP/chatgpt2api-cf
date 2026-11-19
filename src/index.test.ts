@@ -3406,3 +3406,114 @@ describe('malformed messages[].tool_calls on the HTTP path', () => {
     expect(res.status).toBe(200);
   });
 });
+
+// Guards [audit:unanswered-tool-call]: an assistant tool call that no
+// `tool` message answers used to be replayed as a plain transcript frame, and
+// the model answered with invented progress ("I'm checking ticket TCK-77…")
+// at finish_reason "stop" — or with content null when the call was last. An
+// agent loop reads that 200 as a finished turn, records a false result and
+// never runs the tool. OpenAI rejects the same shape with 400, and so does the
+// gateway now: it is the mirror image of the orphan-tool guard, which already
+// refuses a `tool` result whose id nothing declared.
+describe('unanswered assistant tool_calls on the HTTP path', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  const toolReply = '{"tool_calls":[{"name":"lookup","arguments":{"id":"TCK-77"}}]}';
+  const answers = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ role: 'tool', tool_call_id: `call_${i + 1}`, content: 'ok' }));
+  const call = (i: number) => ({
+    id: `call_${i}`,
+    type: 'function',
+    function: { name: 'lookup', arguments: '{"id":"TCK-77"}' },
+  });
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent(toolReply))}\n\n`]);
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'auto',
+          tools: [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }],
+          ...payload,
+        }),
+      },
+      mockEnv
+    );
+  }
+
+  it.each([
+    // The exact shape seen upstream: history ends on the call, so the model
+    // has nothing to read but its own unanswered request.
+    { label: 'history ends on the call', messages: [{ role: 'user', content: 'Status of TCK-77?' }, { role: 'assistant', content: null, tool_calls: [call(1)] }], path: 'messages[1]' },
+    // A caller that appends a follow-up without running the tool first: the
+    // model has to invent an answer for "go ahead".
+    { label: 'user turn follows the call', messages: [{ role: 'user', content: 'Status of TCK-77?' }, { role: 'assistant', content: null, tool_calls: [call(1)] }, { role: 'user', content: 'Go ahead.' }], path: 'messages[1]' },
+    // Assistant prose after the call: a second assistant frame cannot answer
+    // the first, so the result is still missing.
+    { label: 'assistant turn follows the call', messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: null, tool_calls: [call(1)] }, { role: 'assistant', content: 'I checked.' }], path: 'messages[1]' },
+    // One of two parallel calls answered: the batch is incomplete, and the
+    // model would answer the second from thin air.
+    { label: 'only one of two parallel calls answered', messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: null, tool_calls: [call(1), call(2)] }, { role: 'tool', tool_call_id: 'call_1', content: 'ok' }, { role: 'user', content: 'and?' }], path: 'messages[1]' },
+    // A late result for an EARLIER batch's id does not close the open batch:
+    // the orphan guard passes it (the id was declared somewhere), so only this
+    // check notices that call_2 is still unanswered.
+    { label: 'late result for a different batch', messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: null, tool_calls: [call(1)] }, { role: 'tool', tool_call_id: 'call_1', content: 'ok' }, { role: 'assistant', content: null, tool_calls: [call(2)] }, { role: 'tool', tool_call_id: 'call_1', content: 'ok again' }, { role: 'user', content: 'and?' }], path: 'messages[3]' },
+  ])('returns 400 when $label', async ({ messages, path }) => {
+    const res = await post({ messages });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; message: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('messages');
+    // The message must name the frame AND the id, so an agent author can fix
+    // the loop without guessing which call it forgot to run.
+    expect(data.error.message).toContain(path);
+    expect(data.error.message).toContain('.tool_calls');
+    // Rejected before any upstream work: no device, no prepare, no conversation.
+    expect(client.prepareCalls).toHaveLength(0);
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // The SSE-vs-JSON switch must not be reached: a streaming caller gets a JSON
+  // 400, never an empty 200 event stream.
+  it('returns a JSON 400 (not an SSE error frame) for a streaming request', async () => {
+    const res = await post({
+      stream: true,
+      messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: null, tool_calls: [call(1)] }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // The guard is a completeness rule, not a refusal of tool history: every
+  // answered batch must keep working, whichever order the results arrive in.
+  it.each([
+    { label: 'every call answered in order', messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: null, tool_calls: [call(1), call(2)] }, ...answers(2)] },
+    { label: 'every call answered out of order', messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: null, tool_calls: [call(1), call(2)] }, { role: 'tool', tool_call_id: 'call_2', content: 'b' }, { role: 'tool', tool_call_id: 'call_1', content: 'a' }] },
+    { label: 'call answered then a follow-up user turn', messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: null, tool_calls: [call(1)] }, ...answers(1), { role: 'user', content: 'thanks' }] },
+    { label: 'assistant text alongside a fully answered call', messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'Looking it up.', tool_calls: [call(1)] }, ...answers(1)] },
+    // The shorthand form carries no id, so nothing could answer it; shape
+    // validation already tolerates it and this guard must not contradict that.
+    { label: 'id-less shorthand call', messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: null, tool_calls: [{ name: 'lookup', arguments: '{}' }] }, { role: 'user', content: 'and?' }] },
+  ])('keeps $label working', async ({ messages }) => {
+    const res = await post({ messages });
+    expect(res.status).toBe(200);
+  });
+});
