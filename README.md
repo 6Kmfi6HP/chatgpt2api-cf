@@ -411,6 +411,14 @@ HTTP 400 `invalid_request_error` with `param: "messages"` and the offending path
 `Invalid parameter: messages[0].content must be a string, an array of content parts, or null.`
 The same applies to a body that is JSON `null` or a non-object value.
 
+The `role` value itself is checked, case-sensitively: only `system`, `developer`, `user`,
+`assistant` and `tool` are accepted. Any other value (`Tool`, `Assistant`, `asistant`, `function`,
+`AI`, or a trailing space) returns HTTP 400 `invalid_request_error` naming the role and its index.
+Unrecognised roles used to be coerced to `user`, which meant a one-letter case change bypassed the
+orphan-`tool` guard and replayed a tool payload to the model as a user instruction. `developer` is
+compiled to a system frame on both the plain and the tool path, matching OpenAI's replacement of
+`system`.
+
 Input content parts the gateway cannot forward are rejected, never dropped. Only `text`/`input_text`
 (becoming prompt text) and `image_url`/`input_image` (becoming uploaded attachments) have an upstream
 representation; an `input_audio`, `file`, `video_url` or unknown part type returns HTTP 400
