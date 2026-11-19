@@ -344,6 +344,14 @@ print(response.choices[0].message.content)  # "John Hartman 在 HQ-North 的 7 �
 
 流式模式会输出 `delta.tool_calls` 帧与 `finish_reason: "tool_calls"`。
 
+旧版的 `functions` / `function_call` 字段**不受支持**：网关只把 `tools` 编译进上游协议，
+因此携带非空 `functions` 的请求（无论 `function_call` 缺省、为 `"auto"`，还是点名某个函数）
+一律返回 `400 invalid_request_error`（`param: "functions"`、`code: "unsupported_parameter"`），
+而不是当成普通对话回一段散文并给出 `finish_reason: "stop"`。请改用 `tools` / `tool_choice`。
+有两种形状仍然放行，因为它们本就不要求调用：`functions` 缺省/为空，以及
+`function_call: "none"`（语义即"按普通对话回答"）。未声明任何 `functions` 却发了
+`function_call`，属于请求体错误（`param: "function_call"`）。
+
 普通 JSON 回答属于正文、不是工具调用：请求带了 `tools` 但模型回复的是一份普通 JSON 文档
 （以 `{` 开头、没有 `tool_calls`）时，流式结束会把缓冲的这段文本作为 `delta.content` 帧下发。
 工具调用检测只在"仍可能解析成工具调用约定"期间扣留文本，turn 结束时的兜底 drain 保证回复
