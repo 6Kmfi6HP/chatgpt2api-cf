@@ -452,9 +452,19 @@ export function buildUpstreamMessages(messages: GenericMessage[]): UpstreamMessa
               return { name: tc.name, arguments: args };
             }),
           });
+          // OpenAI lets one assistant turn carry prose AND calls ("looking that
+          // up…" + the call). That prose is history the model must still read on
+          // later turns; serializing only the payload had the model deny words it
+          // had already said, with a 200 hiding the loss. The payload stays the
+          // last part and byte-identical, so the protocol line the model imitates
+          // never gains prose around the JSON.
+          const text = contentToText(m.content);
           return {
             author: { role: 'assistant' },
-            content: { content_type: 'text', parts: [payload] },
+            content: {
+              content_type: 'text',
+              parts: text === '' ? [payload] : [text, payload],
+            },
           };
         }
         return {
