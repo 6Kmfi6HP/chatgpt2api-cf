@@ -348,6 +348,12 @@ print(response.choices[0].message.content)  # "John Hartman works on the 7th flo
 
 Streaming emits `delta.tool_calls` frames and `finish_reason: "tool_calls"`.
 
+An assistant turn may carry text and `tool_calls` at once ("Handing this to the tool. …" plus the
+call), as OpenAI allows. That text is replayed to the upstream verbatim alongside the call, because
+it is history the model must still see: sending only the call payload made the model deny its own
+prior words on later turns (it answered "NONE" to "which codeword did you give me?" for a codeword
+it had just written), with HTTP 200 hiding the loss.
+
 The deprecated `functions` / `function_call` pair is **not** supported: the gateway compiles only
 `tools` into the upstream protocol, so a request carrying a non-empty `functions` list (with
 `function_call` absent, `"auto"`, or naming a function) is rejected with

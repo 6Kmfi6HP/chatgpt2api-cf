@@ -349,6 +349,48 @@ describe('Hono Application (src/index.ts)', () => {
       expect(dto.messages[0].content.parts[0]).toContain('You are terse.');
     });
 
+    // Guards [audit:assistant-text-with-tool-calls-dropped] on the HTTP path:
+    // both stream and non-stream requests replay history through the same DTO,
+    // so the assistant prose that accompanied a tool call must reach the
+    // upstream frames in either mode. Upstream otherwise denies words it said.
+    it.each([false, true])(
+      'replays assistant text that accompanied tool_calls (stream=%s)',
+      async (stream) => {
+        mockClient.conversationHandler = async () =>
+          createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('ok'))}\n\n`]);
+        const res = await postChat({
+          model: 'auto',
+          stream,
+          tools: [
+            { type: 'function', function: { name: 'lookup_ticket', parameters: { type: 'object' } } },
+          ],
+          messages: [
+            { role: 'user', content: 'look up TCK-900' },
+            {
+              role: 'assistant',
+              content: 'Handing this to the ticket tool.',
+              tool_calls: [
+                {
+                  id: 'call_a1',
+                  type: 'function',
+                  function: { name: 'lookup_ticket', arguments: '{"id":"TCK-900"}' },
+                },
+              ],
+            },
+            { role: 'tool', tool_call_id: 'call_a1', name: 'lookup_ticket', content: '{"status":"open"}' },
+            { role: 'user', content: 'status?' },
+          ],
+        });
+        expect(res.status).toBe(200);
+        if (stream) await res.text();
+        const frames: Array<{ author: { role: string }; content: { parts: unknown[] } }> =
+          mockClient.prepareCalls[0].anonBody.messages;
+        const assistant = frames.find((m) => m.author.role === 'assistant');
+        expect(assistant?.content.parts).toContain('Handing this to the ticket tool.');
+        expect(assistant?.content.parts.join('\n')).toContain('"tool_calls"');
+      }
+    );
+
     it('tool history without tools enabled maps role:"tool" results to tool frames', async () => {
       const res = await postChat({
         model: 'auto',
