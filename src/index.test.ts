@@ -3559,3 +3559,152 @@ describe('unanswered assistant tool_calls on the HTTP path', () => {
     expect(res.status).toBe(200);
   });
 });
+
+// Guards [audit:images-dropped-when-tools-enabled]: with tools enabled the
+// handler collected image refs from `role:"user"` frames only, so an image
+// carried by a tool result (the normal shape for a browser/computer-use
+// screenshot) or by an assistant frame was validated, accepted, and then
+// dropped on the way to the upstream: the model answered a question about a
+// picture it never received, and the caller read a 200. The tools-off path has
+// always forwarded every frame's images, so tools-on must match it instead of
+// silently narrowing the request.
+describe('images on non-user frames survive the tools path', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  // CRC-valid 1x1 PNG: the upstream parses the bytes, so a hand-assembled
+  // IDAT would be rejected as image_parse_error and hide the real behaviour.
+  const PNG_DATA_URL =
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const imagePart = { type: 'image_url', image_url: { url: PNG_DATA_URL } };
+  const shotTool = {
+    type: 'function',
+    function: { name: 'shot', description: 'Take a screenshot', parameters: { type: 'object', properties: {} } },
+  };
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+    // uploadImage() talks to the real backend through globalThis.fetch: serve
+    // the three-step flow so the test observes the rebuilt DTO, not the upload.
+    let uploads = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: any, init?: any) => {
+        const target = String(url);
+        if (target.endsWith('/backend-anon/files')) {
+          uploads++;
+          return Response.json({
+            status: 'success',
+            upload_url: `https://blob.example/upload-${uploads}`,
+            file_id: `file-${uploads}`,
+          });
+        }
+        if (target.startsWith('https://blob.example/')) {
+          return new Response(null, { status: 201 });
+        }
+        if (target.endsWith('/files/process_upload_stream')) {
+          return new Response(
+            JSON.stringify({ event: 'file.processing.completed', message: 'done', progress: 100 }) + '\n',
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        throw new Error(`unexpected fetch ${target} ${init?.method ?? ''}`);
+      })
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const post = (payload: object) =>
+    app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5-6', search: false, ...payload }),
+      },
+      mockEnv
+    );
+
+  /** Every uploaded attachment the upstream would receive, in frame order. */
+  const pointers = (anonBody: any): any[] =>
+    (anonBody.messages as any[])
+      .flatMap((m) => (Array.isArray(m?.content?.parts) ? m.content.parts : []))
+      .filter((p) => p && p.content_type === 'image_asset_pointer');
+
+  const toolHistory = () => [
+    { role: 'user', content: 'Use the shot tool, then tell me the screenshot color.' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{ id: 'call_s1', type: 'function', function: { name: 'shot', arguments: '{}' } }],
+    },
+    {
+      role: 'tool',
+      tool_call_id: 'call_s1',
+      name: 'shot',
+      content: [{ type: 'text', text: 'screenshot captured' }, imagePart],
+    },
+    { role: 'user', content: 'What single color fills the screenshot? Answer one word.' },
+  ];
+
+  it('forwards an image carried by a tool result when tools are enabled', async () => {
+    const res = await post({ messages: toolHistory(), tools: [shotTool] });
+    expect(res.status).toBe(200);
+    const anonBody = client.conversationCalls[0].anonBody;
+    expect(pointers(anonBody)).toHaveLength(1);
+    expect(pointers(anonBody)[0].asset_pointer).toBe('file-service://file-1');
+    // The tool text still travels with the tool frame; only the attachment is
+    // relocated to the last user frame, which is how every image is sent.
+    const parts = (anonBody.messages as any[]).flatMap((m) => m?.content?.parts ?? []);
+    expect(parts).toContain('screenshot captured');
+  });
+
+  it('forwards an image carried by an assistant frame when tools are enabled', async () => {
+    const res = await post({
+      messages: [
+        { role: 'user', content: 'What is in this image?' },
+        { role: 'assistant', content: [{ type: 'text', text: 'An image, surely.' }, imagePart] },
+        { role: 'user', content: 'Name its single color.' },
+      ],
+      tools: [shotTool],
+    });
+    expect(res.status).toBe(200);
+    expect(pointers(client.conversationCalls[0].anonBody)).toHaveLength(1);
+  });
+
+  it('keeps forwarding every image when tools are off, as before', async () => {
+    const res = await post({ messages: toolHistory() });
+    expect(res.status).toBe(200);
+    expect(pointers(client.conversationCalls[0].anonBody)).toHaveLength(1);
+  });
+
+  // Order and count are the contract: dropping or reordering attachments would
+  // attach the screenshot to the wrong question.
+  it('preserves count and order across user and tool frames', async () => {
+    const res = await post({
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'first' }, imagePart] },
+        ...toolHistory(),
+      ],
+      tools: [shotTool],
+    });
+    expect(res.status).toBe(200);
+    const got = pointers(client.conversationCalls[0].anonBody);
+    expect(got).toHaveLength(2);
+    expect(got.map((p) => p.asset_pointer)).toEqual([
+      'file-service://file-1',
+      'file-service://file-2',
+    ]);
+  });
+});
