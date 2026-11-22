@@ -174,7 +174,11 @@ function toolProtocolFrame(
  * - `prompt` is only the placeholder for buildAnonRequest's default user
  *   message; it is overridden by req.messages whenever any are provided.
  * - When opts.messageContent is set (multimodal), it replaces the content of
- *   the last user message (falling back to the placeholder user message).
+ *   the last user message. A history with no user frame at all (an agent loop
+ *   shaped `assistant(tool_calls)` + `role:"tool"` that carries the screenshot)
+ *   gets one appended carrier user frame instead: the attachment has already
+ *   been uploaded by the caller, and dropping the pointer would answer a
+ *   question about a picture the model never received under a 200.
  * - search/reasoning_effort/service_tier/one_off_model_override/system_hints/
  *   local_function_names/map_search_params and opts.attachmentMimeTypes are
  *   passed through to buildAnonRequest options verbatim.
@@ -212,14 +216,30 @@ export function buildAnonRequestBodyWithTools(
   }
 
   if (opts.messageContent && typeof opts.messageContent === 'object') {
+    let merged = false;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].author.role === 'user') {
         messages[i] = {
           ...messages[i],
           content: opts.messageContent as UpstreamMessage['content'],
         };
+        merged = true;
         break;
       }
+    }
+    // No user frame to carry the attachment. It is already uploaded (and
+    // quota-charged) by the caller, so discarding the pointer would answer a
+    // question about a picture the model never received while the client read
+    // a 200. Append a carrier frame instead, keeping the replayed history and
+    // its frame order untouched.
+    if (!merged) {
+      messages = [
+        ...messages,
+        {
+          author: { role: 'user' },
+          content: opts.messageContent as UpstreamMessage['content'],
+        },
+      ];
     }
   }
 

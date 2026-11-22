@@ -3708,3 +3708,157 @@ describe('images on non-user frames survive the tools path', () => {
     ]);
   });
 });
+
+// Guards [audit:image-dropped-when-no-user-frame-with-tools]: the tools path
+// merged multimodal content into the LAST `role:"user"` upstream frame. An
+// agent loop whose history is `assistant(tool_calls)` + `role:"tool"` (the
+// screenshot) and that carries no user frame therefore uploaded the image,
+// spent the device's upload quota, and then dropped the pointer: the model was
+// asked about a picture it never received while the client read a 200. The
+// tools-off path appends a carrier user frame in that case; tools-on must do
+// the same instead of silently discarding the attachment.
+describe('images survive the tools path when the history has no user frame', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  const PNG_DATA_URL =
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const imagePart = { type: 'image_url', image_url: { url: PNG_DATA_URL } };
+  const shotTool = {
+    type: 'function',
+    function: { name: 'shot', description: 'Take a screenshot', parameters: { type: 'object', properties: {} } },
+  };
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+    let uploads = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: unknown) => {
+        const target = String(url);
+        if (target.endsWith('/backend-anon/files')) {
+          uploads++;
+          return Response.json({
+            status: 'success',
+            upload_url: `https://blob.example/upload-${uploads}`,
+            file_id: `file-${uploads}`,
+          });
+        }
+        if (target.startsWith('https://blob.example/')) {
+          return new Response(null, { status: 201 });
+        }
+        if (target.endsWith('/files/process_upload_stream')) {
+          return new Response(
+            JSON.stringify({ event: 'file.processing.completed', message: 'done', progress: 100 }) + '\n',
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        throw new Error(`unexpected fetch ${target}`);
+      })
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const post = (payload: object) =>
+    app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5-6', search: false, ...payload }),
+      },
+      mockEnv
+    );
+
+  // Narrow helpers, not `any`: a malformed DTO must fail loudly instead of
+  // quietly reading as "no image pointers".
+  type Frame = { author: { role: string }; content?: { parts?: unknown } };
+  type ImagePointer = { content_type: string; asset_pointer: string };
+  const frames = (anonBody: unknown): Frame[] => {
+    const messages = (anonBody as { messages?: unknown }).messages;
+    if (!Array.isArray(messages)) throw new Error('anonBody.messages is not an array');
+    return messages as Frame[];
+  };
+  const pointers = (anonBody: unknown): ImagePointer[] =>
+    frames(anonBody)
+      .flatMap((m) => (Array.isArray(m.content?.parts) ? m.content.parts : []))
+      .filter(
+        (p): p is ImagePointer =>
+          typeof p === 'object' &&
+          p !== null &&
+          (p as { content_type?: unknown }).content_type === 'image_asset_pointer'
+      );
+
+  // The shape that lost the image: a tool result carries the screenshot and no
+  // user frame exists anywhere in the history.
+  const userlessToolHistory = () => [
+    { role: 'system', content: 'You answer questions about screenshots.' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{ id: 'call_u1', type: 'function', function: { name: 'shot', arguments: '{}' } }],
+    },
+    {
+      role: 'tool',
+      tool_call_id: 'call_u1',
+      name: 'shot',
+      content: [{ type: 'text', text: 'screenshot captured' }, imagePart],
+    },
+  ];
+
+  it('carries the tool-result image into an added user frame when tools are on', async () => {
+    const res = await post({ messages: userlessToolHistory(), tools: [shotTool] });
+    expect(res.status).toBe(200);
+    const anonBody = client.conversationCalls[0].anonBody;
+    expect(pointers(anonBody)).toHaveLength(1);
+    expect(pointers(anonBody)[0].asset_pointer).toBe('file-service://file-1');
+  });
+
+  it('keeps every original frame after adding the carrier user frame', async () => {
+    const res = await post({ messages: userlessToolHistory(), tools: [shotTool] });
+    expect(res.status).toBe(200);
+    const roles = frames(client.conversationCalls[0].anonBody).map((m) => m.author.role);
+    // Protocol frame, then system/assistant/tool exactly as sent, then carrier.
+    expect(roles.slice(-4)).toEqual(['system', 'assistant', 'tool', 'user']);
+    expect(roles.filter((r) => r === 'user')).toHaveLength(1);
+  });
+
+  it('carries an assistant-frame image when the history has no user frame', async () => {
+    const res = await post({
+      messages: [
+        { role: 'system', content: 'Vision helper.' },
+        { role: 'assistant', content: [{ type: 'text', text: 'Here is the shot.' }, imagePart] },
+      ],
+      tools: [shotTool],
+    });
+    expect(res.status).toBe(200);
+    expect(pointers(client.conversationCalls[0].anonBody)).toHaveLength(1);
+  });
+
+  // The carrier frame must not become a second, empty user turn when one
+  // already exists: that would change the replayed history for every normal
+  // agent loop and could re-open the question the tool result already answered.
+  it('does not add a carrier frame when a user frame exists', async () => {
+    const res = await post({
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'show me' }, imagePart] },
+        { role: 'assistant', content: 'Shown.' },
+      ],
+      tools: [shotTool],
+    });
+    expect(res.status).toBe(200);
+    const roles = frames(client.conversationCalls[0].anonBody).map((m) => m.author.role);
+    expect(roles.filter((r) => r === 'user')).toHaveLength(1);
+  });
+});
