@@ -1572,16 +1572,18 @@ export function createApp(options?: AppOptions) {
     const model = req.model;
     const prompt = flattenMessages(req.messages);
 
-    // Collect image references (order preserved). With tools enabled only
-    // user messages carry images (tool/assistant frames never do).
+    // Collect image references from every frame (order preserved). A tool
+    // result carries the screenshot in an agent loop, and an assistant frame
+    // can carry one too: reading only user frames (the pre-existing tools-on
+    // shortcut) validated and accepted those parts, then dropped them, so the
+    // model answered about a picture it never received while the caller read a
+    // 200. Both roles are forwarded exactly like user frames, which is what the
+    // tools-off path has always done.
     // Computed once: req.tools / req.tool_choice are never mutated below,
     // so the retry loop and downstream uses share this value.
     const hasTools =
       Array.isArray(req.tools) && req.tools.length > 0 && req.tool_choice !== 'none';
-    const refSource = hasTools
-      ? req.messages.filter((m) => m.role === 'user')
-      : req.messages;
-    const imageRefs = refSource.flatMap((m) => collectImageRefs(m.content as any));
+    const imageRefs = req.messages.flatMap((m) => collectImageRefs(m.content as any));
 
     // A request with neither text nor an attachment carries nothing the
     // upstream can answer: it greets the caller and the client reads a 200 it
