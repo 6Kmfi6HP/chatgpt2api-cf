@@ -299,6 +299,28 @@ describe('buildUpstreamMessages', () => {
     );
   });
 
+  // Guards [audit:assistant-text-with-tool-calls-dropped]: OpenAI lets one
+  // assistant turn carry prose AND tool calls ("looking that up…" + the call),
+  // and that prose is history the model must still see on later turns. Dropping
+  // it made the model deny its own prior words while the request returned 200.
+  it('keeps the assistant text of a message that also carries tool_calls', () => {
+    const out = buildUpstreamMessages([
+      {
+        role: 'assistant',
+        content: 'Looking up TCK-900 now.',
+        tool_calls: [{ name: 'get_weather', arguments: '{"city":"Paris"}' }],
+      },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].author.role).toBe('assistant');
+    // The canonical tool-call line must survive byte-identical so the protocol
+    // example the model imitates never gains prose around the JSON.
+    expect(out[0].content.parts).toContain(
+      '{"tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}',
+    );
+    expect(out[0].content.parts).toContain('Looking up TCK-900 now.');
+  });
+
   it('keeps invalid tool_call argument strings as raw strings in the JSON payload', () => {
     const out = buildUpstreamMessages([
       {
