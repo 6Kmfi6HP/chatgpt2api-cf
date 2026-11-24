@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { DeviceManager, DEVICE_POOL_KEY, DEFAULT_POOL_SIZE } from './device';
+import {
+  DeviceManager,
+  DEVICE_POOL_KEY,
+  DEFAULT_POOL_SIZE,
+  DEFAULT_MAX_DEVICE_USES,
+  resolveMaxDeviceUses,
+} from './device';
 import { UpstreamClient, StatusError } from './client';
 import type { Env, DevicePoolState } from './types';
 
@@ -222,6 +228,107 @@ describe('DeviceManager', () => {
       await manager.getHealthyDevice(env, client);
 
       expect(mockKV.getCalls).toBeGreaterThan(initialGetCalls);
+    });
+  });
+
+  describe('Per-device usage cap (DEVICE_MAX_USES) and retireDevice', () => {
+    it('resolves DEVICE_MAX_USES with default 10 and ignores invalid values', () => {
+      expect(resolveMaxDeviceUses(env)).toBe(DEFAULT_MAX_DEVICE_USES);
+      expect(resolveMaxDeviceUses({ ...env, DEVICE_MAX_USES: '5' })).toBe(5);
+      expect(resolveMaxDeviceUses({ ...env, DEVICE_MAX_USES: '0' })).toBe(DEFAULT_MAX_DEVICE_USES);
+      expect(resolveMaxDeviceUses({ ...env, DEVICE_MAX_USES: 'abc' })).toBe(DEFAULT_MAX_DEVICE_USES);
+    });
+
+    it('increments useCount up to 10 and automatically replaces device on the 11th request', async () => {
+      env.DEVICE_POOL_SIZE = '1';
+      const seenIds: string[] = [];
+      for (let i = 1; i <= 10; i++) {
+        const d = await manager.getHealthyDevice(env, client);
+        seenIds.push(d.id);
+        expect(d.useCount).toBe(i);
+      }
+      expect(new Set(seenIds).size).toBe(1);
+
+      const d11 = await manager.getHealthyDevice(env, client);
+      expect(d11.id).not.toBe(seenIds[0]);
+      expect(d11.useCount).toBe(1);
+
+      const pool = await manager.getPool(env);
+      expect(pool.devices).toHaveLength(1);
+      expect(pool.devices[0].id).toBe(d11.id);
+    });
+
+    it('respects custom DEVICE_MAX_USES override across a multi-device pool', async () => {
+      env.DEVICE_POOL_SIZE = '2';
+      env.DEVICE_MAX_USES = '2';
+      const d1 = await manager.getHealthyDevice(env, client);
+      const d2 = await manager.getHealthyDevice(env, client);
+      const d3 = await manager.getHealthyDevice(env, client);
+      // d1 hit maxUses=2 on d3, so d4 evicts d1 and immediately picks replacement C.
+      const d4 = await manager.getHealthyDevice(env, client);
+      const d5 = await manager.getHealthyDevice(env, client);
+      // d2 hit maxUses=2 on d5, so d6 evicts d2 and immediately picks replacement D.
+      const d6 = await manager.getHealthyDevice(env, client);
+
+      expect(d1.id).not.toBe(d2.id);
+      expect(d3.id).toBe(d1.id);
+      expect(d3.useCount).toBe(2);
+      expect(d5.id).toBe(d2.id);
+      expect(d5.useCount).toBe(2);
+
+      expect([d1.id, d2.id]).not.toContain(d4.id);
+      expect([d1.id, d2.id]).not.toContain(d6.id);
+      expect(d4.id).not.toBe(d6.id);
+      expect(d4.useCount).toBe(1);
+      expect(d6.useCount).toBe(1);
+    });
+
+    it('evicts pre-seeded exhausted devices automatically on next checkout', async () => {
+      env.DEVICE_POOL_SIZE = '2';
+      await mockKV.put(DEVICE_POOL_KEY, {
+        devices: [
+          { id: 'old-exhausted', useCount: 10, lastUsedAt: 1 },
+          { id: 'healthy-one', useCount: 3, lastUsedAt: 100 },
+        ],
+        lastUpdated: Date.now(),
+      });
+
+      const dev1 = await manager.getHealthyDevice(env, client);
+      expect(dev1.id).not.toBe('old-exhausted');
+      const pool = await manager.getPool(env);
+      expect(pool.devices.map((d) => d.id)).not.toContain('old-exhausted');
+      expect(pool.devices).toHaveLength(2);
+    });
+
+    it('retireDevice evicts the specified device and is a safe no-op if already gone', async () => {
+      env.DEVICE_POOL_SIZE = '2';
+      const d1 = await manager.getHealthyDevice(env, client);
+      const d2 = await manager.getHealthyDevice(env, client);
+
+      const retired = await manager.retireDevice(env, d1.id);
+      expect(retired).toBe(true);
+      const poolAfter = await manager.getPool(env);
+      expect(poolAfter.devices).toHaveLength(2);
+      expect(poolAfter.devices.map((d) => d.id)).not.toContain(d1.id);
+      expect(poolAfter.devices.map((d) => d.id)).toContain(d2.id);
+
+      // Already evicted: no innocent device should be harmed.
+      const secondTry = await manager.retireDevice(env, d1.id);
+      expect(secondTry).toBe(false);
+      const poolStill = await manager.getPool(env);
+      expect(poolStill.devices.map((d) => d.id)).toEqual(poolAfter.devices.map((d) => d.id));
+    });
+
+    it('reportCooldown does not evict an innocent device when target was already evicted', async () => {
+      env.DEVICE_POOL_SIZE = '2';
+      const d1 = await manager.getHealthyDevice(env, client);
+      const d2 = await manager.getHealthyDevice(env, client);
+      await manager.retireDevice(env, d1.id);
+
+      await manager.reportCooldown(env, d1.id, new StatusError('conversation', 429, 'limit'));
+      const pool = await manager.getPool(env);
+      expect(pool.devices).toHaveLength(2);
+      expect(pool.devices.map((d) => d.id)).toContain(d2.id);
     });
   });
 });

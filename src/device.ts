@@ -3,19 +3,44 @@ import { UpstreamClient, StatusError } from './client';
 
 export const DEVICE_POOL_KEY = 'chatgpt_device_pool';
 export const DEFAULT_POOL_SIZE = 3;
+export const DEFAULT_MAX_DEVICE_USES = 10;
 export const DEFAULT_L1_TTL_MS = 20_000; // 20 seconds
+
+/** Resolves the per-device request limit from `env.DEVICE_MAX_USES` (default 10). */
+export function resolveMaxDeviceUses(env?: Env): number {
+  const configured = env?.DEVICE_MAX_USES ? parseInt(env.DEVICE_MAX_USES, 10) : DEFAULT_MAX_DEVICE_USES;
+  return isNaN(configured) || configured < 1 ? DEFAULT_MAX_DEVICE_USES : configured;
+}
 
 /**
  * Helper to select an eviction candidate when the pool is at capacity.
  * Ported from Go pickEvictionCandidate in auto_provision.go:
  * 1. If preferId is specified and found, evict it.
- * 2. Else pick candidate with longest cooldownUntil in the future.
- * 3. Fallback: candidate with oldest lastUsedAt.
+ * 2. Next evict any device that already reached maxUses (highest useCount first).
+ * 3. Else pick candidate with longest cooldownUntil in the future.
+ * 4. Fallback: candidate with oldest lastUsedAt.
  */
-export function pickEvictionIndex(devices: DeviceIdentity[], preferId?: string): number {
+export function pickEvictionIndex(
+  devices: DeviceIdentity[],
+  preferId?: string,
+  maxUses: number = DEFAULT_MAX_DEVICE_USES
+): number {
   if (preferId) {
     const idx = devices.findIndex((d) => d.id === preferId);
     if (idx !== -1) return idx;
+  }
+
+  let exhaustedIdx = -1;
+  let maxExhaustedUses = -1;
+  for (let i = 0; i < devices.length; i++) {
+    const uses = devices[i].useCount || 0;
+    if (uses >= maxUses && uses > maxExhaustedUses) {
+      maxExhaustedUses = uses;
+      exhaustedIdx = i;
+    }
+  }
+  if (exhaustedIdx !== -1) {
+    return exhaustedIdx;
   }
 
   const now = Date.now();
@@ -138,6 +163,8 @@ export class DeviceManager {
 
   /**
    * Selects a healthy uncooled device identity using Round-Robin (LRU).
+   * Evicts any device that already reached `DEVICE_MAX_USES` (default 10)
+   * before selection so the upstream 10-turn guest downgrade is avoided.
    * Automatically refreshes sentinel token if missing or expiring within 60s.
    * If all devices are cooled down, provisions a fresh identity to recover immediately.
    */
@@ -146,8 +173,15 @@ export class DeviceManager {
       const state = await this.getPool(env);
       const configuredSize = env.DEVICE_POOL_SIZE ? parseInt(env.DEVICE_POOL_SIZE, 10) : DEFAULT_POOL_SIZE;
       const poolSize = isNaN(configuredSize) || configuredSize < 1 ? DEFAULT_POOL_SIZE : configuredSize;
+      const maxUses = resolveMaxDeviceUses(env);
 
-      let modified = this.reconcilePoolSize(state, poolSize);
+      // Evict devices that already reached maxUses before selecting a device.
+      const beforeCount = state.devices.length;
+      state.devices = state.devices.filter((d) => (d.useCount || 0) < maxUses);
+      let modified = state.devices.length !== beforeCount;
+      if (this.reconcilePoolSize(state, poolSize)) {
+        modified = true;
+      }
 
       const now = Date.now();
       const nowSec = Math.floor(now / 1000);
@@ -162,7 +196,7 @@ export class DeviceManager {
         device = {
           id: crypto.randomUUID(),
         };
-        const victimIdx = pickEvictionIndex(state.devices);
+        const victimIdx = pickEvictionIndex(state.devices, undefined, maxUses);
         state.devices.splice(victimIdx, 1);
         state.devices.push(device);
         modified = true;
@@ -186,7 +220,9 @@ export class DeviceManager {
         modified = true;
       }
 
-      device.lastUsedAt = now;
+      const maxLastUsed = state.devices.reduce((max, d) => Math.max(max, d.lastUsedAt || 0), 0);
+      device.lastUsedAt = Math.max(now, maxLastUsed + 1);
+      device.useCount = (device.useCount || 0) + 1;
       modified = true;
 
       if (modified) {
@@ -198,9 +234,34 @@ export class DeviceManager {
   }
 
   /**
+   * Immediately retires a specific device (e.g. when upstream reports
+   * `model_limits` or silently downgrades to `-mini`) and replaces it with
+   * a fresh UUID. No-ops safely if the device was already evicted.
+   */
+  async retireDevice(env: Env, deviceId: string): Promise<boolean> {
+    if (!deviceId) return false;
+    return await this.withLock(async () => {
+      const state = await this.getPool(env);
+      const configuredSize = env.DEVICE_POOL_SIZE ? parseInt(env.DEVICE_POOL_SIZE, 10) : DEFAULT_POOL_SIZE;
+      const poolSize = isNaN(configuredSize) || configuredSize < 1 ? DEFAULT_POOL_SIZE : configuredSize;
+
+      const idx = state.devices.findIndex((d) => d.id === deviceId);
+      if (idx === -1) {
+        return false;
+      }
+
+      state.devices.splice(idx, 1);
+      state.devices.push({ id: crypto.randomUUID() });
+      this.reconcilePoolSize(state, poolSize);
+      await this.savePool(env, state);
+      return true;
+    });
+  }
+
+  /**
    * Reports an upstream 429 or 403 error.
    * Matches Go auto_provision.go behavior:
-   * 1. Evicts the rate-limited candidate when pool is at capacity (keeping pool bounded to poolSize).
+   * 1. Evicts the rate-limited candidate if still in the pool (keeping pool bounded to poolSize).
    * 2. Provisions a fresh replacement device so pool has active capacity.
    * 3. Saves updated pool to KV and updates memory cache.
    */
@@ -210,21 +271,13 @@ export class DeviceManager {
       const configuredSize = env.DEVICE_POOL_SIZE ? parseInt(env.DEVICE_POOL_SIZE, 10) : DEFAULT_POOL_SIZE;
       const poolSize = isNaN(configuredSize) || configuredSize < 1 ? DEFAULT_POOL_SIZE : configuredSize;
 
-      // When pool is full, evict the rate-limited candidate (just like Go auto_provision)
-      if (state.devices.length >= poolSize) {
-        const victimIdx = pickEvictionIndex(state.devices, deviceId);
-        if (victimIdx !== -1) {
-          state.devices.splice(victimIdx, 1);
-        }
+      const idx = state.devices.findIndex((d) => d.id === deviceId);
+      if (idx !== -1) {
+        state.devices.splice(idx, 1);
+        state.devices.push({ id: crypto.randomUUID() });
       }
 
-      // Provision fresh replacement device
-      const replacement: DeviceIdentity = {
-        id: crypto.randomUUID(),
-      };
-      state.devices.push(replacement);
-
-      // Reconcile to ensure pool size is strictly bounded
+      // Reconcile to ensure pool size is strictly bounded (tops up if below poolSize).
       this.reconcilePoolSize(state, poolSize);
 
       await this.savePool(env, state);

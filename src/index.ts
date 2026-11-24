@@ -4,11 +4,26 @@ import { streamSSE } from 'hono/streaming';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Env, ChatCompletionRequest, ChatCompletionResponse } from './types';
 import { UpstreamClient, StatusError } from './client';
-import { deviceManager as defaultDeviceManager, DeviceManager } from './device';
-import { flattenMessages, lastUserMessageText } from './translate';
-import { buildAnonRequestBodyWithTools, normalizeToolDefinitions } from './toolcall_wire';
+import {
+  deviceManager as defaultDeviceManager,
+  DeviceManager,
+  resolveMaxDeviceUses,
+} from './device';
+import { flattenMessages, lastUserMessageText, SEARCH_SYSTEM_PROMPT } from './translate';
+import {
+  buildAnonRequestBodyWithTools,
+  normalizeToolDefinitions,
+  shouldInjectSearchPrompt,
+} from './toolcall_wire';
 import { getModelCatalog } from './catalog';
-import { pipeOpenAIStream, aggregateNonStreamWithSignals, StreamProcessor, STREAM_TAIL_GRACE_MS, READ_TIMEOUT } from './stream';
+import {
+  pipeOpenAIStream,
+  aggregateNonStreamWithSignals,
+  StreamProcessor,
+  STREAM_TAIL_GRACE_MS,
+  READ_TIMEOUT,
+  type UpstreamTurnSignals,
+} from './stream';
 import { createParser } from 'eventsource-parser';
 import {
   collectImageRefs,
@@ -682,6 +697,19 @@ export function openAIErrorBody(err: unknown): {
   return { status, error: { message, type, param, code } };
 }
 
+/** Observability response headers exposed to browser/CORS clients. */
+export const OBSERVABILITY_HEADERS = [
+  'x-device-id',
+  'x-device-use-count',
+  'x-device-max-uses',
+  'x-search-enabled',
+  'x-search-prompt-injected',
+  'x-upstream-model',
+  'x-used-web-search',
+  'x-search-sources-count',
+  'x-model-degraded',
+];
+
 interface RetryArgs {
   model: string;
   prompt: string;
@@ -698,10 +726,24 @@ interface StreamRetryCtx {
   imageRefs: ReturnType<typeof collectImageRefs>;
   client: UpstreamClient;
   dm: DeviceManager;
+  deviceId: string;
   hasTools: boolean;
 }
 
 type SSEWriter = Parameters<typeof pipeOpenAIStream>[1];
+
+/** Emit an SSE comment carrying turn observability metadata right before [DONE]. */
+async function emitStreamMeta(writer: SSEWriter, signals: UpstreamTurnSignals): Promise<void> {
+  if (typeof writer.write === 'function') {
+    const meta = {
+      upstream_model: signals.upstreamModel || 'unknown',
+      used_web_search: signals.usedWebSearch,
+      search_sources: signals.sourcesCount,
+      model_degraded: signals.modelDegraded,
+    };
+    await writer.write(`: meta ${JSON.stringify(meta)}\n\n`);
+  }
+}
 
 /** Emit one OpenAI chunk (or "[DONE]") to an SSE writer. */
 async function emitSSE(
@@ -907,7 +949,8 @@ async function emitAggregatedAsStream(
   writer: SSEWriter,
   result: ChatCompletionResponse,
   model: string,
-  req: ChatCompletionRequest
+  req: ChatCompletionRequest,
+  signals?: UpstreamTurnSignals
 ): Promise<void> {
   const sp = new StreamProcessor(model, req);
   const text = result.choices?.[0]?.message?.content ?? '';
@@ -968,6 +1011,7 @@ async function emitAggregatedAsStream(
   for (const chunk of sp.flush()) {
     await emitSSE(writer, chunk);
   }
+  await emitStreamMeta(writer, signals ?? sp.signals());
   await emitSSE(writer, '[DONE]');
 }
 
@@ -995,8 +1039,17 @@ async function pipeOpenAIStreamRetrying(
   signal: AbortSignal | undefined,
   ctx: StreamRetryCtx
 ): Promise<void> {
+  const handleSignals = async (signals: UpstreamTurnSignals, targetDeviceId: string) => {
+    if (signals.modelDegraded && targetDeviceId) {
+      await ctx.dm.retireDevice(ctx.env, targetDeviceId).catch(() => {});
+    }
+    await emitStreamMeta(writer, signals);
+  };
+
   if (!ctx.hasTools) {
-    await pipeOpenAIStream(resp, writer, model, req, signal);
+    await pipeOpenAIStream(resp, writer, model, req, signal, (signals) =>
+      handleSignals(signals, ctx.deviceId)
+    );
     return;
   }
 
@@ -1023,6 +1076,7 @@ async function pipeOpenAIStreamRetrying(
       for (const chunk of sp.flush()) {
         await emitSSE(writer, chunk);
       }
+      await handleSignals(sp.signals(), ctx.deviceId);
       await emitSSE(writer, '[DONE]');
       return;
     }
@@ -1060,9 +1114,13 @@ async function pipeOpenAIStreamRetrying(
       ],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     };
+    const primarySignals = sp.signals();
     const contractViolated = violatesToolContract(req, bufferedCompletion, sp.usedWebSearch);
 
     if (contractViolated && attempt < MAX_STREAM_ATTEMPTS - 1) {
+      if (primarySignals.modelDegraded && ctx.deviceId) {
+        await ctx.dm.retireDevice(ctx.env, ctx.deviceId).catch(() => {});
+      }
       try {
         await currentResp.body?.cancel();
       } catch {}
@@ -1079,7 +1137,13 @@ async function pipeOpenAIStreamRetrying(
         if (!violatesToolContract(req, retryResp.result, retryResp.usedWebSearch)) {
           // Got a usable answer — stream it out as a synthesized attempt and
           // finish, preserving the streaming contract.
-          await emitAggregatedAsStream(writer, retryResp.result, model, req);
+          await emitAggregatedAsStream(writer, retryResp.result, model, req, {
+            usedWebSearch: retryResp.usedWebSearch,
+            upstreamModel: retryResp.upstreamModel,
+            sourcesCount: retryResp.sourcesCount,
+            modelLimitReached: retryResp.modelLimitReached,
+            modelDegraded: retryResp.modelDegraded,
+          });
           return;
         }
       }
@@ -1095,6 +1159,7 @@ async function pipeOpenAIStreamRetrying(
     for (const chunk of sp.flush()) {
       await emitSSE(writer, chunk);
     }
+    await handleSignals(primarySignals, ctx.deviceId);
     await emitSSE(writer, '[DONE]');
     return;
   }
@@ -1104,18 +1169,20 @@ async function pipeOpenAIStreamRetrying(
  * Re-runs a tool turn on fresh devices (up to 4 attempts). Returns the first
  * result that satisfies the tool contract (a tool call, or a non-refusal plain
  * answer when no tool_choice was mandatory), or the last result if every
- * attempt violated it. usedWebSearch travels with the result so the caller
- * can re-check the contract.
+ * attempt violated it. Turn observability signals travel with the result so
+ * callers can report headers and retire silently downgraded devices.
  */
 async function retryToolTurn(
   env: Env,
   args: RetryArgs
-): Promise<{ result: ChatCompletionResponse; usedWebSearch: boolean } | null> {
+): Promise<({ result: ChatCompletionResponse; deviceId: string } & UpstreamTurnSignals) | null> {
   const { model, prompt, imageRefs, req, client, dm, signal } = args;
-  let lastResult: { result: ChatCompletionResponse; usedWebSearch: boolean } | null = null;
+  let lastResult: ({ result: ChatCompletionResponse; deviceId: string } & UpstreamTurnSignals) | null = null;
   for (let i = 0; i < 4; i++) {
+    let deviceId = '';
     try {
       const device = await dm.getHealthyDevice(env, client);
+      deviceId = device.id;
       let messageContent: Record<string, any> | undefined;
       let mimeTypes: string[] | undefined;
       if (imageRefs.length > 0) {
@@ -1150,13 +1217,19 @@ async function retryToolTurn(
       const conduitToken = await client.prepare(device.id, device.sentinelToken!, anonBody, signal);
       const resp = await client.conversation(device.id, device.sentinelToken!, conduitToken, anonBody, signal);
       const attempt = await aggregateNonStreamWithSignals(resp, model, req);
-      lastResult = attempt;
+      if (attempt.modelDegraded) {
+        await dm.retireDevice(env, device.id).catch(() => {});
+      }
+      lastResult = { ...attempt, deviceId: device.id };
       // Accept when the tool contract is satisfied: a tool call, or (absent a
       // mandatory tool_choice) any non-refusal plain answer.
       if (!violatesToolContract(req, attempt.result, attempt.usedWebSearch)) {
-        return attempt;
+        return lastResult;
       }
-    } catch {
+    } catch (err) {
+      if (deviceId && err instanceof StatusError && (err.status === 429 || err.status === 403 || err.status === 401)) {
+        await dm.reportCooldown(env, deviceId, err).catch(() => {});
+      }
       // keep trying
     }
   }
@@ -1171,8 +1244,8 @@ export function createApp(options?: AppOptions) {
   const commitDeadlineMs = options?.nonStreamCommitDeadlineMs ?? NONSTREAM_COMMIT_DEADLINE_MS;
   const keepAliveMs = options?.keepAliveIntervalMs ?? SSE_PING_INTERVAL_MS;
 
-  // Enable CORS for all routes
-  app.use('*', cors());
+  // Enable CORS for all routes and expose observability headers
+  app.use('*', cors({ exposeHeaders: OBSERVABILITY_HEADERS }));
 
   // Bearer token authentication middleware for API routes
   app.use('/v1/*', async (c, next) => {
@@ -1266,6 +1339,10 @@ export function createApp(options?: AppOptions) {
       kvBound,
       hasPool: Boolean(kvPool?.devices),
       poolDevicesCount: kvPool?.devices?.length || 0,
+      maxDeviceUses: resolveMaxDeviceUses(c.env),
+      deviceUseCounts: Array.isArray(kvPool?.devices)
+        ? kvPool.devices.map((d: any) => d.useCount || 0)
+        : [],
     });
   });
   app.get('/healthz', (c) => c.json({ status: 'ok' }));
@@ -1613,6 +1690,10 @@ export function createApp(options?: AppOptions) {
     let upstreamResp: Response | null = null;
     let lastError: any = null;
     let selectedDeviceId = '';
+    let selectedDeviceUseCount = 0;
+    const maxDeviceUses = resolveMaxDeviceUses(c.env);
+    const searchEnabled = hasTools ? req.search === true : req.search !== false;
+    let searchPromptInjected = false;
     /** Set when the non-stream refusal retry swapped to a fresh device. */
     let deviceRotated = false;
     const signal = c.req.raw?.signal;
@@ -1625,6 +1706,7 @@ export function createApp(options?: AppOptions) {
       try {
         const device = await dm.getHealthyDevice(c.env, client);
         selectedDeviceId = device.id;
+        selectedDeviceUseCount = device.useCount ?? 1;
 
         // Image uploads are per-device quota'd upstream, so they happen inside
         // the retry loop with the same device that runs the conversation. A
@@ -1677,15 +1759,17 @@ export function createApp(options?: AppOptions) {
         // Search defaults are unchanged: ON for plain chat unless
         // "search": false; OFF for tool requests unless "search": true (the
         // upstream web tool competes with tool-calling).
+        const injectSearchPrompt = shouldInjectSearchPrompt(req as any, hasTools, searchEnabled);
         const wireReq = {
           ...req,
           model,
-          search: hasTools ? req.search ?? false : req.search !== false,
+          search: searchEnabled,
         } as any;
         const anonBody = buildAnonRequestBodyWithTools(wireReq, {
           prompt,
           messageContent,
           attachmentMimeTypes,
+          injectSearchPrompt,
         });
 
         // Degenerate history without a single user message (e.g. system-only):
@@ -1703,6 +1787,12 @@ export function createApp(options?: AppOptions) {
             },
           ];
         }
+
+        searchPromptInjected =
+          shouldInjectSearchPrompt(req as any, hasTools, searchEnabled) &&
+          (anonBody.messages as any[]).some(
+            (m) => m?.author?.role === 'system' && m?.content?.parts?.[0] === SEARCH_SYSTEM_PROMPT
+          );
 
         const conduitToken = await client.prepare(
           device.id,
@@ -1761,6 +1851,10 @@ export function createApp(options?: AppOptions) {
     }
 
     c.header('x-device-id', selectedDeviceId);
+    c.header('x-device-use-count', String(selectedDeviceUseCount));
+    c.header('x-device-max-uses', String(maxDeviceUses));
+    c.header('x-search-enabled', String(searchEnabled));
+    c.header('x-search-prompt-injected', String(searchPromptInjected));
 
     if (req.stream) {
       return streamSSE(c, async (sseStream) => {
@@ -1780,6 +1874,7 @@ export function createApp(options?: AppOptions) {
             imageRefs,
             client,
             dm,
+            deviceId: selectedDeviceId,
             hasTools: hasTools,
           });
         } finally {
@@ -1797,10 +1892,31 @@ export function createApp(options?: AppOptions) {
     // 200 early and stream whitespace heartbeats (legal before a JSON value)
     // until the real body is ready. Browsers and SDKs reset read timers on
     // those bytes; the final document is still one JSON.parse-able value.
+    const liveSignals: UpstreamTurnSignals = {
+      usedWebSearch: false,
+      upstreamModel: '',
+      sourcesCount: 0,
+      modelLimitReached: false,
+      modelDegraded: false,
+    };
+    const syncSignals = (sig: UpstreamTurnSignals) => {
+      liveSignals.usedWebSearch = sig.usedWebSearch;
+      liveSignals.upstreamModel = sig.upstreamModel;
+      liveSignals.sourcesCount = sig.sourcesCount;
+      liveSignals.modelLimitReached = sig.modelLimitReached;
+      liveSignals.modelDegraded = sig.modelDegraded;
+    };
+
     const resultPromise = (async (): Promise<ChatCompletionResponse> => {
-      const first = await aggregateNonStreamWithSignals(upstreamResp!, model, req);
+      const first = await aggregateNonStreamWithSignals(upstreamResp!, model, req, liveSignals);
+      syncSignals(first);
       let result = first.result;
+      let activeDeviceId = selectedDeviceId;
+      let finalSignals: UpstreamTurnSignals = first;
       if (hasTools && violatesToolContract(req, result, first.usedWebSearch)) {
+        if (first.modelDegraded && selectedDeviceId) {
+          await dm.retireDevice(c.env, selectedDeviceId).catch(() => {});
+        }
         try {
           await upstreamResp!.body?.cancel();
         } catch {}
@@ -1809,8 +1925,14 @@ export function createApp(options?: AppOptions) {
         });
         if (retryResp) {
           result = retryResp.result;
+          activeDeviceId = retryResp.deviceId;
+          finalSignals = retryResp;
+          syncSignals(retryResp);
           deviceRotated = true;
         }
+      }
+      if (finalSignals.modelDegraded && activeDeviceId) {
+        await dm.retireDevice(c.env, activeDeviceId).catch(() => {});
       }
       return result;
     })();
@@ -1826,11 +1948,15 @@ export function createApp(options?: AppOptions) {
     }
 
     // Header must be set before the body commits; the retry runs inside
-    // resultPromise, so the rotation flag is only readable once it settles
-    // (fast path) or once the awaited result is in hand (slow path).
+    // resultPromise, so the rotation flag and upstream signals are read once
+    // settled (fast path) or as populated so far (slow path).
     if (deviceRotated) {
       c.header('x-device-id', 'rotated');
     }
+    c.header('x-upstream-model', liveSignals.upstreamModel || 'unknown');
+    c.header('x-used-web-search', String(liveSignals.usedWebSearch));
+    c.header('x-search-sources-count', String(liveSignals.sourcesCount));
+    c.header('x-model-degraded', String(liveSignals.modelDegraded));
 
     if (deadline.settled) {
       return c.json(deadline.result);

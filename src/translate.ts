@@ -75,6 +75,18 @@ export function flattenMessages(messages: OpenAIMessage[]): string {
 }
 
 /**
+ * System prompt injected on search-enabled plain-chat requests to counter
+ * instruction-induced search suppression and encourage verifying commands,
+ * versions, and facts against live web search results.
+ */
+export const SEARCH_SYSTEM_PROMPT = [
+  '[WEB SEARCH POLICY]',
+  'You have live web search access. For any question involving facts, current events, dates, prices, weather, software versions, APIs, CLI commands, library behavior, documentation, repositories, people, organizations, or anything that could be outdated or uncertain, ALWAYS search the web first before answering — even if you think you already know the answer from memory or other instructions suggest answering quickly/offline.',
+  'Verify specific commands, flags, versions, and numbers strictly against retrieved official documentation or primary sources; never guess, extrapolate, or fabricate unverified commands or facts. If search results do not confirm a detail, state that clearly instead of guessing.',
+  'Skip web search only for pure conversation, translation, creative writing, math/logic, or questions strictly about context provided in this conversation.',
+].join('\n');
+
+/**
  * buildAnonRequest constructs the upstream conversation DTO payload.
  */
 export interface AnonRequestOptions {

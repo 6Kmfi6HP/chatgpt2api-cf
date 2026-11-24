@@ -6,7 +6,9 @@ import {
   contentPartError,
   toolsParamError,
   legacyFunctionsParamError,
+  OBSERVABILITY_HEADERS,
 } from './index';
+import { SEARCH_SYSTEM_PROMPT } from './translate';
 import { clearCatalogCache } from './catalog';
 import { UpstreamClient, StatusError } from './client';
 import { DeviceManager } from './device';
@@ -307,11 +309,13 @@ describe('Hono Application (src/index.ts)', () => {
       const dto = mockClient.prepareCalls[0].anonBody;
       expect(dto.messages.map((m: any) => m.author.role)).toEqual([
         'system',
+        'system',
         'user',
         'assistant',
         'user',
       ]);
       expect(dto.messages.map((m: any) => m.content.parts[0])).toEqual([
+        SEARCH_SYSTEM_PROMPT,
         'You are concise.',
         'remember the codeword alpha1',
         'ok1',
@@ -323,18 +327,57 @@ describe('Hono Application (src/index.ts)', () => {
       expect(dto.parentMessageId).toBeNull();
       // No labeled-transcript blob pasted into a single frame anymore.
       expect(JSON.stringify(dto.messages)).not.toContain('Assistant:');
+
+      // With search: false, only the caller's exact 4 native frames are sent.
+      const resOff = await postChat({
+        model: 'auto',
+        search: false,
+        messages: [
+          { role: 'system', content: 'You are concise.' },
+          { role: 'user', content: 'remember the codeword alpha1' },
+          { role: 'assistant', content: 'ok1' },
+          { role: 'user', content: 'What was the codeword?' },
+        ],
+      });
+      expect(resOff.status).toBe(200);
+      const dtoOff = mockClient.prepareCalls[1].anonBody;
+      expect(dtoOff.messages.map((m: any) => m.author.role)).toEqual([
+        'system',
+        'user',
+        'assistant',
+        'user',
+      ]);
+      expect(dtoOff.messages.map((m: any) => m.content.parts[0])).toEqual([
+        'You are concise.',
+        'remember the codeword alpha1',
+        'ok1',
+        'What was the codeword?',
+      ]);
     });
 
-    it('keeps the single-message wire shape: one verbatim user frame', async () => {
+    it('keeps the single-message wire shape: search policy + verbatim user frame (or verbatim only when search=false)', async () => {
       const res = await postChat({
         model: 'auto',
         messages: [{ role: 'user', content: 'Say hello' }],
       });
       expect(res.status).toBe(200);
       const dto = mockClient.prepareCalls[0].anonBody;
-      expect(dto.messages).toHaveLength(1);
-      expect(dto.messages[0].author.role).toBe('user');
-      expect(dto.messages[0].content.parts[0]).toBe('Say hello');
+      expect(dto.messages).toHaveLength(2);
+      expect(dto.messages[0].author.role).toBe('system');
+      expect(dto.messages[0].content.parts[0]).toBe(SEARCH_SYSTEM_PROMPT);
+      expect(dto.messages[1].author.role).toBe('user');
+      expect(dto.messages[1].content.parts[0]).toBe('Say hello');
+
+      const resOff = await postChat({
+        model: 'auto',
+        search: false,
+        messages: [{ role: 'user', content: 'Say hello' }],
+      });
+      expect(resOff.status).toBe(200);
+      const dtoOff = mockClient.prepareCalls[1].anonBody;
+      expect(dtoOff.messages).toHaveLength(1);
+      expect(dtoOff.messages[0].author.role).toBe('user');
+      expect(dtoOff.messages[0].content.parts[0]).toBe('Say hello');
     });
 
     it('falls back to a single user frame when history has no user message', async () => {
@@ -424,7 +467,7 @@ describe('Hono Application (src/index.ts)', () => {
       expect(msgs[2].author.role).toBe('tool');
       expect(msgs[2].author.name).toBe('get_weather');
       expect(msgs[2].content.parts[0]).toBe('{"temp_c":26}');
-      // No tool protocol frame: tools were not part of the request.
+      // No tool protocol frame or search prompt frame when answering a tool result.
       expect(msgs[0].author.role).not.toBe('system');
     });
   });
@@ -1352,7 +1395,17 @@ describe('Tool calling (OpenAI tools API)', () => {
     const convCall = client.conversationCalls[0];
     const msgs = convCall.anonBody.messages;
     // No tool protocol system message inserted
-    expect(msgs[0].author.role).not.toBe('system');
+    expect(JSON.stringify(msgs)).not.toContain('TOOL CALL FORMAT');
+    expect(JSON.stringify(msgs)).not.toContain('get_weather');
+
+    // With search: false as well, no system frame at all.
+    const resOff = await testApp.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, search: false }),
+    }, mockEnv);
+    expect(resOff.status).toBe(200);
+    expect(client.conversationCalls[1].anonBody.messages[0].author.role).not.toBe('system');
   });
 
   it('rejects an orphan role:"tool" message with 400 invalid_request_error', async () => {
@@ -3860,5 +3913,305 @@ describe('images survive the tools path when the history has no user frame', () 
     expect(res.status).toBe(200);
     const roles = frames(client.conversationCalls[0].anonBody).map((m) => m.author.role);
     expect(roles.filter((r) => r === 'user')).toHaveLength(1);
+  });
+});
+
+describe('Observability headers, SSE meta, device use-count eviction & silent downgrade retirement', () => {
+  it('exposes observability headers on non-stream responses and in CORS exposeHeaders', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager(100);
+    const testApp = createApp({ client, deviceManager: dm });
+    const env: Env = { CHATGPT_KV: new MockKVNamespace() as any, DEVICE_POOL_SIZE: '3', DEVICE_MAX_USES: '10' };
+
+    client.conversationHandler = async () =>
+      createSseResponse([
+        `data: ${JSON.stringify({
+          type: 'message_stream',
+          message: {
+            id: 'web-1',
+            author: { role: 'tool', name: 'web.run' },
+            metadata: {
+              search_result_groups: [
+                { domain: 'example.com', entries: [{ url: 'https://example.com/1', title: '1', ref_id: { turn_index: 0, ref_type: 'search', ref_index: 0 } }] },
+              ],
+            },
+            content: { content_type: 'text', parts: [''] },
+          },
+        })}\n\n`,
+        `data: ${JSON.stringify({
+          type: 'message_stream',
+          message: {
+            id: 'live-1',
+            author: { role: 'assistant' },
+            status: 'finished_successfully',
+            end_turn: true,
+            channel: 'final',
+            metadata: { message_type: 'next', model_slug: 'gpt-6' },
+            content: { content_type: 'text', parts: ['Grounded answer.'] },
+          },
+        })}\n\n`,
+      ]);
+
+    const res = await testApp.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://client.example' },
+        body: JSON.stringify({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }),
+      },
+      env
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-device-id')).toBeTruthy();
+    expect(res.headers.get('x-device-use-count')).toBe('1');
+    expect(res.headers.get('x-device-max-uses')).toBe('10');
+    expect(res.headers.get('x-search-enabled')).toBe('true');
+    expect(res.headers.get('x-search-prompt-injected')).toBe('true');
+    expect(res.headers.get('x-upstream-model')).toBe('gpt-6');
+    expect(res.headers.get('x-used-web-search')).toBe('true');
+    expect(res.headers.get('x-search-sources-count')).toBe('1');
+    expect(res.headers.get('x-model-degraded')).toBe('false');
+
+    const exposed = (res.headers.get('access-control-expose-headers') || '').toLowerCase();
+    for (const h of OBSERVABILITY_HEADERS) {
+      expect(exposed).toContain(h);
+    }
+  });
+
+  it('emits streaming observability headers and : meta comment before [DONE]', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager(100);
+    const testApp = createApp({ client, deviceManager: dm, keepAliveIntervalMs: 60_000 });
+    const env: Env = { CHATGPT_KV: new MockKVNamespace() as any, DEVICE_POOL_SIZE: '2' };
+
+    client.conversationHandler = async () =>
+      createSseResponse([
+        `data: ${JSON.stringify({
+          type: 'message_stream',
+          message: {
+            id: 'live-1',
+            author: { role: 'assistant' },
+            status: 'finished_successfully',
+            end_turn: true,
+            channel: 'final',
+            metadata: { message_type: 'next', model_slug: 'gpt-6' },
+            content: { content_type: 'text', parts: ['Streamed text.'] },
+          },
+        })}\n\n`,
+      ]);
+
+    const res = await testApp.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-6', search: false, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      },
+      env
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-search-enabled')).toBe('false');
+    expect(res.headers.get('x-search-prompt-injected')).toBe('false');
+    const body = await res.text();
+    const metaIdx = body.indexOf(': meta ');
+    const doneIdx = body.indexOf('data: [DONE]');
+    expect(metaIdx).toBeGreaterThan(-1);
+    expect(doneIdx).toBeGreaterThan(metaIdx);
+    const metaLine = body.slice(metaIdx, body.indexOf('\n', metaIdx));
+    const parsedMeta = JSON.parse(metaLine.slice(': meta '.length));
+    expect(parsedMeta).toEqual({
+      upstream_model: 'gpt-6',
+      used_web_search: false,
+      search_sources: 0,
+      model_degraded: false,
+    });
+  });
+
+  it('populates live upstream observability headers even on the slow-path early commit', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager(100);
+    const testApp = createApp({
+      client,
+      deviceManager: dm,
+      nonStreamCommitDeadlineMs: 15,
+      keepAliveIntervalMs: 10,
+    });
+    const env: Env = { CHATGPT_KV: new MockKVNamespace() as any };
+    const gate = Promise.withResolvers<void>();
+    const encoder = new TextEncoder();
+
+    client.conversationHandler = async () => {
+      const body = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                type: 'message_stream',
+                message: {
+                  id: 'web-slow',
+                  author: { role: 'tool', name: 'web.run' },
+                  content: { content_type: 'text', parts: [''] },
+                },
+              })}\n\n`
+            )
+          );
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                type: 'message_stream',
+                message: {
+                  id: 'live-slow',
+                  author: { role: 'assistant' },
+                  status: 'in_progress',
+                  metadata: { message_type: 'next', model_slug: 'gpt-6' },
+                  content: { content_type: 'text', parts: ['Partial'] },
+                },
+              })}\n\n`
+            )
+          );
+          await gate.promise;
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                type: 'message_stream',
+                message: {
+                  id: 'live-slow',
+                  author: { role: 'assistant' },
+                  status: 'finished_successfully',
+                  end_turn: true,
+                  channel: 'final',
+                  metadata: { message_type: 'next', model_slug: 'gpt-6' },
+                  content: { content_type: 'text', parts: ['Partial complete'] },
+                },
+              })}\n\n`
+            )
+          );
+          controller.close();
+        },
+      });
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    };
+
+    const resPromise = testApp.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-6', messages: [{ role: 'user', content: 'slow?' }] }),
+      },
+      env
+    );
+
+    await new Promise((r) => setTimeout(r, 40));
+    gate.resolve();
+    const res = await resPromise;
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-upstream-model')).toBe('gpt-6');
+    expect(res.headers.get('x-used-web-search')).toBe('true');
+    const json = JSON.parse((await res.text()).trim());
+    expect(json.choices[0].message.content).toBe('Partial complete');
+  });
+
+  it.each([false, true])(
+    'automatically retires a device when upstream silently downgrades or emits model_limits (stream=%s)',
+    async (stream) => {
+      const client = new MockUpstreamClient();
+      const dm = new DeviceManager(100);
+      const testApp = createApp({ client, deviceManager: dm, keepAliveIntervalMs: 60_000 });
+      const env: Env = { CHATGPT_KV: new MockKVNamespace() as any, DEVICE_POOL_SIZE: '1' };
+
+      client.conversationHandler = async () =>
+        createSseResponse([
+          `data: ${JSON.stringify({
+            type: 'message_stream',
+            message: {
+              id: 'live-1',
+              author: { role: 'assistant' },
+              status: 'finished_successfully',
+              end_turn: true,
+              channel: 'final',
+              metadata: { message_type: 'next', model_slug: 'gpt-6-mini' },
+              content: { content_type: 'text', parts: ['Downgraded answer.'] },
+            },
+          })}\n\n`,
+          `data: ${JSON.stringify({
+            type: 'conversation_detail_metadata',
+            model_limits: [{ model_slug: 'gpt-6' }],
+          })}\n\n`,
+        ]);
+
+      const res1 = await testApp.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'gpt-6', stream, messages: [{ role: 'user', content: 'hi' }] }),
+        },
+        env
+      );
+      expect(res1.status).toBe(200);
+      const degradedDeviceId = res1.headers.get('x-device-id');
+      if (stream) {
+        const raw = await res1.text();
+        expect(raw).toContain('"model_degraded":true');
+      } else {
+        expect(res1.headers.get('x-model-degraded')).toBe('true');
+        await res1.text();
+      }
+
+      // Pool should now contain a brand new device instead of degradedDeviceId.
+      const pool = await dm.getPool(env);
+      expect(pool.devices).toHaveLength(1);
+      expect(pool.devices[0].id).not.toBe(degradedDeviceId);
+
+      // Next request immediately picks up the replacement device.
+      const res2 = await testApp.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'gpt-6', stream: false, messages: [{ role: 'user', content: 'hi again' }] }),
+        },
+        env
+      );
+      expect(res2.headers.get('x-device-id')).not.toBe(degradedDeviceId);
+      expect(res2.headers.get('x-device-use-count')).toBe('1');
+    }
+  );
+
+  it('rotates to a fresh device over HTTP once DEVICE_MAX_USES is exceeded', async () => {
+    const client = new MockUpstreamClient();
+    const dm = new DeviceManager(100);
+    const testApp = createApp({ client, deviceManager: dm });
+    const env: Env = {
+      CHATGPT_KV: new MockKVNamespace() as any,
+      DEVICE_POOL_SIZE: '1',
+      DEVICE_MAX_USES: '3',
+    };
+
+    const reqIds: string[] = [];
+    const counts: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const res = await testApp.request(
+        '/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'gpt-6', messages: [{ role: 'user', content: `q${i}` }] }),
+        },
+        env
+      );
+      expect(res.status).toBe(200);
+      reqIds.push(res.headers.get('x-device-id')!);
+      counts.push(res.headers.get('x-device-use-count')!);
+      expect(res.headers.get('x-device-max-uses')).toBe('3');
+    }
+
+    expect(reqIds[0]).toBe(reqIds[1]);
+    expect(reqIds[1]).toBe(reqIds[2]);
+    expect(reqIds[3]).not.toBe(reqIds[0]);
+    expect(counts).toEqual(['1', '2', '3', '1']);
   });
 });

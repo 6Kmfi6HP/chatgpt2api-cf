@@ -4,6 +4,7 @@ import {
   pipeOpenAIStream,
   aggregateNonStream,
   aggregateNonStreamWithSignals,
+  isModelDegraded,
  } from './stream';
 import type { ChatCompletionRequest, ChatCompletionChunk } from './types';
 import {
@@ -1380,5 +1381,138 @@ describe('sampling limits (stop / max_tokens)', () => {
     // decode to a string that a strict UTF-8 encoder can re-encode losslessly.
     expect(new TextDecoder().decode(new TextEncoder().encode(content))).toBe(content);
     expect(() => encodeURIComponent(content)).not.toThrow();
+  });
+});
+
+describe('UpstreamTurnSignals & silent downgrade detection', () => {
+  function createSseResponse(events: string[]): Response {
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const ev of events) {
+          controller.enqueue(new TextEncoder().encode(ev));
+        }
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+  }
+
+  it('detects silent -mini downgrade and model_limits without false positives on explicit -mini', () => {
+    expect(isModelDegraded('gpt-6', 'gpt-6-mini', false)).toBe(true);
+    expect(isModelDegraded('auto', 'gpt-6-mini', false)).toBe(true);
+    expect(isModelDegraded('gpt-6', 'gpt-6', true)).toBe(true);
+    expect(isModelDegraded('gpt-6-mini', 'gpt-6-mini', false)).toBe(false);
+    expect(isModelDegraded('gpt-6', 'gpt-6', false)).toBe(false);
+  });
+
+  it('extracts upstreamModel, sourcesCount, modelLimitReached, and modelDegraded in StreamProcessor & pipeOpenAIStream', async () => {
+    const events = [
+      `data: ${JSON.stringify({
+        type: 'message_stream',
+        message: {
+          id: 'hist-echo',
+          author: { role: 'assistant' },
+          status: 'finished_successfully',
+          metadata: { model_slug: 'gpt-5-old' },
+          content: { content_type: 'text', parts: ['old'] },
+        },
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        type: 'message_stream',
+        message: {
+          id: 'live-web',
+          author: { role: 'tool', name: 'web.run' },
+          metadata: {
+            search_result_groups: [
+              { domain: 'example.com', entries: [{ url: 'https://example.com/a', title: 'A', ref_id: { turn_index: 0, ref_type: 'search', ref_index: 0 } }] },
+            ],
+          },
+          content: { content_type: 'text', parts: [''] },
+        },
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        type: 'message_stream',
+        message: {
+          id: 'live-1',
+          author: { role: 'assistant' },
+          status: 'finished_successfully',
+          end_turn: true,
+          channel: 'final',
+          metadata: { message_type: 'next', model_slug: 'gpt-6-mini' },
+          content: { content_type: 'text', parts: ['Answer'] },
+        },
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        type: 'server_ste_metadata',
+        metadata: { model_slug: 'gpt-6-mini' },
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        type: 'conversation_detail_metadata',
+        model_limits: [{ model_slug: 'gpt-6', resets_after: '2026-11-24T08:00:00Z' }],
+      })}\n\n`,
+      'data: [DONE]\n\n',
+    ];
+
+    let capturedSignals: any = null;
+    const written: string[] = [];
+    await pipeOpenAIStream(
+      createSseResponse(events),
+      { writeSSE: async (m) => void written.push(m.data) },
+      'gpt-6',
+      { model: 'gpt-6', messages: [{ role: 'user', content: 'hi' }], stream: true },
+      undefined,
+      (sig) => {
+        capturedSignals = sig;
+      }
+    );
+
+    expect(written[written.length - 1]).toBe('[DONE]');
+    expect(capturedSignals).toEqual({
+      usedWebSearch: true,
+      upstreamModel: 'gpt-6-mini',
+      sourcesCount: 1,
+      modelLimitReached: true,
+      modelDegraded: true,
+    });
+  });
+
+  it('extracts observability signals and populates liveSignals in aggregateNonStreamWithSignals', async () => {
+    const resp = createSseResponse([
+      `data: ${JSON.stringify({
+        type: 'message_stream',
+        message: {
+          id: 'live-1',
+          author: { role: 'assistant' },
+          status: 'finished_successfully',
+          end_turn: true,
+          channel: 'final',
+          metadata: { message_type: 'next', model_slug: 'gpt-6' },
+          content: { content_type: 'text', parts: ['Done.'] },
+        },
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        type: 'conversation_detail_metadata',
+        model_limits: [],
+      })}\n\n`,
+    ]);
+    const liveSignals = {
+      usedWebSearch: false,
+      upstreamModel: '',
+      sourcesCount: 0,
+      modelLimitReached: false,
+      modelDegraded: false,
+    };
+    const out = await aggregateNonStreamWithSignals(
+      resp,
+      'auto',
+      { model: 'auto', messages: [{ role: 'user', content: 'hi' }] },
+      liveSignals
+    );
+    expect(out.upstreamModel).toBe('gpt-6');
+    expect(out.modelDegraded).toBe(false);
+    expect(liveSignals.upstreamModel).toBe('gpt-6');
+    expect(liveSignals.modelDegraded).toBe(false);
   });
 });

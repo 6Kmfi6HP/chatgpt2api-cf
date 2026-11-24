@@ -224,6 +224,8 @@ export interface DeviceIdentity {
   cooldownUntil?: number; // Unix timestamp in milliseconds
   failureCount?: number;
   lastUsedAt?: number; // Unix timestamp in milliseconds for round-robin rotation
+  /** Number of upstream requests served by this device; rotated out once limit is reached. */
+  useCount?: number;
 }
 
 export interface DevicePoolState {
@@ -235,4 +237,6 @@ export interface Env {
   CHATGPT_KV: KVNamespace;
   API_KEYS?: string; // Comma separated allowed api keys (empty = public)
   DEVICE_POOL_SIZE?: string; // Default "3"
+  /** Max requests a single device serves before automatic eviction & replacement. Default "10". */
+  DEVICE_MAX_USES?: string;
 }

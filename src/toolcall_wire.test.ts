@@ -5,9 +5,10 @@ import {
   isToolCallResponseText,
   buildToolCallsChatMessage,
   extractToolNameFromUpstreamMessage,
+  shouldInjectSearchPrompt,
 } from './toolcall_wire';
 import type { WireToolCallRequest } from './toolcall_wire';
-import { buildAnonRequest } from './translate';
+import { buildAnonRequest, SEARCH_SYSTEM_PROMPT } from './translate';
 import { TOOL_CALL_REPLY_FORMAT } from './toolcall';
 
 // buildAnonRequest is the network-facing boundary (it only builds the DTO, but
@@ -404,5 +405,55 @@ describe('buildAnonRequestBodyWithTools parallel_tool_calls', () => {
     });
     const dto = buildAnonRequestBodyWithTools(req, { prompt: 'p' });
     expect(dto.messages.map((m: any) => m.author.role)).toEqual(['system', 'user']);
+  });
+});
+
+describe('search system prompt injection', () => {
+  it('injects SEARCH_SYSTEM_PROMPT when search=true and no tools are active', () => {
+    const req = baseReq({
+      search: true,
+      messages: [{ role: 'user', content: 'Vitest 4 default pool?' }],
+    });
+    const dto = buildAnonRequestBodyWithTools(req, { prompt: 'p' });
+    expect(dto.messages).toHaveLength(2);
+    expect(dto.messages[0].author.role).toBe('system');
+    expect(dto.messages[0].content.parts[0]).toBe(SEARCH_SYSTEM_PROMPT);
+    expect(dto.messages[1].content.parts[0]).toBe('Vitest 4 default pool?');
+  });
+
+  it('omits SEARCH_SYSTEM_PROMPT when search=false', () => {
+    const req = baseReq({
+      search: false,
+      messages: [{ role: 'user', content: 'Vitest 4 default pool?' }],
+    });
+    const dto = buildAnonRequestBodyWithTools(req, { prompt: 'p' });
+    expect(dto.messages).toHaveLength(1);
+    expect(dto.messages[0].author.role).toBe('user');
+  });
+
+  it('omits SEARCH_SYSTEM_PROMPT when tools are active even if search=true', () => {
+    const req = baseReq({
+      search: true,
+      messages: [{ role: 'user', content: 'check weather' }],
+      tools: [{ type: 'function', function: { name: 'get_weather' } }],
+    });
+    const dto = buildAnonRequestBodyWithTools(req, { prompt: 'p' });
+    expect(dto.messages[0].content.parts[0]).toContain('[SYSTEM TOOL PROTOCOL');
+    expect(dto.messages.some((m: any) => m.content?.parts?.[0] === SEARCH_SYSTEM_PROMPT)).toBe(false);
+  });
+
+  it('omits SEARCH_SYSTEM_PROMPT when answering a role:tool result without explicit search=true', () => {
+    const toolResultReq: WireToolCallRequest = {
+      model: 'gpt-6',
+      messages: [
+        { role: 'user', content: 'weather?' },
+        { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'c1', name: 'get_weather', content: '20C' },
+      ],
+    };
+    expect(shouldInjectSearchPrompt(toolResultReq, false, true)).toBe(false);
+    expect(shouldInjectSearchPrompt({ ...toolResultReq, search: true }, false, true)).toBe(true);
+    expect(shouldInjectSearchPrompt(baseReq({}), true, true)).toBe(false);
+    expect(shouldInjectSearchPrompt(baseReq({}), false, false)).toBe(false);
   });
 });
