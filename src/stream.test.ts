@@ -1478,6 +1478,56 @@ describe('UpstreamTurnSignals & silent downgrade detection', () => {
     });
   });
 
+  it('waits for post-turn conversation_detail_metadata past the typing-tail grace', async () => {
+    const enc = new TextEncoder();
+    const live = `data: ${JSON.stringify({
+      type: 'message_stream',
+      message: {
+        id: 'live-1',
+        author: { role: 'assistant' },
+        status: 'finished_successfully',
+        end_turn: true,
+        channel: 'final',
+        metadata: { message_type: 'next', model_slug: 'gpt-6' },
+        content: { content_type: 'text', parts: ['Done.'] },
+      },
+    })}\n\n`;
+    const limits = `data: ${JSON.stringify({
+      type: 'conversation_detail_metadata',
+      model_limits: [{ model_slug: 'gpt-6' }],
+    })}\n\n`;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(enc.encode(live));
+        // The upstream metadata trailer lands after the live turn has been
+        // quiet for longer than the client typing-tail grace.
+        setTimeout(() => {
+          try {
+            controller.enqueue(enc.encode(limits));
+            controller.close();
+          } catch {
+            // The reader was cancelled by the old 250ms cutoff.
+          }
+        }, 400);
+      },
+    });
+    let capturedSignals: any = null;
+    const written: string[] = [];
+    await pipeOpenAIStream(
+      new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }),
+      { writeSSE: async (m) => void written.push(m.data) },
+      'gpt-6',
+      { model: 'gpt-6', messages: [{ role: 'user', content: 'hi' }], stream: true },
+      undefined,
+      (sig) => {
+        capturedSignals = sig;
+      }
+    );
+    expect(written[written.length - 1]).toBe('[DONE]');
+    expect(capturedSignals.modelLimitReached).toBe(true);
+    expect(capturedSignals.modelDegraded).toBe(true);
+  });
+
   it('extracts observability signals and populates liveSignals in aggregateNonStreamWithSignals', async () => {
     const resp = createSseResponse([
       `data: ${JSON.stringify({
