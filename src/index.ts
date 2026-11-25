@@ -20,7 +20,7 @@ import {
   pipeOpenAIStream,
   aggregateNonStreamWithSignals,
   StreamProcessor,
-  STREAM_TAIL_GRACE_MS,
+  TURN_METADATA_GRACE_MS,
   READ_TIMEOUT,
   type UpstreamTurnSignals,
 } from './stream';
@@ -910,10 +910,17 @@ async function streamAttempt(
         }
 
         if (done) break;
-        // Idle-based window: reset after processing so drain time does not
-        // consume it (mirrors pipeOpenAIStream; see STREAM_TAIL_GRACE_MS).
+        // Idle-based window: keep reading until the post-turn metadata frame
+        // lands so streaming turns do not drop model_limits (mirrors
+        // pipeOpenAIStream; see TURN_METADATA_GRACE_MS).
         if (sp.endedTurn) {
-          graceDeadline = Date.now() + STREAM_TAIL_GRACE_MS;
+          if (sp.sawTurnMetadata) {
+            try {
+              await reader.cancel();
+            } catch {}
+            break;
+          }
+          graceDeadline = Date.now() + TURN_METADATA_GRACE_MS;
         }
       }
       if (tailTimedOut) {

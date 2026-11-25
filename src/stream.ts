@@ -151,6 +151,8 @@ export class StreamProcessor {
   public upstreamModel = '';
   /** True when upstream reported `conversation_detail_metadata.model_limits`. */
   public modelLimitReached = false;
+  /** True once the post-turn `conversation_detail_metadata` frame was parsed. */
+  public sawTurnMetadata = false;
 
   constructor(
     model: string,
@@ -184,6 +186,9 @@ export class StreamProcessor {
     ingestMetadata(this.sources, rawJSON);
 
     const ev = rawJSON;
+    if (ev?.type === 'conversation_detail_metadata') {
+      this.sawTurnMetadata = true;
+    }
     if (hasModelLimits(ev)) {
       this.modelLimitReached = true;
     }
@@ -484,6 +489,15 @@ async function emitChunk(
  * Shared with the buffered retry reader in src/index.ts.
  */
 export const STREAM_TAIL_GRACE_MS = 250;
+/**
+ * After the live assistant message reports `end_turn`, the upstream still
+ * sends `conversation_detail_metadata` (which carries `model_limits`) and
+ * closes the socket. That trailer lands ~0.4-0.8s after the last content
+ * frame, i.e. after the 250ms typing tail. Keep reading for it so the device
+ * retirement and `model_degraded` signals are not silently dropped for
+ * streaming clients; stop as soon as the event is parsed.
+ */
+export const TURN_METADATA_GRACE_MS = 1500;
 
 /** Sentinel returned by the bounded tail read when the grace window expires. */
 export const READ_TIMEOUT = Symbol('read-timeout');
@@ -584,13 +598,19 @@ export async function pipeOpenAIStream(
         }
 
         if (done) break;
-        // Idle-based window: reset AFTER emission so a slow client sink (whose
-        // drain can take longer than the grace period) never consumes the
-        // window and causes an in-window trailing frame to be dropped. The
-        // stream now ends after STREAM_TAIL_GRACE_MS of upstream silence
-        // following the last emitted frame.
+        // The turn's live content is complete, but the upstream still emits
+        // its metadata trailer (including model_limits). Stop as soon as that
+        // frame is parsed; otherwise keep the read window open long enough to
+        // receive it. Reset AFTER emission so a slow client sink never
+        // consumes the window.
         if (sp.endedTurn) {
-          graceDeadline = Date.now() + STREAM_TAIL_GRACE_MS;
+          if (sp.sawTurnMetadata) {
+            try {
+              await reader.cancel();
+            } catch {}
+            break;
+          }
+          graceDeadline = Date.now() + TURN_METADATA_GRACE_MS;
         }
       }
     } finally {
