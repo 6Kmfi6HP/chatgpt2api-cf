@@ -9,7 +9,7 @@ import {
   DeviceManager,
   resolveMaxDeviceUses,
 } from './device';
-import { flattenMessages, lastUserMessageText, SEARCH_SYSTEM_PROMPT } from './translate';
+import { extractMessageText, flattenMessages, lastUserMessageText, SEARCH_SYSTEM_PROMPT } from './translate';
 import {
   buildAnonRequestBodyWithTools,
   normalizeToolDefinitions,
@@ -1669,13 +1669,26 @@ export function createApp(options?: AppOptions) {
       Array.isArray(req.tools) && req.tools.length > 0 && req.tool_choice !== 'none';
     const imageRefs = req.messages.flatMap((m) => collectImageRefs(m.content as any));
 
-    // A request with neither text nor an attachment carries nothing the
-    // upstream can answer: it greets the caller and the client reads a 200 it
-    // never asked for. This covers `content: ""`, an empty `content: []`, and a
-    // history whose only text-bearing frames were assistant/tool frames. An
-    // image-only message is legitimate (vision requests carry no prompt text),
-    // so images count as content.
-    if (prompt.trim() === '' && imageRefs.length === 0) {
+    // A request with no user turn, no attachment, no tool result and no
+    // system/developer instruction carries nothing the upstream can answer.
+    // Testing `prompt` alone was not enough: `flattenMessages` folds assistant
+    // text into it, so an assistant-only history slipped through and the
+    // degenerate-history fallback replayed the model's own words as a *user*
+    // message (issue #63). A system/developer frame is a deliberate
+    // instruction that the fallback is allowed to open with, an image-only
+    // message is a legitimate vision request, and an agent loop may continue
+    // from a tool result with no user frame — all of those stay valid.
+    const hasUserText = req.messages.some(
+      (m) => m.role === 'user' && extractMessageText(m.content).trim() !== ''
+    );
+    const hasToolResult = req.messages.some((m) => m.role === 'tool');
+    const hasInstructionFrame = req.messages.some((m) => {
+      // `developer` is accepted at runtime as a system alias; the wire type
+      // keeps only OpenAI's classic roles, so widen the check locally.
+      const role = (m as { role?: string }).role;
+      return role === 'system' || role === 'developer';
+    });
+    if (!hasUserText && imageRefs.length === 0 && !hasToolResult && !hasInstructionFrame) {
       return c.json(
         {
           error: {
