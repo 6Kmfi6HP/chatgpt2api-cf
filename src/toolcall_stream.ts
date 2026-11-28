@@ -1,5 +1,6 @@
 import {
   isTruncatedToolCallPrefix,
+  MAX_PARSE_LENGTH,
   tryParseToolCall,
   tryParseTruncatedToolCall,
   stripGenuiMarkers,
@@ -16,7 +17,11 @@ import {
  * flushes as soon as it is provably a plain reply.
  */
 
-export const DEFAULT_MAX_TOOLCALL_BUFFER = 1200;
+// Must match the non-stream parser's own limit: a reply the parser accepts as a
+// tool call (up to MAX_PARSE_LENGTH) must be held here until it resolves too.
+// A smaller window flushed large calls as plain content (see
+// [audit:stream-large-toolcall-flushed]).
+export const DEFAULT_MAX_TOOLCALL_BUFFER = MAX_PARSE_LENGTH;
 
 export interface DetectorDecision {
   decision: 'buffer' | 'flush' | 'emit_tool_calls';
@@ -62,10 +67,9 @@ export class ToolCallStreamDetector {
       return { decision: 'flush', text: raw };
     }
 
-    // Oversize: no tool-call convention reply exceeds this.
+    // Oversize: beyond what tryParseToolCall would ever accept, so it cannot
+    // resolve into a tool call — flush as plain text.
     if (raw.length > this.maxBuffer) {
-      // Could still be a malformed tool call JSON — but per protocol replies
-      // are small; treat as plain text and flush.
       this.flushed = true;
       return { decision: 'flush', text: raw };
     }
