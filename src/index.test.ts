@@ -3667,6 +3667,98 @@ describe('unanswered assistant tool_calls on the HTTP path', () => {
   });
 });
 
+// Guards [audit:tool-result-content-dropped]: `role:"tool"` with no `content`
+// (or `content: null`) used to be accepted. The builder forwarded `parts: ['']`
+// and `unansweredToolCallError` treated the frame as the answer to the call, so
+// a client whose tool output went missing got a plausible 200 answer for a
+// result the model never received. OpenAI requires `content` on a tool result;
+// an explicit empty string or parts array still means "the tool returned
+// nothing" and stays accepted.
+describe('content-less tool results on the HTTP path', () => {
+  let client: MockUpstreamClient;
+  let mockEnv: Env;
+  let app: ReturnType<typeof createApp>;
+
+  const call = {
+    id: 'call_1',
+    type: 'function',
+    function: { name: 'lookup', arguments: '{"id":"TCK-77"}' },
+  };
+  const history = (toolMsg: Record<string, unknown>) => [
+    { role: 'user', content: 'Status of TCK-77?' },
+    { role: 'assistant', content: null, tool_calls: [call] },
+    toolMsg,
+  ];
+
+  beforeEach(() => {
+    clearCatalogCache();
+    client = new MockUpstreamClient();
+    client.conversationHandler = async () =>
+      createSseResponse([`data: ${JSON.stringify(mkAssistantEvent('It is open.'))}\n\n`]);
+    app = createApp({ client, deviceManager: new DeviceManager(100) });
+    mockEnv = {
+      CHATGPT_KV: new MockKVNamespace() as unknown as Env['CHATGPT_KV'],
+      API_KEYS: '',
+      DEVICE_POOL_SIZE: '3',
+    } as unknown as Env;
+  });
+
+  async function post(payload: Record<string, unknown>) {
+    return app.request(
+      '/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'auto',
+          tools: [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }],
+          ...payload,
+        }),
+      },
+      mockEnv
+    );
+  }
+
+  it.each([
+    { label: 'missing content', toolMsg: { role: 'tool', tool_call_id: 'call_1' } },
+    { label: 'null content', toolMsg: { role: 'tool', tool_call_id: 'call_1', content: null } },
+  ])('returns 400 for a tool result with $label', async ({ toolMsg }) => {
+    const res = await post({ messages: history(toolMsg) });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; message: string } } = await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('messages');
+    expect(data.error.message).toContain('messages[2].content');
+    // Rejected before any upstream work: no device, no prepare, no conversation.
+    expect(client.prepareCalls).toHaveLength(0);
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // The SSE-vs-JSON switch must not be reached: a streaming caller gets a JSON
+  // 400, never an empty 200 event stream.
+  it('returns a JSON 400 (not an SSE error frame) for a streaming request', async () => {
+    const res = await post({
+      stream: true,
+      messages: history({ role: 'tool', tool_call_id: 'call_1' }),
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // The rule rejects only a LOST content field, not a tool that genuinely
+  // returned nothing: an explicit empty string or parts array still works.
+  it.each([
+    { label: 'empty string', content: '' },
+    { label: 'content-parts array', content: [{ type: 'text', text: 'open' }] },
+  ])('keeps a tool result with an explicit $label working', async ({ content }) => {
+    const res = await post({
+      messages: history({ role: 'tool', tool_call_id: 'call_1', content }),
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
 // Guards [audit:images-dropped-when-tools-enabled]: with tools enabled the
 // handler collected image refs from `role:"user"` frames only, so an image
 // carried by a tool result (the normal shape for a browser/computer-use

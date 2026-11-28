@@ -201,6 +201,18 @@ export function messageShapeError(messages: unknown[]): string | null {
     if (toolCallsError) {
       return toolCallsError;
     }
+    // OpenAI requires `content` on a tool result. Accepting an absent or null
+    // one forwards an empty result to the model AND clears the unanswered-call
+    // guard below, because `unansweredToolCallError` treats any matching
+    // `role:"tool"` frame as the answer. A client that lost the tool output
+    // (an undefined variable, a serialization bug) therefore gets a plausible
+    // 200 answer for a result the model never received — the same silent
+    // data-loss class this gateway rejects for orphan/unanswered calls. An
+    // explicit empty string or content-parts array is a legitimate "the tool
+    // returned nothing" and stays accepted.
+    if (role === 'tool' && (content === undefined || content === null)) {
+      return `${path}.content must be present for a role "tool" message`;
+    }
     // null and undefined are legal: assistant turns that only call tools carry
     // no text, and some clients omit content entirely.
     if (content === undefined || content === null || typeof content === 'string') {
