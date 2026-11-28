@@ -175,7 +175,7 @@ export function buildToolProtocolSystemMessage(
 }
 
 /** Max reply length considered for tool-call parsing; longer means prose. */
-const MAX_PARSE_LENGTH = 8000;
+export const MAX_PARSE_LENGTH = 8000;
 
 /**
  * Extract the JSON payload from a model reply, or null.

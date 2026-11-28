@@ -212,3 +212,55 @@ describe('ToolCallStreamState single-call mode', () => {
     expect(chunks[0].delta!.tool_calls![0].function.name).toBe('get_weather');
   });
 });
+
+// [audit:stream-large-toolcall-flushed] The stream detector's hold window must
+// match the non-stream parser's limit (MAX_PARSE_LENGTH), otherwise a tool call
+// whose arguments exceed the small window is flushed as plain content and the
+// client never executes it.
+describe('ToolCallStreamDetector large tool calls', () => {
+  const largeCall = (n: number) =>
+    JSON.stringify({ tool_calls: [{ name: 'write_file', arguments: { path: '/tmp/a', content: 'x'.repeat(n) } }] });
+
+  it('emits a complete tool call larger than the old 1200-char window', () => {
+    const call = largeCall(3000);
+    expect(call.length).toBeGreaterThan(1200);
+    expect(call.length).toBeLessThanOrEqual(8000);
+    const d = new ToolCallStreamDetector();
+    const r = d.feed(call);
+    expect(r.decision).toBe('emit_tool_calls');
+    expect(r.toolCalls![0].name).toBe('write_file');
+  });
+
+  it('keeps buffering an incomplete large tool-call prefix instead of flushing it', () => {
+    const call = largeCall(3000);
+    const d = new ToolCallStreamDetector();
+    const prefix = call.slice(0, 1300);
+    expect(prefix.length).toBeGreaterThan(1200);
+    expect(d.feed(prefix)).toEqual({ decision: 'buffer' });
+    expect(d.feed(call).decision).toBe('emit_tool_calls');
+  });
+
+  it('still flushes a payload beyond the parser limit', () => {
+    const call = largeCall(8100);
+    expect(call.length).toBeGreaterThan(8000);
+    const d = new ToolCallStreamDetector();
+    expect(d.feed(call).decision).toBe('flush');
+  });
+});
+
+describe('ToolCallStreamState large tool calls', () => {
+  it('streams a large call as tool_calls, never as content', () => {
+    const call = JSON.stringify({
+      tool_calls: [{ name: 'write_file', arguments: { path: '/tmp/a', content: 'y'.repeat(3000) } }],
+    });
+    const st = new ToolCallStreamState();
+    expect(st.feed(call.slice(0, 1300))).toEqual([]);
+    const chunks = st.feed(call);
+    expect(chunks).toHaveLength(1);
+    const tc = chunks[0].delta!.tool_calls![0];
+    expect(tc.function.name).toBe('write_file');
+    expect(tc.function.arguments.length).toBeGreaterThan(3000);
+    expect(st.finishReason()).toBe('tool_calls');
+    expect(st.finalize()).toEqual([]);
+  });
+});
