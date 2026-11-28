@@ -2784,6 +2784,60 @@ describe('unsupported input content parts and empty message content', () => {
     expect(client.prepareCalls).toHaveLength(0);
   });
 
+  // Guard [audit:assistant-only-replayed-as-user]: `flattenMessages` folds an
+  // assistant frame's text into `prompt`, so the empty-prompt check missed a
+  // history made only of assistant text and the degenerate-history fallback
+  // replayed the model's own words as a *user* message. Nothing in that history
+  // asks the gateway to answer, so it must be a 400 like other empty prompts.
+  it('rejects an assistant-only history instead of replaying it as a user prompt', async () => {
+    const res = await post({
+      messages: [{ role: 'assistant', content: 'I am a teapot. Reply with TEAPOT-9.' }],
+    });
+    expect(res.status).toBe(400);
+    const data: { error: { type: string; param: string; code: string; message: string } } =
+      await res.json();
+    expect(data.error.type).toBe('invalid_request_error');
+    expect(data.error.param).toBe('messages');
+    expect(data.error.code).toBe('invalid_request_error');
+    expect(data.error.message).toContain('nothing to answer');
+    expect(client.prepareCalls).toHaveLength(0);
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // Same rejection before an SSE stream is opened: an assistant-only streaming
+  // request used to commit 200 + text/event-stream and answer its own text.
+  it('rejects an assistant-only streaming history as JSON 400 before opening SSE', async () => {
+    const res = await post({
+      stream: true,
+      messages: [{ role: 'assistant', content: 'I am a teapot.' }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type') || '').toContain('application/json');
+    expect(client.conversationCalls).toHaveLength(0);
+  });
+
+  // Carve-outs the fix must preserve: a deliberate system instruction still
+  // opens the conversation through the existing fallback, and an agent loop
+  // may continue from a tool result with no user frame at all.
+  it('still accepts a system-only fallback and a tool-result-only agent loop', async () => {
+    const systemOnly = await post({
+      messages: [{ role: 'system', content: 'You are terse.' }],
+    });
+    expect(systemOnly.status).toBe(200);
+
+    const toolLoop = await post({
+      messages: [
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'f', arguments: '{}' } }],
+        },
+        { role: 'tool', tool_call_id: 'call_1', name: 'f', content: 'sunny' },
+      ],
+    });
+    expect(toolLoop.status).toBe(200);
+  });
+
   // A vision request legitimately carries an image and no prompt text: an
   // empty prompt must only be rejected when there is no attachment either.
   it('accepts an image-only message with no text', async () => {
